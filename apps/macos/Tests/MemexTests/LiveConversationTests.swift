@@ -50,6 +50,13 @@ private actor RecordingConversationRuntime: ConversationRuntime {
     func delayReadiness() { readyOnConnect = false }
     func holdNextPrompt() { holdPrompt = true }
     func acknowledgePrompt() { promptWaiter?.resume(); promptWaiter = nil }
+    func waitForCommandCount(_ count: Int) async throws {
+        for _ in 0..<200 {
+            if commands.count >= count { return }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        try #require(commands.count >= count, "The expected command was not dispatched")
+    }
     func emit(_ snapshot: ConversationSnapshot) { receive?(.success(snapshot)) }
     func confirm(_ command: ConversationCommand, messageID: String = "native-user", turnID: String = "native-turn") {
         let user = TranscriptRecord(recordID: "runtime:\(messageID)", record: Message(
@@ -333,6 +340,46 @@ private actor RecordingConversationRuntime: ConversationRuntime {
         #expect(conversation.draft == "Keep this draft")
         #expect(conversation.canChangeSettings)
         await conversation.disconnect()
+    }
+
+    @Test func approvalAndSettingsRemainUsableBeforePromptDispatchReturns() async throws {
+        let driver = RecordingConversationRuntime()
+        await driver.holdNextPrompt()
+        let conversation = LiveConversation(session: liveSession(), makeRuntime: { driver }, resolveTarget: fakeTarget)
+        conversation.draft = "Request requiring permission"
+        let send = Task { await conversation.send() }
+        try await driver.waitForCommandCount(1)
+        let prompt = try #require(await driver.commands.first)
+        let approval = ConversationApproval(id: "permission", title: "Bash", detail: nil,
+            options: [.init(id: "deny", title: "Deny", kind: "reject_once")])
+        let permission = ConversationControls.Configuration(id: "permission_mode", title: "Permissions", category: "mode",
+            selectedID: "default", choices: [.init(id: "default", title: "Default"), .init(id: "auto", title: "Auto")])
+        var snapshot = ConversationSnapshot(connected: true, ready: true, running: true,
+            approvals: [approval], controls: .init(configurations: [permission]))
+        await driver.emit(snapshot)
+        try await waitFor { !conversation.snapshot.approvals.isEmpty }
+        #expect(conversation.submitting)
+        #expect(conversation.canRespondToRequests)
+        #expect(conversation.canChangeSettings)
+        conversation.draft = "Retain my next draft"
+        await conversation.approve(approval, option: approval.options[0])
+        #expect(conversation.submitting)
+        #expect(conversation.pendingPrompt?.commandID == prompt.id)
+        #expect(!conversation.canSubmit)
+        let configure = Task { await conversation.configure(permission, value: "auto") }
+        try await driver.waitForCommandCount(3)
+        snapshot.controls?.configurations[0] = .init(id: permission.id, title: permission.title,
+            category: permission.category, selectedID: "auto", choices: permission.choices)
+        await driver.emit(snapshot)
+        await configure.value
+        #expect(await driver.commands.map(\.action) == [.prompt, .approval, .configuration])
+        #expect(conversation.submitting)
+        #expect(conversation.draft == "Retain my next draft")
+        await driver.acknowledgePrompt()
+        await send.value
+        await conversation.disconnect()
+        #expect(!conversation.canRespondToRequests)
+        #expect(!conversation.submittingControl)
     }
 
     @Test func rejectedSettingsKeepTheRunningConversationConnected() async throws {

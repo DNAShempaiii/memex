@@ -112,6 +112,7 @@ final class LiveConversation {
     private(set) var hasSnapshot = false
     private(set) var connecting = false
     private(set) var submitting = false
+    private(set) var submittingControl = false
     private(set) var changingHistory = false
     private var checkpointCaptures: Set<UUID> = []
     private var capturingCheckpoint: Bool { !checkpointCaptures.isEmpty }
@@ -220,7 +221,7 @@ final class LiveConversation {
 
     var canSend: Bool {
         ownership == .available && snapshot.connected && snapshot.ready && !snapshot.running && !snapshot.pendingPrompt
-            && snapshot.approvals.isEmpty && snapshot.questions.isEmpty && !connecting && !submitting && error == nil
+            && snapshot.approvals.isEmpty && snapshot.questions.isEmpty && !connecting && !submitting && !submittingControl && error == nil
             && snapshot.controls?.pendingChanges != true && !loadingAttachments && !applyingSettings && !changingHistory && !capturingCheckpoint
     }
     var canSubmit: Bool {
@@ -231,12 +232,12 @@ final class LiveConversation {
     var canQueue: Bool { ownership == .available && !preparingPrompt && !loadingAttachments && !deliveryUncertain && error == nil && !changingHistory }
     var canSteer: Bool {
         canQueue && snapshot.connected && snapshot.ready && snapshot.running && snapshot.canSteer
-            && pendingPrompt == nil && !submitting && !stopping && snapshot.controls?.pendingChanges != true
+            && pendingPrompt == nil && !submitting && !submittingControl && !stopping && snapshot.controls?.pendingChanges != true
             && snapshot.approvals.isEmpty && snapshot.questions.isEmpty && !capturingCheckpoint
     }
     var canInterruptAndRestart: Bool {
         canQueue && snapshot.connected && snapshot.ready && snapshot.running && !snapshot.canSteer
-            && snapshot.canCancel && !stopping && !submitting && pendingPrompt == nil
+            && snapshot.canCancel && !stopping && !submitting && !submittingControl && pendingPrompt == nil
             && snapshot.approvals.isEmpty && snapshot.questions.isEmpty
             && snapshot.controls?.pendingChanges != true && !capturingCheckpoint
     }
@@ -244,15 +245,23 @@ final class LiveConversation {
         onTransferQueuedPrompt != nil && !transferringQueue && !isServerOwned && session.machineID == "local"
     }
     var canChangeSettings: Bool {
-        ownership == .available && snapshot.connected && snapshot.ready && !connecting && !submitting
-            && !preparingPrompt && pendingPrompt == nil && error == nil && !applyingSettings
+        ownership == .available && snapshot.connected && snapshot.ready && !connecting && !submittingControl
+            && ((!submitting && !preparingPrompt && pendingPrompt == nil) || awaitingProviderRequest)
+            && error == nil && !applyingSettings
             && snapshot.controls?.pendingChanges != true && !changingHistory && !capturingCheckpoint
     }
-    var isWorking: Bool { connecting || preparingPrompt || submitting || snapshot.running || snapshot.pendingPrompt || changingHistory || capturingCheckpoint }
+    private var awaitingProviderRequest: Bool {
+        (!snapshot.approvals.isEmpty || !snapshot.questions.isEmpty)
+            && (pendingPrompt == nil || pendingPrompt?.phase == .awaitingConfirmation)
+    }
+    var canRespondToRequests: Bool {
+        ownership == .available && snapshot.connected && !connecting && !submittingControl && !changingHistory
+    }
+    var isWorking: Bool { connecting || preparingPrompt || submitting || submittingControl || snapshot.running || snapshot.pendingPrompt || changingHistory || capturingCheckpoint }
     var canMutateHistory: Bool { canSend && !preparingPrompt && snapshot.canMutateHistory && pendingPrompt == nil && queue.isEmpty }
     var canStop: Bool {
         !stopping && (connecting || (preparingPrompt && pendingPrompt?.phase == .preparing)
-            || (snapshot.connected && snapshot.canCancel && (snapshot.running || snapshot.pendingPrompt) && !submitting))
+            || (snapshot.connected && snapshot.canCancel && (snapshot.running || snapshot.pendingPrompt) && !submittingControl))
     }
     private var visibleStart: Int {
         var remaining = visibleLimit
@@ -362,6 +371,7 @@ final class LiveConversation {
         if !queue.isEmpty { queueHeld = true; persistDraft() }
         settleStop()
         submitting = false
+        submittingControl = false
         error = nil
         snapshot.connected = false
         snapshot.ready = false
@@ -473,6 +483,7 @@ final class LiveConversation {
         changingHistory = false
         connecting = false
         submitting = false
+        submittingControl = false
         snapshot.connected = false
         snapshot.ready = false
         snapshot.running = false
@@ -874,26 +885,32 @@ final class LiveConversation {
     }
 
     func approve(_ approval: ConversationApproval, option: ConversationApproval.Option) async {
-        guard snapshot.connected, !submitting, snapshot.approvals.contains(approval), approval.options.contains(option) else { return }
+        guard canRespondToRequests, snapshot.approvals.contains(approval), approval.options.contains(option) else { return }
         _ = await perform(ConversationCommand(.approval, text: option.id, requestID: approval.id))
     }
 
     func respondToElicitation(_ approval: ConversationApproval, response: String) async {
-        guard snapshot.connected, !submitting, snapshot.approvals.contains(approval), approval.kind == "mcp_elicitation" else { return }
+        guard canRespondToRequests, snapshot.approvals.contains(approval), approval.kind == "mcp_elicitation" else { return }
         _ = await perform(ConversationCommand(.approval, text: response, requestID: approval.id))
     }
 
     func answer(_ question: ConversationQuestion, text: String) async {
-        guard snapshot.connected, !submitting, snapshot.questions.contains(question), let answer = text.nilIfBlank else { return }
+        guard canRespondToRequests, snapshot.questions.contains(question), let answer = text.nilIfBlank else { return }
         _ = await perform(ConversationCommand(.userInput, text: answer, requestID: question.id))
     }
 
     private func perform(_ command: ConversationCommand) async -> Bool {
-        guard let runtime, !submitting else { return false }
+        let isPrompt = command.action == .prompt || command.action == .steer
+        guard let runtime, !submittingControl, !isPrompt || !submitting else { return false }
         let token = generation
-        submitting = true
+        // Permission requests can arrive before prompt dispatch returns. Their
+        // replies must reach the provider without releasing the outgoing fence.
+        if isPrompt { submitting = true } else { submittingControl = true }
         defer {
-            if generation == token { submitting = false; notifyState(); scheduleQueueDrain() }
+            if generation == token {
+                if isPrompt { submitting = false } else { submittingControl = false }
+                notifyState(); scheduleQueueDrain()
+            }
         }
         if command.action == .prompt, let beforePrompt {
             await beforePrompt(session, command)
@@ -961,6 +978,7 @@ final class LiveConversation {
         finishConnecting(false)
         connecting = false
         submitting = false
+        submittingControl = false
         snapshot.connected = false
         snapshot.ready = false
         snapshot.running = false

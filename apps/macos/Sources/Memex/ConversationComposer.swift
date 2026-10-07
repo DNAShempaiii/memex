@@ -35,7 +35,7 @@ struct ConversationComposer: View {
             ConversationQuestionsView(conversation: conversation)
             ForEach(conversation.snapshot.approvals.filter { $0.kind == "mcp_elicitation" }) { approval in
                 ConversationElicitationView(approval: approval,
-                    canRespond: conversation.snapshot.connected && !conversation.submitting,
+                    canRespond: conversation.canRespondToRequests,
                     onRespond: { response in Task { await conversation.respondToElicitation(approval, response: response) } })
             }
             if let error = contextError ?? conversation.settingsError ?? library.error {
@@ -71,7 +71,7 @@ struct ConversationComposer: View {
                         options: approval.options.map {
                             AcpComposerPendingApprovalOption(id: $0.id, name: $0.title, kind: $0.kind)
                         })
-                    item.canRespond = conversation.snapshot.connected && !conversation.submitting
+                    item.canRespond = conversation.canRespondToRequests
                     return item
                 },
                 onSelectApprovalOption: { requestID, optionID in

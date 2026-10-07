@@ -31,7 +31,7 @@ struct ConversationQuestionsView: View {
                         }.font(.caption)
                     }
                     AcpStructuredUserInputView(input: question.item,
-                        isResponding: conversation.submitting || !conversation.snapshot.connected || loading.contains(question.id),
+                        isResponding: !conversation.canRespondToRequests || loading.contains(question.id),
                         draft: Binding(get: { drafts.draft(for: question.item) },
                                        set: { drafts.set($0, for: question.id) }),
                         additionalContent: AnyView(attachmentControls(question)),

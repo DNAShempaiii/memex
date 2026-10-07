@@ -20,6 +20,9 @@ Model and permission controls remain available during active turns and approval
 requests. Claude starts and resumes in native Auto mode unless you have explicitly
 chosen a different conversation or provider mode. The provider determines when a change takes effect; rejected changes
 leave the conversation connected and display the reason beside the composer.
+Approval responses, answers, Stop, and permission controls remain usable when a
+provider request arrives before prompt dispatch returns. Responding does not
+confirm delivery or release the retained outgoing-message state.
 
 The selected conversation title appears in the main toolbar. The grouped controls
 end with **…**, containing branch, fork, rewind, and parent/child navigation actions.
