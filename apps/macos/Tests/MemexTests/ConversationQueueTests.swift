@@ -52,6 +52,25 @@ private actor QueueRuntime: ConversationRuntime {
     func release(_ index: Int) { waiters.removeValue(forKey: index)?.resume() }
 }
 
+/// Holds draft saves while armed so a test can act during the pre-dispatch flush.
+private actor SaveGate {
+    private var armed = false
+    private(set) var arrivals = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func arm() { armed = true }
+    func pass() async {
+        guard armed else { return }
+        arrivals += 1
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func release() {
+        armed = false
+        for waiter in waiters { waiter.resume() }
+        waiters = []
+    }
+}
+
 @Suite(.serialized) @MainActor struct ConversationQueueTests {
     private var session: Session {
         Session(source: "codex", sessionID: "queue-session", sourcePath: "/tmp/queue/sessions/native.jsonl",
@@ -405,7 +424,7 @@ private actor QueueRuntime: ConversationRuntime {
         await live.transferQueuedPrompt(id: entry.id)
         #expect(saved?.attachments == [attachment])
         #expect(live.queue.isEmpty)
-        #expect(store.drafts[session.id]?.queue.isEmpty == true)
+        #expect(store.drafts[session.id]?.queue.isEmpty ?? true) // An empty draft is not stored.
         #expect(await runtime.commands.isEmpty)
     }
 
@@ -423,7 +442,9 @@ private actor QueueRuntime: ConversationRuntime {
         await runtime.emit(.init(connected: true, ready: true, canCancel: true))
         await restarting.value
         #expect(await runtime.commands.map(\.action) == [.cancel, .prompt])
-        #expect(live.queueHeld)
+        // Nothing was queued when Stop interrupted the turn, so there is nothing
+        // to hold; a held empty queue would silently pause later follow-ups.
+        #expect(!live.queueHeld)
         await live.disconnect()
     }
 
@@ -448,4 +469,105 @@ private actor QueueRuntime: ConversationRuntime {
         }
     }
 
+    @Test func interruptionWithAnEmptyQueueDoesNotPauseLaterFollowUps() async throws {
+        let runtime = QueueRuntime()
+        let store = ConversationDraftStore()
+        let live = conversation(runtime, drafts: store)
+        await live.connect()
+        await live.disconnect()
+        #expect(!live.queueHeld)
+        #expect(store.drafts[session.id] == nil)
+        await live.connect()
+        await runtime.emit(.init(connected: true, ready: true, running: true, canCancel: true, canSteer: true))
+        try await wait { live.snapshot.running }
+        await live.stop()
+        #expect(!live.queueHeld)
+        live.draft = "Follow-up"
+        await live.enqueueDraft()
+        await runtime.emit(.init(connected: true, ready: true, canCancel: true, canSteer: true))
+        try await wait { live.pendingPrompt != nil }
+        #expect(await runtime.commands.map(\.text) == ["", "Follow-up"])
+        await live.disconnect()
+    }
+
+    @Test func restoredHeldQueueStaysHeldUntilItEmpties() async throws {
+        let runtime = QueueRuntime()
+        let store = ConversationDraftStore()
+        let queued = ConversationQueuedPrompt(.init(.prompt, text: "Restored", id: "restored"))
+        store.set(.init(text: "", queue: [queued], queueHeld: true), for: session.id)
+        let live = conversation(runtime, drafts: store)
+        #expect(live.queueHeld)
+        await live.connect()
+        #expect(await runtime.commands.isEmpty)
+        live.cancelQueued(id: queued.id)
+        #expect(!live.queueHeld)
+        #expect(store.drafts[session.id] == nil)
+        live.draft = "New follow-up"
+        await live.enqueueDraft()
+        #expect(await runtime.commands.map(\.text) == ["New follow-up"])
+        await live.disconnect()
+    }
+
+    @Test func stopDuringThePreDispatchSaveReturnsThePromptUnsent() async throws {
+        let runtime = QueueRuntime()
+        let gate = SaveGate()
+        let store = ConversationDraftStore(beforeWrite: { await gate.pass() })
+        let live = conversation(runtime, drafts: store)
+        await live.connect()
+        live.draft = "Do not send after Stop"
+        await gate.arm()
+        let sending = Task { await live.send() }
+        try await wait { live.pendingPrompt?.phase == .awaitingConfirmation }
+        #expect(await gate.arrivals > 0)
+        #expect(live.canStop)
+        await live.stop()
+        await gate.release()
+        await sending.value
+        #expect(await runtime.commands.isEmpty)
+        #expect(live.draft == "Do not send after Stop")
+        #expect(live.pendingPrompt == nil)
+        #expect(store.drafts[session.id]?.deliveryUncertain == false)
+        #expect(live.canSubmit)
+        await live.disconnect()
+    }
+
+    @Test func manualReconnectDemotesAnAwaitedPromptSoItCanBeRestored() async throws {
+        let runtime = QueueRuntime()
+        await runtime.suspendPrompt()
+        let live = conversation(runtime)
+        await live.connect()
+        live.draft = "Awaiting confirmation"
+        let sending = Task { await live.send() }
+        while await runtime.commands.isEmpty { await Task.yield() }
+        #expect(live.pendingPrompt?.phase == .awaitingConfirmation)
+        await live.disconnect()
+        #expect(live.pendingPrompt?.phase == .uncertain)
+        await runtime.releasePrompt()
+        await sending.value
+        await live.connect()
+        #expect(live.pendingPrompt?.phase == .uncertain)
+        live.restorePendingDraft()
+        #expect(live.draft == "Awaiting confirmation")
+        #expect(live.pendingPrompt == nil)
+        #expect(await runtime.commands.count == 1)
+        await live.disconnect()
+    }
+
+    @Test func restartThatCannotSendExplainsWhy() async throws {
+        let runtime = QueueRuntime()
+        let live = conversation(runtime)
+        await live.connect()
+        await runtime.emit(.init(connected: true, ready: true, running: true, canCancel: true))
+        try await wait { live.canInterruptAndRestart }
+        live.draft = "Restart me"
+        let restarting = Task { await live.interruptAndRestartDraft() }
+        try await wait { live.status == "Stopping…" }
+        // Stopped, but the agent is not ready for a new turn.
+        await runtime.emit(.init(connected: true, ready: false, canCancel: true))
+        await restarting.value
+        #expect(await runtime.commands.map(\.action) == [.cancel])
+        #expect(live.draft == "Restart me")
+        #expect(live.notice != nil)
+        await live.disconnect()
+    }
 }

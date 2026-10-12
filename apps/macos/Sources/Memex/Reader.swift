@@ -79,10 +79,7 @@ struct ReaderView: View {
         .onChange(of: navigation.visibleRecordID) { _, id in outline.follow(id) }
         .task(id: store.selectedLiveConversation?.session.id) {
             guard let live = store.selectedLiveConversation else { return }
-            while !Task.isCancelled {
-                live.refreshOwnership()
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }
-            }
+            await live.monitorOwnership(isActive: { NSApp.isActive })
         }
         .onChange(of: store.findConversationRequest) { _, _ in
             find?.isOpen = true

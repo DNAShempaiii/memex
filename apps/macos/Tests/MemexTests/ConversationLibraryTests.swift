@@ -124,6 +124,37 @@ import Testing
         #expect(store.librarySessions.isEmpty)
     }
 
+    @Test func browsingNeverCreatesMetadataOrInjectsUnorganizedRows() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let library = ConversationLibrary(directory: directory)
+        let store = Store(conversationLibrary: library)
+        let browsed = session("browsed"), unread = session("unread")
+        #expect(library.markRead([unread], read: false))
+        store.openConversation(browsed)
+        #expect(library.entries[browsed.id] == nil)
+        store.openConversation(unread)
+        #expect(!library.isUnread(unread))
+        // The read mark is saved off the main actor.
+        for _ in 0..<200 where ConversationLibrary(directory: directory).isUnread(unread) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let reopened = ConversationLibrary(directory: directory)
+        #expect(!reopened.isUnread(unread))
+        #expect(reopened.entries[browsed.id] == nil)
+        #expect(library.error == nil)
+
+        // Saved but unorganized rows stay where the index pages put them.
+        #expect(library.rename(browsed, to: "Renamed only"))
+        store.sessions = []
+        #expect(store.librarySessions.isEmpty)
+        #expect(library.pin([unread], pinned: true))
+        #expect(store.librarySessions.map(\.id) == [unread.id])
+        // Search results are exactly the index's hits.
+        store.query = "Provider"
+        #expect(store.librarySessions.isEmpty)
+    }
+
     @Test func sectionsReadStateAndDeletionPreserveExistingMetadata() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

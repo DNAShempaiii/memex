@@ -502,18 +502,47 @@ private actor RecordingConversationRuntime: ConversationRuntime {
         let conversation = LiveConversation(session: liveSession(), makeRuntime: { driver },
             resolveTarget: fakeTarget, checkOwnership: { _ in locked })
         conversation.draft = "Keep this draft"
+        await conversation.refreshOwnership()
         #expect(conversation.isOpenElsewhere)
         #expect(!conversation.canSubmit)
         await conversation.send()
         #expect(await driver.connections == 0)
         locked = false
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         #expect(conversation.canSubmit)
         #expect(conversation.draft == "Keep this draft")
         #expect(await driver.commands.isEmpty)
         await conversation.send()
         #expect(await driver.connections == 1)
         #expect(await driver.commands.map(\.text) == ["Keep this draft"])
+        await conversation.disconnect()
+    }
+
+    @Test func ownershipProbesNeverOverlapAndOnlyTheNewestResultApplies() async {
+        let driver = RecordingConversationRuntime()
+        var calls = 0, active = 0, mostActive = 0
+        let conversation = LiveConversation(session: liveSession(), makeRuntime: { driver },
+            resolveTarget: fakeTarget, checkOwnership: { _ in
+                calls += 1
+                let call = calls
+                active += 1
+                mostActive = max(mostActive, active)
+                try? await Task.sleep(for: .milliseconds(30))
+                active -= 1
+                // The superseded probe reports a stale writer.
+                return call == 1
+            })
+        #expect(calls == 0) // Constructing a viewer does not inspect ownership.
+        async let first: Void = conversation.refreshOwnership()
+        async let second: Void = conversation.refreshOwnership()
+        _ = await (first, second)
+        #expect(calls == 2)
+        #expect(mostActive == 1)
+        #expect(!conversation.isOpenElsewhere)
+        #expect(!conversation.isProbingOwnership)
+        await conversation.connect()
+        await conversation.refreshOwnership()
+        #expect(calls == 3) // Only connect's own pre-launch check.
         await conversation.disconnect()
     }
 
@@ -550,7 +579,7 @@ private actor RecordingConversationRuntime: ConversationRuntime {
         await driver.emit(ConversationSnapshot(connected: true, ready: true))
         try await Task.sleep(for: .milliseconds(20))
         #expect(!conversation.snapshot.connected)
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         #expect(conversation.canSubmit)
         #expect(await driver.commands.isEmpty)
     }
@@ -562,7 +591,7 @@ private actor RecordingConversationRuntime: ConversationRuntime {
             resolveTarget: fakeTarget, checkOwnership: { _ in locked })
         await conversation.connect()
         locked = true
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         #expect(conversation.canSend)
         #expect(!conversation.isOpenElsewhere)
         await conversation.disconnect()
@@ -582,7 +611,7 @@ private actor RecordingConversationRuntime: ConversationRuntime {
         #expect(!conversation.canSubmit)
         #expect(await driver.connections == 0)
         fail = false
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         #expect(conversation.canSubmit)
         #expect(conversation.ownershipError == nil)
         #expect(conversation.draft == "Keep this draft")
@@ -639,7 +668,7 @@ private actor RecordingConversationRuntime: ConversationRuntime {
         #expect(!conversation.canSubmit)
         #expect(await driver.connections == 0)
         #expect(await driver.commands.isEmpty)
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         #expect(!conversation.canSubmit)
         #expect(conversation.error == "Original workspace unavailable")
     }
@@ -657,7 +686,7 @@ private actor RecordingConversationRuntime: ConversationRuntime {
         #expect(conversation.pendingPrompt?.phase == .uncertain)
         #expect(!conversation.canSend)
         #expect(conversation.error == "Acknowledgement lost")
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         #expect(!conversation.canSubmit)
         #expect(conversation.error == "Acknowledgement lost")
         await conversation.send()

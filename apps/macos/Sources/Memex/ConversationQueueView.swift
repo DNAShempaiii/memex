@@ -6,6 +6,7 @@ struct ConversationQueueView: View {
     @State private var editing: ConversationQueuedPrompt?
     @State private var expanded = true
     @State private var transferring: ConversationQueuedPrompt?
+    @State private var inspecting: ConversationQueuedPrompt?
 
     var body: some View {
         Group {
@@ -30,6 +31,9 @@ struct ConversationQueueView: View {
                                     Button("Steer current turn now") { Task { await conversation.promoteQueued(id: entry.id) } }
                                 } else if !conversation.isWorking {
                                     Button("Send next") { Task { await conversation.promoteQueued(id: entry.id) } }
+                                }
+                                if conversation.unresolvedTransferIDs.contains(entry.id) {
+                                    Button("Mark transfer inspected…") { inspecting = entry }
                                 }
                                 if conversation.canTransferQueuedPrompt {
                                     Button("Move to side-chat draft…") { conversation.holdQueue(); transferring = entry }
@@ -70,6 +74,14 @@ struct ConversationQueueView: View {
                     Button("Move draft") { transferring = nil; Task { await conversation.transferQueuedPrompt(id: entry.id) } }
                 }
             }.padding(20).frame(width: 520, height: 340)
+        }
+        .confirmationDialog("Mark side-chat transfer inspected?",
+                            isPresented: Binding(get: { inspecting != nil }, set: { if !$0 { inspecting = nil } }),
+                            presenting: inspecting) { entry in
+            Button("Mark inspected") { conversation.markQueuedTransferInspected(id: entry.id) }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text("Check the provider's native conversations first. If a side chat was created, use it and remove this queued message. Marking this inspected lets you move the message again, which creates a new side chat.")
         }
         .sheet(item: $editing) { entry in
             ConversationQueueEditor(conversation: conversation, entry: entry)

@@ -98,7 +98,7 @@ private actor PanelFixtureRuntime: ConversationRuntime {
     }
     for isLocked in [false, true, false] {
         locked = isLocked
-        conversation.refreshOwnership()
+        await conversation.refreshOwnership()
         host.layoutSubtreeIfNeeded()
         try await Task.sleep(for: .milliseconds(30))
         host.layoutSubtreeIfNeeded()

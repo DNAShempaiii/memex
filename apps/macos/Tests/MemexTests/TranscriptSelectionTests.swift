@@ -312,10 +312,11 @@ import Testing
         #expect(restored.selectedTranscriptText(in: "another session") == nil)
     }
 
-    @Test func unavailableConversationReportsOwnershipAndPreservesDraft() {
+    @Test func unavailableConversationReportsOwnershipAndPreservesDraft() async {
         let session = Session(source: "codex", sessionID: "selection", sourcePath: "/tmp/selection.jsonl",
                               project: "selection", cwd: "/tmp", machine: "local")
         let live = LiveConversation(session: session, checkOwnership: { _ in true })
+        await live.refreshOwnership()
         live.draft = "Keep me"
         let error = live.appendTranscriptSelection(.init(text: "selected", sourceIDs: ["record"]))
         #expect(error == "This conversation is open in another app. Close it there before adding context here.")
