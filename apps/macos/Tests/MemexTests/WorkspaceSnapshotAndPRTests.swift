@@ -103,3 +103,20 @@ private struct SnapshotFixture {
     #expect(context.promptText.contains("https://github.com/o/r/pull/1"))
     #expect(!context.promptText.contains("/tmp/project"))
 }
+
+@Test func failedWorkspaceSnapshotLeavesNoPartialArchive() async throws {
+    let fixture = try SnapshotFixture()
+    defer { fixture.clean() }
+    let workspace = try fixture.store.prepare(directory: fixture.repository, newWorktree: true, baseRef: "HEAD", command: CommandRun())
+    let unreadable = workspace.workingDirectory.appendingPathComponent("unreadable")
+    try Data("secret".utf8).write(to: unreadable)
+    try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: unreadable.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: unreadable.path) }
+    // Older than the capture window, so only tar reads the file and fails.
+    try await Task.sleep(for: .milliseconds(2_200))
+    #expect(throws: (any Error).self) { try fixture.store.captureSnapshot(workspace, isBusy: false, command: CommandRun()) }
+    let folder = try #require(workspace.metadataURL).deletingLastPathComponent().appendingPathComponent("snapshots")
+    let leftovers = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+    #expect(leftovers.isEmpty, "Partial snapshot files remained: \(leftovers)")
+    #expect(try fixture.git(["for-each-ref", "refs/memex/snapshots/"], at: workspace.workingDirectory).isEmpty)
+}
