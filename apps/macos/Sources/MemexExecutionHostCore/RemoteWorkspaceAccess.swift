@@ -34,10 +34,12 @@ public final class RemoteWorkspaceAccess {
         if request.method == "workspace.files" { return try list(root: root, path: path) }
         let descriptor = try openFile(root: root, path: path, writing: request.method == "workspace.file.write")
         defer { close(descriptor) }
-        guard flock(descriptor, LOCK_EX) == 0 else { throw failure("Cannot lock workspace file") }
+        // Reads never take an advisory lock: another process's long-held lock
+        // (for example Cargo's build lock) must not stall the host.
+        if request.method == "workspace.file.read" { return try contents(read(descriptor)) }
+        try lockForWrite(descriptor)
         defer { flock(descriptor, LOCK_UN) }
         let original = try read(descriptor)
-        if request.method == "workspace.file.read" { return try contents(original) }
         guard request.method == "workspace.file.write", let expected = p["revision"]?.string,
               let text = p["text"]?.string, text.utf8.count <= Self.fileLimit else {
             throw HostFailure("invalid_params", "A bounded text value and original revision are required")
@@ -82,6 +84,18 @@ public final class RemoteWorkspaceAccess {
         guard fsync(parent) == 0 else { throw HostFailure("file_durability", "The complete replacement is visible, but directory synchronization failed. Reload its revision before retrying.") }
     }
 
+    /// Bounded wait: the host serializes requests, so a write never blocks
+    /// indefinitely behind a lock held by an unrelated process.
+    private func lockForWrite(_ descriptor: Int32) throws {
+        for attempt in 0..<Self.writeLockAttempts {
+            if flock(descriptor, LOCK_EX | LOCK_NB) == 0 { return }
+            guard errno == EWOULDBLOCK || errno == EINTR else { throw failure("Cannot lock workspace file") }
+            if attempt + 1 < Self.writeLockAttempts { usleep(100_000) }
+        }
+        throw HostFailure("file_locked", "This file is locked by another process. Your draft is retained; save again after it is released.")
+    }
+
+    private static let writeLockAttempts = 10
     private static let fileLimit = 2 * 1024 * 1024
     static func components(_ path: String, allowRoot: Bool = false) throws -> [String] {
         if path.isEmpty && allowRoot { return [] }

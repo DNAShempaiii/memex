@@ -259,4 +259,44 @@ final class HostHandoffTests: XCTestCase {
             XCTAssertEqual(($0 as? HostFailure)?.code, "handoff_identity")
         }
     }
+
+    func testOversizedWorkspaceFailsBeforeFencingSource() throws {
+        let f = try fixture(), id = UUID().uuidString
+        try Data(count: RemoteWorkspaceHandoff.byteLimit + 1).write(to: f.source.appendingPathComponent("large.bin"))
+        let targetInfo = try ok(f.targetHost, "host.info")
+        let reply = response(f.sourceHost, "conversation.handoff.prepare", ["handoffId": .string(id), "conversationId": f.conversation["id"],
+            "destinationHostId": .string(f.targetHost.hostID), "destinationPublicKey": targetInfo["handoffPublicKey"],
+            "destinationWorkspaceId": .string(f.destination.path)])
+        XCTAssertEqual(reply.error?.code, "handoff_limit")
+        XCTAssertTrue(f.sourceProvider.fenced.isEmpty)
+        XCTAssertTrue(try ok(f.sourceHost, "conversation.handoff.list").array.isEmpty)
+        _ = try ok(f.sourceHost, "conversation.resume", ["conversationId": f.conversation["id"]])
+    }
+
+    func testHostPinsPeerSigningKeysAndRejectsTombstonesNamingItself() throws {
+        let f = try fixture(), id = UUID().uuidString
+        _ = try prepare(f, id: id)
+        _ = try install(f, id: id)
+        // Another host's valid key cannot replace the source key the destination pinned.
+        let imposter = try ExecutionHost(directory: f.root.appendingPathComponent("host-c"), workspaceRoots: []) { _ in Provider() }
+        let exported = try ok(f.sourceHost, "conversation.handoff.export", ["handoffId": .string(id)])
+        let other = UUID().uuidString
+        var package = exported["package"].object; package["operationID"] = .string(other)
+        let forged = response(f.targetHost, "conversation.handoff.install", ["handoffId": .string(other), "package": .object(package),
+            "certificate": exported["certificate"], "sourcePublicKey": try ok(imposter, "host.info")["handoffPublicKey"]])
+        XCTAssertEqual(forged.error?.code, "handoff_identity")
+        XCTAssertTrue(forged.error?.message.contains("different handoff signing key") == true)
+        // The source likewise refuses a changed destination key for the same host.
+        let mismatch = response(f.sourceHost, "conversation.handoff.prepare", ["handoffId": .string(UUID().uuidString), "conversationId": f.conversation["id"],
+            "destinationHostId": .string(f.targetHost.hostID), "destinationPublicKey": try ok(imposter, "host.info")["handoffPublicKey"],
+            "destinationWorkspaceId": .string(f.destination.path)])
+        XCTAssertEqual(mismatch.error?.code, "handoff_identity")
+        // A tombstone claiming this host as its own source is refused.
+        let selfID = UUID().uuidString
+        package["operationID"] = .string(selfID); package["sourceHostID"] = .string(f.targetHost.hostID)
+        let tombstone = response(f.targetHost, "conversation.handoff.abort", ["handoffId": .string(selfID), "package": .object(package),
+            "certificate": exported["certificate"], "sourcePublicKey": try ok(f.targetHost, "host.info")["handoffPublicKey"]])
+        XCTAssertEqual(tombstone.error?.code, "handoff_identity")
+        XCTAssertFalse(try ok(f.targetHost, "conversation.handoff.list").array.contains { $0["id"].string == selfID })
+    }
 }

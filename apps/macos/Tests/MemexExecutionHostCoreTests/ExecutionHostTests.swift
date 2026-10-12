@@ -13,6 +13,7 @@ final class ExecutionHostTests: XCTestCase {
         var sequence: Double = 1
         var permissionMode: String?
         var pendingPermission = false
+        var failingReads: Set<String> = []
         func create(id: String, provider: String, workspaceID: String, cwd: String, title: String) throws -> HostedConversation {
             let c = HostedConversation(id: id, nativeSessionID: "native-" + id, provider: provider,
                 providerInstanceID: "codex:test-home", workspaceID: workspaceID, cwd: cwd,
@@ -21,7 +22,8 @@ final class ExecutionHostTests: XCTestCase {
         }
         func resume(_ conversation: HostedConversation) throws { resumed.append(conversation); connected = true }
         func read(_ conversation: HostedConversation) throws -> HostValue {
-            .object(["ready": .bool(connected), "running": .bool(running), "connected": .bool(connected),
+            if failingReads.contains(conversation.id) { throw HostFailure("provider_io", "injected read failure") }
+            return .object(["ready": .bool(connected), "running": .bool(running), "connected": .bool(connected),
                 "controls": .object([
                     "pendingControlCommandIds": .array(pendingPermission ? [.string("pending")] : []),
                     "configOptions": .array(permissionMode.map { mode in [.object([
@@ -323,6 +325,11 @@ final class ExecutionHostTests: XCTestCase {
         let skipped = call(host, "schedule.list").result?.array.first
         XCTAssertEqual(skipped?["lastSkippedAt"].string, "2026-10-05T09:00:00Z")
         XCTAssertEqual(skipped?["nextRunAt"].string, "2026-10-06T09:00:00Z")
+        let missed = try XCTUnwrap(call(host, "schedule.runs").result?.array.first)
+        XCTAssertEqual(missed["status"].string, "skipped")
+        XCTAssertEqual(missed["needsAttention"].bool, true)
+        XCTAssertEqual(missed["conversationID"].string, id)
+        XCTAssertTrue(missed["error"].string?.contains("not replayed") == true)
         current = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-06T09:00:00Z"))
         try host.tick()
         try host.tick()
@@ -352,5 +359,88 @@ final class ExecutionHostTests: XCTestCase {
         current = current.addingTimeInterval(120)
         parameters["text"] = .string("revised again")
         XCTAssertEqual(call(host, "schedule.upsert", parameters).result?["nextRunAt"], weekly?["nextRunAt"])
+    }
+
+    func testOneFailingQueueEntryIsHeldVisiblyWhileOtherConversationsDispatch() throws {
+        let (directory, workspace) = try fixture()
+        let provider = Provider()
+        let host = try ExecutionHost(directory: directory, workspaceRoots: [workspace]) { _ in provider }
+        let broken = try create(host, workspace), healthy = try create(host, workspace)
+        XCTAssertNil(call(host, "conversation.queue.add", ["conversationId": .string(broken), "text": .string("first")], commandID: "broken").error)
+        XCTAssertNil(call(host, "conversation.queue.add", ["conversationId": .string(healthy), "text": .string("second")], commandID: "healthy").error)
+        provider.failingReads = [broken]
+        try host.tick()
+        XCTAssertEqual(provider.commands.map(\.id), ["healthy"])
+        let held = try XCTUnwrap(call(host, "conversation.queue.list", ["conversationId": .string(broken)]).result?.array.first)
+        XCTAssertEqual(held["status"].string, "held")
+        XCTAssertEqual(held["error"].string, "injected read failure")
+        provider.failingReads = []; provider.running = false
+        XCTAssertNil(call(host, "conversation.queue.resume", ["conversationId": .string(broken)]).error)
+        try host.tick()
+        XCTAssertEqual(provider.commands.map(\.id), ["healthy", "broken"])
+    }
+
+    func testInvalidManagedManifestIsReportedWithoutBreakingWorkspaceListing() throws {
+        let (directory, workspace) = try fixture()
+        let host = try ExecutionHost(directory: directory, workspaceRoots: [workspace]) { _ in Provider() }
+        let reservation = directory.appendingPathComponent("worktrees").appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory.appendingPathComponent("worktrees"), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try FileManager.default.createDirectory(at: reservation, withIntermediateDirectories: true)
+        try Data("not a manifest".utf8).write(to: reservation.appendingPathComponent("workspace.json"))
+        let listed = try XCTUnwrap(call(host, "workspace.list").result?.array)
+        XCTAssertEqual(listed.map { $0["id"].string }, [workspace.path])
+        let trees = try XCTUnwrap(call(host, "worktree.list").result?.array)
+        XCTAssertEqual(trees.count, 1)
+        XCTAssertEqual(trees.first?["state"].string, "invalid")
+        XCTAssertEqual(trees.first?["id"].string, reservation.lastPathComponent)
+        XCTAssertNotNil(trees.first?["failure"].string)
+    }
+
+    func testReceiptsRetainDigestsNotParametersAndMigrateLegacyCatalogs() throws {
+        let (directory, workspace) = try fixture()
+        let provider = Provider()
+        var host = try ExecutionHost(directory: directory, workspaceRoots: [workspace]) { _ in provider }
+        let id = try create(host, workspace)
+        let attachment = String(repeating: "QUJD", count: 50_000)
+        let params: [String: HostValue] = ["conversationId": .string(id), "text": .string("look"),
+            "promptContent": .array([.object(["type": .string("image"), "data": .string(attachment), "mimeType": .string("image/png")])])]
+        let first = call(host, "conversation.send", params, commandID: "with-image")
+        XCTAssertNil(first.error)
+        let catalogURL = directory.appendingPathComponent("catalog.json")
+        let stored = try String(contentsOf: catalogURL, encoding: .utf8)
+        XCTAssertFalse(stored.contains(attachment))
+        XCTAssertEqual(call(host, "conversation.send", params, commandID: "with-image").result, first.result)
+        var changed = params; changed["text"] = .string("other")
+        XCTAssertEqual(call(host, "conversation.send", changed, commandID: "with-image").error?.code, "id_conflict")
+        XCTAssertEqual(provider.commands.count, 1)
+
+        // A receipt written by the previous format keeps its idempotency after migration.
+        var catalog = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: catalogURL)) as? [String: Any])
+        var receipts = try XCTUnwrap(catalog["receipts"] as? [String: Any])
+        var legacyParams = params.mapValues { try! JSONSerialization.jsonObject(with: JSONEncoder().encode($0), options: .fragmentsAllowed) }
+        legacyParams["hostId"] = host.hostID; legacyParams["commandId"] = "legacy"; legacyParams["issuedAt"] = "2026-10-05T12:00:00Z"
+        receipts["legacy"] = ["request": ["method": "conversation.send", "params": legacyParams], "status": "completed",
+                              "result": ["receipt": ["commandId": "legacy", "accepted": true]]]
+        catalog["receipts"] = receipts
+        try JSONSerialization.data(withJSONObject: catalog).write(to: catalogURL)
+        host = try ExecutionHost(directory: directory, workspaceRoots: [workspace]) { _ in provider }
+        XCTAssertFalse(try String(contentsOf: catalogURL, encoding: .utf8).contains(attachment))
+        XCTAssertEqual(call(host, "conversation.send", params, commandID: "legacy").result?["receipt"]["commandId"].string, "legacy")
+        XCTAssertEqual(call(host, "conversation.send", changed, commandID: "legacy").error?.code, "id_conflict")
+        XCTAssertEqual(provider.commands.count, 1)
+    }
+
+    func testReceiptsExpireByAgeWhileRecentOnesRemain() throws {
+        let (directory, workspace) = try fixture()
+        let provider = Provider()
+        var current = Date(timeIntervalSince1970: 1_800_000_000)
+        let host = try ExecutionHost(directory: directory, workspaceRoots: [workspace], providerFactory: { _ in provider }, now: { current })
+        let id = try create(host, workspace)
+        XCTAssertNil(call(host, "conversation.send", ["conversationId": .string(id), "text": .string("old")], commandID: "old-send").error)
+        XCTAssertEqual(call(host, "command.read", commandID: "old-send").result?["status"].string, "completed")
+        current = current.addingTimeInterval(8 * 24 * 60 * 60)
+        XCTAssertNil(call(host, "conversation.send", ["conversationId": .string(id), "text": .string("new")], commandID: "new-send").error)
+        XCTAssertEqual(call(host, "command.read", commandID: "old-send").error?.code, "not_found")
+        XCTAssertEqual(call(host, "command.read", commandID: "new-send").result?["status"].string, "completed")
     }
 }

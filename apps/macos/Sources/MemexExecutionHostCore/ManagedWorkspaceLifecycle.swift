@@ -15,6 +15,12 @@ public struct ManagedWorkspaceEntry: Identifiable, Sendable {
     public var id: String { workspace.id }
 }
 
+public struct InvalidManagedWorkspace: Sendable {
+    public let id: String
+    public let path: String
+    public let reason: String
+}
+
 extension ManagedWorkspaceStore {
     private struct Lifecycle: Codable { var archived = false; var removed = false }
 
@@ -60,17 +66,30 @@ extension ManagedWorkspaceStore {
     }
 
     public func managedWorkspaces() throws -> [ManagedWorkspaceEntry] {
+        let scan = try scanManagedWorkspaces()
+        if let failure = scan.invalid.first { throw WorkspaceGitError(message: failure.reason) }
+        return scan.entries
+    }
+
+    /// One unreadable reservation never hides the others; callers decide how to
+    /// surface invalid manifests.
+    public func scanManagedWorkspaces() throws -> (entries: [ManagedWorkspaceEntry], invalid: [InvalidManagedWorkspace]) {
         let manager = FileManager.default
-        guard manager.fileExists(atPath: managedRoot.path) else { return [] }
-        return try manager.contentsOfDirectory(at: managedRoot, includingPropertiesForKeys: [.isDirectoryKey])
-            .compactMap { reservation in
-                let manifest = reservation.appendingPathComponent("workspace.json")
-                guard manager.fileExists(atPath: manifest.path) else { return nil }
+        guard manager.fileExists(atPath: managedRoot.path) else { return ([], []) }
+        var entries: [ManagedWorkspaceEntry] = [], invalid: [InvalidManagedWorkspace] = []
+        for reservation in try manager.contentsOfDirectory(at: managedRoot, includingPropertiesForKeys: [.isDirectoryKey]) {
+            let manifest = reservation.appendingPathComponent("workspace.json")
+            guard manager.fileExists(atPath: manifest.path) else { continue }
+            do {
                 let workspace = try JSONDecoder().decode(ConversationWorkspace.self, from: Data(contentsOf: manifest))
                 guard reservation.lastPathComponent == workspace.id else { throw WorkspaceGitError(message: "A workspace manifest has an unexpected identity: \(manifest.path)") }
                 let lifecycle = try Self.readLifecycle(workspace)
-                return ManagedWorkspaceEntry(workspace: workspace, archived: lifecycle.archived, removed: lifecycle.removed)
+                entries.append(ManagedWorkspaceEntry(workspace: workspace, archived: lifecycle.archived, removed: lifecycle.removed))
+            } catch {
+                invalid.append(InvalidManagedWorkspace(id: reservation.lastPathComponent, path: reservation.path, reason: error.localizedDescription))
             }
+        }
+        return (entries, invalid)
     }
 
     /// Archiving hides the entry but deliberately retains every file, including

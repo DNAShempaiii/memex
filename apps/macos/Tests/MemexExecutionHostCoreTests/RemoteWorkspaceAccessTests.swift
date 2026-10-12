@@ -86,4 +86,63 @@ final class RemoteWorkspaceAccessTests: XCTestCase {
         _ = try access.handle(request("workspace.terminal.close", fields), root: root)
         XCTAssertThrowsError(try access.handle(request("workspace.terminal.read", fields), root: root))
     }
+
+    func testReadsIgnoreAdvisoryLocksAndLockedWritesFailWithinBound() throws {
+        let root = try fixture(), file = root.appendingPathComponent("Cargo.lock")
+        try Data("original".utf8).write(to: file)
+        let holder = open(file.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(holder, 0)
+        defer { close(holder) }
+        XCTAssertEqual(flock(holder, LOCK_EX), 0)
+        let access = RemoteWorkspaceAccess()
+        let current = try access.handle(request("workspace.file.read", ["path": .string("Cargo.lock")]), root: root)
+        XCTAssertEqual(current["text"].string, "original")
+        let started = Date()
+        XCTAssertThrowsError(try access.handle(request("workspace.file.write", ["path": .string("Cargo.lock"), "revision": current["revision"], "text": .string("draft")]), root: root)) {
+            XCTAssertEqual(($0 as? HostFailure)?.code, "file_locked")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "original")
+        flock(holder, LOCK_UN)
+        _ = try access.handle(request("workspace.file.write", ["path": .string("Cargo.lock"), "revision": current["revision"], "text": .string("saved")]), root: root)
+        XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "saved")
+    }
+
+    func testTerminalInputNeverBlocksWhenTheShellStopsReading() throws {
+        let root = try fixture(), access = RemoteWorkspaceAccess()
+        let fields: [String: HostValue] = ["terminalId": .string("stalled")]
+        _ = try access.handle(request("workspace.terminal.open", fields), root: root)
+        defer { _ = try? access.handle(request("workspace.terminal.close", fields), root: root) }
+        var stop = fields; stop["input"] = .string("kill -STOP $PPID\n")
+        _ = try access.handle(request("workspace.terminal.input", stop), root: root)
+        Thread.sleep(forTimeInterval: 1)
+        var chunk = fields; chunk["input"] = .string(String(repeating: "x", count: 60_000))
+        let started = Date()
+        var limited = false
+        for _ in 0..<8 {
+            do { _ = try access.handle(request("workspace.terminal.input", chunk), root: root) }
+            catch let error as HostFailure where error.code == "terminal_limit" { limited = true; break }
+        }
+        XCTAssertTrue(limited, "Unread input is bounded instead of blocking")
+        _ = try access.handle(request("workspace.terminal.close", fields), root: root)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+    }
+
+    func testExitedTerminalsAreReapedWhenCapacityIsNeeded() throws {
+        let root = try fixture(), access = RemoteWorkspaceAccess()
+        for index in 0..<RemoteWorkspaceTerminals.sessionLimit {
+            let fields: [String: HostValue] = ["terminalId": .string("shell-\(index)")]
+            _ = try access.handle(request("workspace.terminal.open", fields), root: root)
+            var exit = fields; exit["input"] = .string("exit\n")
+            _ = try access.handle(request("workspace.terminal.input", exit), root: root)
+        }
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, try (0..<RemoteWorkspaceTerminals.sessionLimit).contains(where: {
+            try access.handle(request("workspace.terminal.read", ["terminalId": .string("shell-\($0)")]), root: root)["running"].bool == true
+        }) { Thread.sleep(forTimeInterval: 0.05) }
+        let fresh: [String: HostValue] = ["terminalId": .string("fresh")]
+        XCTAssertEqual(try access.handle(request("workspace.terminal.open", fresh), root: root)["running"].bool, true)
+        _ = try access.handle(request("workspace.terminal.close", fresh), root: root)
+        XCTAssertThrowsError(try access.handle(request("workspace.terminal.read", ["terminalId": .string("shell-0")]), root: root))
+    }
 }

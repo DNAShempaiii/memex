@@ -28,11 +28,16 @@ host. It uses the exact hostname, existing SSH authentication and strict host-ke
 checking; unknown keys or interactive authentication must be resolved in the
 user's SSH client. Pairing never installs software or sends a prompt. Failed
 pairing closes only a tunnel created by that attempt; Memex closes its own tunnels
-when it quits.
+when it quits. New SSH configurations choose a random local port, and the tunnel
+disables SSH connection sharing so the forward is bound by the `ssh` process Memex
+started. Before every request through the tunnel, including pairing's `host.info`,
+Memex uses libproc to verify that this exact `ssh` process owns the listening
+socket on `127.0.0.1:<local port>`, waiting up to ten seconds. If another process
+holds the port, the execution token is neither saved nor sent.
 
 ## Delivery and recovery
 
-Every mutation has a client-generated `commandId`. The host persists the exact request before crossing a provider boundary. Retrying that ID with the same request returns the existing receipt; changing its contents is an error. Keep the original `issuedAt` as well as the command ID when retrying provider commands.
+Every mutation has a client-generated `commandId`. The host persists a SHA-256 digest of the exact canonical request before crossing a provider boundary. Retrying that ID with the same request returns the existing receipt; changing its contents is an error. Keep the original `issuedAt` as well as the command ID when retrying provider commands. Receipts store the request digest, not its parameters (attachments, file contents and handoff packages are never retained), and keep results up to 64 KiB. A retried command whose larger result was not retained returns current state for `conversation.resume` and terminal operations, and `result_not_retained` otherwise; it never runs again. Receipts are kept for seven days, at most 1,000; executing receipts are never pruned. Retry within that window.
 
 Native and web clients persist outgoing requests before network dispatch. A timeout leaves that request available for inspection and exact retry. A host receipt marked `completed` means the host operation was accepted, not that the agent's turn finished. The `deliveries` and runtime turn snapshot establish provider acknowledgement and terminal status.
 
@@ -40,7 +45,7 @@ After a host restart, sessions remain disconnected until explicitly resumed, und
 
 Schedules use the same durable queue and provider dispatch as interactive messages. CRUD, pause/resume, and run-now are available through the native connection view, web UI, and control API. Choose either an interval of 60 seconds to one year (with an optional first run timestamp), or a fixed local `HH:mm` time on selected ISO weekdays (Monday 1 through Sunday 7) in an explicit timezone. The saved timezone governs execution even when the host or viewer changes its system timezone. Editing a prompt without changing recurrence preserves its due time and paused state.
 
-Missed intervals coalesce into one occurrence. For local-time schedules, a time that does not exist during a spring daylight-saving transition is skipped; an autumn repeated time runs only at its first occurrence. A local-time occurrence missed by at least 60 seconds is skipped and recorded in `lastSkippedAt`, with the next run recomputed in its timezone. It is never replayed as a catch-up burst. Held queues and disconnected sessions prevent provider delivery until resumed. Schedule run-now uses the same durable queue and does not silently release a held queue.
+Missed intervals coalesce into one occurrence. For local-time schedules, a time that does not exist during a spring daylight-saving transition is skipped; an autumn repeated time runs only at its first occurrence. A local-time occurrence missed by at least 60 seconds is skipped, recorded in `lastSkippedAt`, and listed in `schedule.runs` as a `skipped` run that needs attention, with the next run recomputed in its timezone. It is never replayed as a catch-up burst. Held queues and disconnected sessions prevent provider delivery until resumed. Schedule run-now uses the same durable queue and does not silently release a held queue.
 
 A schedule can instead select `newConversation: {workspaceId, provider, title}`
 to create a fresh native chat for each occurrence. Creation is recorded before
@@ -52,9 +57,12 @@ This is an explicit API trigger, not an implicit filesystem or external webhook
 subscription.
 
 `schedule.runs` retains occurrence status, exact conversation identity when known,
-errors and read state. Acknowledged dispatch is distinct from a terminal native
+errors and read state. It returns the newest runs first, 200 by default (`limit`
+up to 1,000), optionally only those updated after an RFC3339 `since`. Finished runs
+that no longer need attention are kept for 30 days, at most 500; unfinished and
+unread attention-needing runs are never pruned. Acknowledged dispatch is distinct from a terminal native
 turn. `notificationPolicy` accepts `attention` (failures, uncertainty, held work or
-input), `all` (also completion/interruption), or `never`. Marking a run read changes
+input or a skipped fixed-time run), `all` (also completion/interruption), or `never`. Marking a run read changes
 inbox attention, not its provider state. The native app polls paired hosts while
 running, quietly baselines existing runs, and uses the existing opt-in macOS
 notification settings. Web/mobile exposes the inbox without claiming an OS push
@@ -64,14 +72,19 @@ notification channel.
 
 Files, diff and terminal operations resolve a currently registered workspace on
 the execution host. Relative paths cannot cross symlinks or access Git metadata;
-file reads/edits accept regular singly linked UTF-8 files up to 2 MiB. Saves require
+file reads/edits accept regular singly linked UTF-8 files up to 2 MiB. Reads take no
+advisory lock. Saves wait at most one second for another process's `flock` and
+otherwise fail with `file_locked`, retaining the draft. Saves require
 the exact loaded revision and retain the viewer's draft on conflict. The native
 remote editor keys drafts by host, workspace and path. Diff output is bounded.
 
 Terminals are host-owned PTYs with exact workspace/terminal identifiers, bounded
 output and cursor-based reads. Opening a remote terminal does not spawn a local
 shell. Closing the native pane detaches the viewer; closing the terminal is a
-separate explicit action. Host restart ends those shell processes. Removing a
+separate explicit action. Input is written off the host lock; up to 256 KiB of
+unread input is buffered, beyond which input fails with `terminal_limit` until the
+shell reads. A host keeps at most eight terminals; exited ones keep their final
+output until capacity is needed. Host restart ends those shell processes. Removing a
 workspace grant revokes file/diff/terminal access.
 
 ## Moving the same native chat
@@ -84,11 +97,17 @@ clean Git checkout, or the exact unchanged retained snapshot from an earlier mov
 The original checkout stays available. Pending turns, requests, queued commands,
 enabled schedules, open host terminals, unsupported Git states or oversized payloads
 block the operation before ownership changes. Workspace snapshots are limited to
-16 MiB/10,000 entries and native JSONL history to 8 MiB; limits reject the entire
-transfer rather than omit files. Submodules, split/sparse indexes and hardlinked or
+16 MiB/10,000 entries, native JSONL history to 8 MiB, and the encoded package
+(base64 file data plus metadata) to 30 MiB; limits reject the entire transfer
+rather than omit files. The source measures the complete package before fencing
+or detaching the conversation, so an oversized move leaves ownership unchanged. Submodules, split/sparse indexes and hardlinked or
 special files require an explicit manual workflow.
 
-Pairings pin the host's signing key. Cross-host transfers persist source export,
+Pairings pin the host's signing key in the viewer, and each host pins every peer
+host's signing key on first verified use. A later prepare, install or abort naming
+that peer with a different key is rejected; remove its `peerHandoffKeys` entry from
+the host catalog only after re-verifying the peer. A destination refuses an abort
+tombstone that names itself as the source. Cross-host transfers persist source export,
 private destination installation, source commitment and destination activation separately.
 Installed destination history stays outside native lookup until the signed source
 commitment is durable, so stopping either host cannot expose two native sessions.
@@ -134,7 +153,7 @@ Responses contain the same `id` and either `result` or `error: {code,message}`. 
 | --- | --- |
 | `host.info` | None |
 | `workspace.list` | None; returns startup-registered roots and active host-owned worktrees derived from those grants |
-| `worktree.list` | Optional startup repository `workspaceId`; returns owned active/archived/removed/failed records and `referencedBy` hosted conversation IDs |
+| `worktree.list` | Optional startup repository `workspaceId`; returns owned active/archived/removed/failed records and `referencedBy` hosted conversation IDs. Unfiltered lists also report unreadable or unverifiable reservations with `state: "invalid"` and a `failure`; they are excluded from `workspace.list` |
 | `worktree.create` | `commandId`, startup repository `workspaceId`, optional existing `baseRef`; generated destination and branch only |
 | `worktree.archive` | `commandId`, `worktreeId`, optional `archived` (defaults true); retains all files |
 | `worktree.reattach` | `commandId`, `worktreeId`; restores the retained branch if clean checkout was removed, otherwise preserves existing files |
@@ -158,7 +177,7 @@ Responses contain the same `id` and either `result` or `error: {code,message}`. 
 | `schedule.pause` | `commandId`, `scheduleId`, `paused` |
 | `schedule.delete`, `schedule.run` | `commandId`, `scheduleId` |
 | `schedule.event` | `commandId`, `eventName`, stable `eventId` |
-| `schedule.runs` | Optional `scheduleId` |
+| `schedule.runs` | Optional `scheduleId`, `limit` (default 200, maximum 1,000), RFC3339 `since` |
 | `schedule.run.read` | `commandId`, `runId`, `read` |
 | `workspace.files`, `workspace.file.read` | `workspaceId`, relative `path` (empty path lists root) |
 | `workspace.file.write` | `commandId`, `workspaceId`, relative `path`, loaded `revision`, UTF-8 `text` |
@@ -168,13 +187,15 @@ Responses contain the same `id` and either `result` or `error: {code,message}`. 
 
 Conversation catalog response fields retain Swift identity names (`nativeSessionID`, `providerInstanceID`, `workspaceID`). Request parameter names use `nativeSessionId` and `workspaceId`. A read returns `{conversation,thread,presentation,operations,ready,connected,running,actions,controls,deliveries,queue,queueHeld,warning}`. `presentation` is the existing lossless conversation service representation, while `thread` is the Rust runtime projection. Do not concatenate them as duplicate transcripts.
 
-Control request bodies are limited to 4 MiB, responses to 32 MiB, socket concurrency to eight requests. Long polling is bounded and does not hold the host state lock while waiting. Unsupported provider actions return an explicit failure; provider capability lists govern which controls are enabled.
+Control request bodies are limited to 4 MiB, except `conversation.handoff.install` and `conversation.handoff.abort`, which carry a handoff package and are limited to 32 MiB by both the web gateway and the host socket. Responses are limited to 32 MiB, socket concurrency to eight requests. Long polling is bounded and does not hold the host state lock while waiting. Unsupported provider actions return an explicit failure; provider capability lists govern which controls are enabled.
 
 ## Control MCP and browser boundaries
 
 `memex-control --root /Users/me/.memex` is a separate, opt-in stdio MCP server. Starting it grants the caller same-user execution authority over that root. Its `control` tool accepts the method and params above. The ordinary `memex mcp` server remains retrieval-only.
 
-The native app may attach `desktop.sock` under the same private execution directory. Browser operations are limited to app-owned tabs with an explicit live UI grant. Grants are scoped to the desktop instance, exact conversation, registered tab, and capability, and do not survive app restart. `browser.describe` reveals no ungranted tabs. The execution host derives the exact native conversation key rather than accepting an arbitrary application target. Browser actions have durable host command receipts; unknown outcomes are not automatically retried.
+A launcher that gives an agent `memex-control` should confine it to that agent's hosted conversation with `--conversation <hosted conversation id>` or `MEMEX_CONTROL_CONVERSATION`. A scoped server rejects conversation, queue, browser and schedule operations targeting any conversation other than its own and the direct children it created with `conversation.fork` or `conversation.delegate`. It also rejects `conversation.create`, `conversation.import`, handoff methods, `schedule.event` and new-conversation schedules. Identity reads (`host.info`, `conversation.list`, `workspace.list`, `worktree.list`, `schedule.list`, `schedule.runs`, `command.read`) and workspace/worktree operations remain available. If both are set, `--conversation` must equal the environment value. This scope stops an agent from operating other chats through the tool; it is not a sandbox against a same-user shell, which can reach the control socket directly. Unscoped use by the owner is unchanged.
+
+The native app may attach `desktop.sock` under the same private execution directory. It serves only the process that holds this root's `control.sock` listener, verified per connection with `LOCAL_PEERPID` and libproc, so an agent shell connecting directly is refused with `desktop_peer`. A token file would not help: any secret the host can read, a same-user shell can read too. Browser operations are limited to app-owned tabs with an explicit live UI grant. Grants are scoped to the desktop instance, exact conversation, registered tab, and capability, and do not survive app restart. `browser.describe` reveals no ungranted tabs. The execution host derives the exact native conversation key rather than accepting an arbitrary application target. Browser actions have durable host command receipts; unknown outcomes are not automatically retried.
 
 Browser dispatch supports `snapshot`, `click`, `type`, `scroll`, `evaluate`,
 `navigate`, `back`, `forward`, `reload`, `wait`, `key`, `selectTab`, `record`, and

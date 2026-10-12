@@ -47,17 +47,24 @@ private final class ExecutionHTTPDelegate: NSObject, URLSessionTaskDelegate, Sen
     }
 }
 
+/// Runs before every request, ahead of the credential leaving the process. SSH
+/// connections use it to prove the local listener belongs to Memex's ssh child.
+typealias ExecutionTransportCheck = @Sendable () async throws -> Void
+
 actor ExecutionHostHTTPClient {
     let endpoint: URL
     let hostID: String?
     private let token: String
     private let session: URLSession
     private let outbox: URL
+    private let transportCheck: ExecutionTransportCheck?
 
-    init(endpoint: URL, token: String, hostID: String? = nil, outbox: URL? = nil, requestTimeout: TimeInterval = 65) throws {
+    init(endpoint: URL, token: String, hostID: String? = nil, outbox: URL? = nil, requestTimeout: TimeInterval = 65,
+         transportCheck: ExecutionTransportCheck? = nil) throws {
         self.endpoint = try Self.validatedEndpoint(endpoint)
         self.token = token
         self.hostID = hostID
+        self.transportCheck = transportCheck
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = requestTimeout
         configuration.timeoutIntervalForResource = requestTimeout + 5
@@ -91,6 +98,8 @@ actor ExecutionHostHTTPClient {
             if params["issuedAt"] == nil { params["issuedAt"] = .string(Date().ISO8601Format()) }
         }
         let request = HostRequest(id: .string(commandID), method: method, params: params)
+        // Nothing is saved or sent when the transport cannot be proven.
+        try await transportCheck?()
         let outgoing = outbox.appendingPathComponent(Self.digest(commandID) + ".json")
         if mutation {
             if FileManager.default.fileExists(atPath: outgoing.path) {
@@ -165,13 +174,18 @@ final class ExecutionHostConnections {
         hosts = defaults?.data(forKey: Self.key).flatMap { try? JSONDecoder().decode([ExecutionHostConnection].self, from: $0) } ?? []
     }
 
-    func pair(name: String, machineID: String, endpoint: URL, token: String) async throws -> ExecutionHostConnection {
+    func pair(name: String, machineID: String, endpoint: URL, token: String,
+              transportCheck: ExecutionTransportCheck? = nil) async throws -> ExecutionHostConnection {
         guard !machineID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HostFailure("machine", "Enter the exact Memex machine identifier") }
-        let client = try ExecutionHostHTTPClient(endpoint: endpoint, token: token)
+        let client = try ExecutionHostHTTPClient(endpoint: endpoint, token: token, transportCheck: transportCheck)
         let info = try await client.call("host.info")
         guard let id = info["hostId"].string else { throw HostFailure("pairing", "The endpoint did not identify an execution host") }
         if let existing = hosts.first(where: { $0.machineID == machineID && $0.id != id }) {
             throw HostFailure("machine", "\(machineID) is already paired with \(existing.name). Remove that pairing before changing its execution identity.")
+        }
+        if let existing = hosts.first(where: { $0.id == id }), let pinned = existing.handoffPublicKey,
+           info["handoffPublicKey"].string != pinned {
+            throw HostFailure("pairing", "\(existing.name) now presents a different handoff signing identity. Remove that pairing before trusting the new identity.")
         }
         try ExecutionHostCredential.save(token, id: id)
         let connection = ExecutionHostConnection(id: id, name: name.isEmpty ? machineID : name,
@@ -191,24 +205,27 @@ final class ExecutionHostConnections {
     func connection(for session: Session) -> ExecutionHostConnection? { hosts.first { $0.machineID == session.machineID } }
     func client(_ connection: ExecutionHostConnection) throws -> ExecutionHostHTTPClient {
         if let ssh = connection.ssh { try ExecutionHostSSHTunnels.shared.start(ssh) }
-        return try ExecutionHostHTTPClient(endpoint: connection.endpoint, token: ExecutionHostCredential.read(connection.id), hostID: connection.id)
+        return try ExecutionHostHTTPClient(endpoint: connection.endpoint, token: ExecutionHostCredential.read(connection.id), hostID: connection.id,
+            transportCheck: ExecutionHostSSHTunnels.transportCheck(for: connection))
     }
     func pairSSH(_ configuration: ExecutionHostSSHConfiguration, machineID: String, token: String) async throws -> ExecutionHostConnection {
         let started = try ExecutionHostSSHTunnels.shared.start(configuration)
         do {
-            // Probe the loopback gateway before pairing; never retry a mutation.
+            // The token is sent only once the local port is proven to be our ssh
+            // listener; host.info then identifies the host behind the verified tunnel.
+            let check: ExecutionTransportCheck = { try await ExecutionHostSSHTunnels.shared.requireOwnedListener(configuration) }
             var connected = false
             for _ in 0..<10 {
-                guard ExecutionHostSSHTunnels.shared.isRunning(configuration) else {
-                    throw HostFailure("ssh_connection", "SSH could not establish the tunnel. Check authentication, trusted host key, and ports with your SSH client.")
-                }
                 do {
-                    _ = try await ExecutionHostHTTPClient(endpoint: configuration.endpoint, token: token, requestTimeout: 1).call("host.info")
+                    _ = try await ExecutionHostHTTPClient(endpoint: configuration.endpoint, token: token, requestTimeout: 1, transportCheck: check).call("host.info")
                     connected = true; break
+                } catch let error as HostFailure where ["ssh_connection", "ssh_tunnel"].contains(error.code) {
+                    throw error
                 } catch { try await Task.sleep(for: .milliseconds(250)) }
             }
             guard connected else { throw HostFailure("ssh_connection", "The SSH tunnel did not reach the configured Memex execution gateway") }
-            var host = try await pair(name: configuration.hostname, machineID: machineID, endpoint: configuration.endpoint, token: token)
+            var host = try await pair(name: configuration.hostname, machineID: machineID, endpoint: configuration.endpoint, token: token,
+                transportCheck: check)
             host.ssh = configuration
             hosts.removeAll { $0.id == host.id }; hosts.append(host)
             try save()

@@ -4,6 +4,8 @@ import Darwin
 /// Host-owned PTYs survive viewer disconnects. Only explicit close or host exit
 /// ends a shell. Ring-buffer cursors make reconnects bounded and loss explicit.
 final class RemoteWorkspaceTerminals {
+    static let sessionLimit = 8
+    static let pendingInputLimit = 256 * 1024
     private final class Terminal: @unchecked Sendable {
         let id: String
         let root: String
@@ -15,18 +17,24 @@ final class RemoteWorkspaceTerminals {
         var ready = false
         var pendingInput = Data()
         var inputFailure: String?
+        private var writing = false
+        private var stopped = false
+        /// PTY writes block when the shell stops reading. They run on this queue
+        /// through a duplicate descriptor, never while a host or terminal lock is held.
+        private let writer = DispatchQueue(label: "memex.workspace-terminal.input")
+        private let inputDescriptor: Int32
         init(id: String, root: String, process: Process, master: FileHandle) {
             self.id = id; self.root = root; self.process = process; self.master = master
+            inputDescriptor = dup(master.fileDescriptor)
+            if inputDescriptor >= 0 { _ = fcntl(inputDescriptor, F_SETFD, FD_CLOEXEC) }
+            else { inputFailure = "Terminal input channel is unavailable" }
         }
         func append(_ data: Data) {
             lock.withLock {
                 output.append(data)
                 if !ready {
                     ready = true
-                    if !pendingInput.isEmpty {
-                        do { try master.write(contentsOf: pendingInput); pendingInput.removeAll() }
-                        catch { inputFailure = "Terminal startup input could not be written: " + error.localizedDescription }
-                    }
+                    scheduleFlush()
                 }
                 if output.count > 1024 * 1024 {
                     let excess = output.count - 1024 * 1024
@@ -37,19 +45,60 @@ final class RemoteWorkspaceTerminals {
         func send(_ data: Data) throws {
             try lock.withLock {
                 if let inputFailure { throw HostFailure("terminal_io", inputFailure) }
-                guard pendingInput.count + data.count <= 65536 else { throw HostFailure("terminal_limit", "Terminal startup input exceeds 64 KiB") }
-                if ready { try master.write(contentsOf: data) }
-                else { pendingInput.append(data) }
+                guard !stopped else { throw HostFailure("terminal_io", "Terminal is closed") }
+                guard pendingInput.count + data.count <= RemoteWorkspaceTerminals.pendingInputLimit else {
+                    throw HostFailure("terminal_limit", "The shell is not reading input; wait for pending terminal input to drain")
+                }
+                pendingInput.append(data)
+                if ready { scheduleFlush() }
+            }
+        }
+        var pendingInputCount: Int { lock.withLock { pendingInput.count } }
+        /// Requires `lock`.
+        private func scheduleFlush() {
+            guard !writing, !stopped, !pendingInput.isEmpty, inputFailure == nil else { return }
+            writing = true
+            writer.async { [self] in flush() }
+        }
+        private func flush() {
+            while true {
+                let chunk: Data? = lock.withLock {
+                    guard !stopped, !pendingInput.isEmpty else { writing = false; return nil }
+                    return Data(pendingInput.prefix(16384))
+                }
+                guard let chunk else { return }
+                let written = chunk.withUnsafeBytes { Darwin.write(inputDescriptor, $0.baseAddress, $0.count) }
+                if written < 0 && errno == EINTR { continue }
+                let failure = written <= 0 ? String(cString: strerror(errno)) : nil
+                lock.withLock {
+                    if let failure {
+                        inputFailure = "Terminal input could not be written: " + failure
+                        pendingInput.removeAll(); writing = false
+                    } else {
+                        // stop() may have discarded pending input during the write.
+                        pendingInput.removeFirst(min(written, pendingInput.count))
+                    }
+                }
+                if failure != nil { return }
             }
         }
         func stop() {
+            let alreadyStopped = lock.withLock { () -> Bool in
+                defer { stopped = true; pendingInput.removeAll() }
+                return stopped
+            }
+            guard !alreadyStopped else { return }
             master.readabilityHandler = nil
             if process.isRunning {
                 let pid = process.processIdentifier
-                if pid > 1, getpgid(pid) == pid, pid != getpgrp() { kill(-pid, SIGHUP) }
-                else { process.terminate() }
+                // SIGCONT lets a stopped shell receive its hangup.
+                if pid > 1, getpgid(pid) == pid, pid != getpgrp() { kill(-pid, SIGHUP); kill(-pid, SIGCONT) }
+                else { process.terminate(); kill(pid, SIGCONT) }
             }
             try? master.close()
+            // Serialized after any in-flight write, which fails once the shell exits.
+            let descriptor = inputDescriptor
+            if descriptor >= 0 { writer.async { Darwin.close(descriptor) } }
         }
         deinit { stop() }
     }
@@ -62,7 +111,11 @@ final class RemoteWorkspaceTerminals {
             throw HostFailure("invalid_params", "A terminal identity is required")
         }
         if request.method == "workspace.terminal.open", sessions[id] == nil {
-            guard sessions.count < 8 else { throw HostFailure("terminal_limit", "Close an existing terminal before opening another") }
+            if sessions.count >= Self.sessionLimit {
+                // Exited shells keep their final output until capacity is needed.
+                for (key, exited) in sessions where !exited.process.isRunning { exited.stop(); sessions.removeValue(forKey: key) }
+            }
+            guard sessions.count < Self.sessionLimit else { throw HostFailure("terminal_limit", "Close an existing terminal before opening another") }
             var master: Int32 = -1, slave: Int32 = -1
             var size = winsize(ws_row: 24, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0)
             guard openpty(&master, &slave, nil, nil, &size) == 0 else { throw HostFailure("terminal_io", "Cannot allocate host terminal") }

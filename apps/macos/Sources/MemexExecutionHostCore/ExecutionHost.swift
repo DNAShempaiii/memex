@@ -1,13 +1,22 @@
 import Foundation
+import CryptoKit
 import Darwin
 
 public final class ExecutionHost: @unchecked Sendable {
     struct Workspace: Codable { var id: String; var path: String; var worktreeID: String?; var repositoryWorkspaceID: String? }
+    /// Idempotency record. Only a digest of the canonical request is retained:
+    /// params can carry attachments, file contents and whole handoff packages.
     struct Receipt: Codable {
-        var request: HostValue
+        var requestDigest: String?
+        /// Legacy catalogs stored full params; they are digested at load.
+        var request: HostValue?
+        var method: String?
         var status: String
         var result: HostValue?
+        /// The result exceeded the retention bound and was not stored.
+        var resultOmitted: Bool?
         var error: String?
+        var createdAt: Date?
     }
     struct Queued: Codable {
         var command: HostedCommand
@@ -40,6 +49,8 @@ public final class ExecutionHost: @unchecked Sendable {
         var schedules: [Schedule] = []
         var scheduleRuns: [HostScheduleRun]?
         var handoffs: [HostHandoffRecord]?
+        /// Handoff signing keys pinned per peer host on first verified use.
+        var peerHandoffKeys: [String: String]?
     }
 
     public let directory: URL
@@ -51,6 +62,8 @@ public final class ExecutionHost: @unchecked Sendable {
     private let handoffSigner: HostHandoffSigner
     private var catalog: Catalog
     private let now: () -> Date
+    private var verifiedManagedWorkspaces: [String: Date] = [:]
+    private static let managedVerificationLifetime: TimeInterval = 3
 
     public init(directory: URL, workspaceRoots: [URL], providerFactory: (String) throws -> any ExecutionProvider,
                 now: @escaping () -> Date = Date.init) throws {
@@ -79,6 +92,18 @@ public final class ExecutionHost: @unchecked Sendable {
         for key in catalog.receipts.keys where catalog.receipts[key]?.status == "executing" {
             catalog.receipts[key]?.status = "uncertain"
             catalog.receipts[key]?.error = "Host restarted before command outcome was recorded; inspect native history before retrying."
+        }
+        for key in catalog.receipts.keys {
+            // Migrate full-parameter receipts to digests and bounded results.
+            guard var receipt = catalog.receipts[key] else { continue }
+            if let legacy = receipt.request {
+                receipt.requestDigest = try Self.requestDigest(legacy)
+                receipt.method = legacy["method"].string
+                receipt.request = nil
+            }
+            if let result = receipt.result, !(try Self.retainsResult(result)) { receipt.result = nil; receipt.resultOmitted = true }
+            receipt.createdAt = receipt.createdAt ?? now()
+            catalog.receipts[key] = receipt
         }
         for index in catalog.queue.indices where ["queued", "dispatching"].contains(catalog.queue[index].status) {
             catalog.queue[index].status = catalog.queue[index].status == "dispatching" ? "uncertain" : "held"
@@ -139,7 +164,10 @@ public final class ExecutionHost: @unchecked Sendable {
         case "worktree.list":
             let repository = p["workspaceId"]?.string
             if let repository { _ = try registeredWorkspace(repository) }
-            return .array(try managedEntries().filter { repository == nil || $0.workspace.sourceDirectory.path == repository }.map(worktreeValue))
+            let scan = try managedScan()
+            let valid = try scan.entries.filter { repository == nil || $0.workspace.sourceDirectory.path == repository }.map(worktreeValue)
+            // Damaged reservations are listed, never silently hidden or fatal to the list.
+            return .array(valid + (repository == nil ? scan.invalid.map(Self.invalidWorktreeValue) : []))
         case "conversation.list":
             return .array(try catalog.conversations.map { conversation in
                 var value = try HostValue.encoded(conversation).object
@@ -158,7 +186,22 @@ public final class ExecutionHost: @unchecked Sendable {
             return try .encoded(receipt)
         case "schedule.list": return try .encoded(catalog.schedules)
         case "schedule.runs":
-            return .array(try (catalog.scheduleRuns ?? []).filter { p["scheduleId"]?.string == nil || $0.scheduleID == p["scheduleId"]?.string }.reversed().map { run in
+            // Newest first, bounded. `since` returns only runs updated after an
+            // RFC3339 instant so pollers need not re-read the whole history.
+            let limit = p["limit"]?.number ?? Double(Self.scheduleRunsDefaultLimit)
+            guard limit.isFinite, limit >= 1, limit <= Double(Self.scheduleRunsMaximumLimit) else {
+                throw HostFailure("invalid_params", "limit must be between 1 and \(Self.scheduleRunsMaximumLimit)")
+            }
+            let since = try p["since"].map { value -> Date in
+                guard let text = value.string, let date = ISO8601DateFormatter().date(from: text) ?? Self.fractionalDate(text) else {
+                    throw HostFailure("invalid_params", "since must be an RFC3339 timestamp")
+                }
+                return date
+            }
+            let runs = (catalog.scheduleRuns ?? []).reversed().filter { run in
+                (p["scheduleId"]?.string == nil || run.scheduleID == p["scheduleId"]?.string) && (since.map { run.updatedAt > $0 } ?? true)
+            }
+            return .array(try runs.prefix(Int(limit)).map { run in
                 var value = try HostValue.encoded(run).object
                 value["needsAttention"] = .bool(run.needsAttention)
                 return .object(value)
@@ -182,18 +225,22 @@ public final class ExecutionHost: @unchecked Sendable {
             "worktree.create", "worktree.archive", "worktree.reattach", "worktree.cleanup", "schedule.event", "schedule.run.read"]
         guard allowed.contains(request.method) || RemoteWorkspaceAccess.mutationMethods.contains(request.method) || Self.handoffMutationMethods.contains(request.method) else { throw HostFailure("method_not_found", "Unknown execution operation: \(request.method)") }
         let id = try required(request.params, "commandId")
-        let identity: HostValue = .object(["method": .string(request.method), "params": .object(request.params)])
+        let digest = try Self.requestDigest(.object(["method": .string(request.method), "params": .object(request.params)]))
         if let existing = catalog.receipts[id] {
-            guard existing.request == identity else { throw HostFailure("id_conflict", "Command ID was already used with different parameters") }
-            if existing.status == "completed", let result = existing.result { return result }
+            guard existing.requestDigest == digest else { throw HostFailure("id_conflict", "Command ID was already used with different parameters") }
+            if existing.status == "completed" {
+                if let result = existing.result { return result }
+                if existing.resultOmitted == true { return try replayOmittedResult(request) }
+            }
             throw HostFailure(existing.status, existing.error ?? "Command delivery is still in progress; inspect its receipt.")
         }
-        catalog.receipts[id] = Receipt(request: identity, status: "executing")
+        catalog.receipts[id] = Receipt(requestDigest: digest, method: request.method, status: "executing", createdAt: now())
         try save()
         do {
             let result = try execute(request)
             catalog.receipts[id]?.status = "completed"
-            catalog.receipts[id]?.result = result
+            if try Self.retainsResult(result) { catalog.receipts[id]?.result = result }
+            else { catalog.receipts[id]?.resultOmitted = true }
             try save()
             return result
         } catch {
@@ -208,6 +255,16 @@ public final class ExecutionHost: @unchecked Sendable {
     }
 
     private func execute(_ request: HostRequest) throws -> HostValue {
+        // Lifecycle and handoff changes invalidate cached managed-checkout verification.
+        if request.method.hasPrefix("worktree.") || Self.handoffMutationMethods.contains(request.method) {
+            verifiedManagedWorkspaces.removeAll()
+            defer { verifiedManagedWorkspaces.removeAll() }
+            return try executeOperation(request)
+        }
+        return try executeOperation(request)
+    }
+
+    private func executeOperation(_ request: HostRequest) throws -> HostValue {
         let p = request.params
         if Self.handoffMutationMethods.contains(request.method) { return try handoffMutation(request) }
         if let id = p["conversationId"]?.string { try requireHandoffAvailable(id) }
@@ -469,32 +526,52 @@ public final class ExecutionHost: @unchecked Sendable {
         }
     }
 
+    /// One bad schedule, queue entry or run never stops the others: each failure
+    /// is recorded on that item and the pass continues. Only persistence fails a tick.
     public func tick() throws {
         try lock.withLock {
             for index in catalog.schedules.indices where !catalog.schedules[index].paused && catalog.schedules[index].eventName == nil && catalog.schedules[index].nextRunAt <= now() {
                 let schedule = catalog.schedules[index]
                 let id = "schedule-\(schedule.id)-\(Int64(schedule.nextRunAt.timeIntervalSince1970))"
-                if let wallClock = schedule.wallClock {
-                    // A late fixed-time run is skipped, not replayed later in a burst.
-                    // The one-minute grace allows normal scheduler latency.
-                    if now().timeIntervalSince(schedule.nextRunAt) < 60 { try enqueueSchedule(index, commandID: id) }
-                    else { catalog.schedules[index].lastSkippedAt = schedule.nextRunAt }
-                    catalog.schedules[index].nextRunAt = try wallClock.next(after: now())
-                } else if let interval = schedule.intervalSeconds {
-                    try enqueueSchedule(index, commandID: id)
-                    // Preserve legacy interval coalescing. Advancing and enqueueing
-                    // share one durable write, so restart cannot duplicate an occurrence.
-                    catalog.schedules[index].nextRunAt = now().addingTimeInterval(interval)
-                } else { throw HostFailure("schedule_time", "Schedule has no recurrence") }
+                do {
+                    if let wallClock = schedule.wallClock {
+                        // A late fixed-time run is skipped, not replayed later in a burst.
+                        // The one-minute grace allows normal scheduler latency.
+                        let lateness = now().timeIntervalSince(schedule.nextRunAt)
+                        if lateness < 60 { try enqueueSchedule(index, commandID: id) }
+                        else { recordSkippedRun(index, commandID: id, lateness: lateness) }
+                        catalog.schedules[index].nextRunAt = try wallClock.next(after: now())
+                    } else if let interval = schedule.intervalSeconds {
+                        try enqueueSchedule(index, commandID: id)
+                        // Preserve legacy interval coalescing. Advancing and enqueueing
+                        // share one durable write, so restart cannot duplicate an occurrence.
+                        catalog.schedules[index].nextRunAt = now().addingTimeInterval(interval)
+                    } else { throw HostFailure("schedule_time", "Schedule has no recurrence") }
+                } catch let error as HostFailure where error.code == "persistence" {
+                    throw error
+                } catch {
+                    // An unschedulable recurrence stops only this schedule, visibly.
+                    catalog.schedules[index].lastError = error.localizedDescription
+                    catalog.schedules[index].nextRunAt = .distantFuture
+                }
                 try save()
             }
             for index in catalog.queue.indices where catalog.queue[index].status == "queued" {
                 let command = catalog.queue[index].command
                 guard !catalog.heldConversations.contains(command.conversationID), !isHandoffFenced(command.conversationID), provider.isConnected(command.conversationID) else { continue }
-                let c = try conversation(command.conversationID)
-                _ = try authorizedWorkspace(c.workspaceID)
-                let snapshot = try provider.read(c)
-                guard snapshot["ready"].bool == true, snapshot["running"].bool != true else { continue }
+                do {
+                    let c = try conversation(command.conversationID)
+                    _ = try authorizedWorkspace(c.workspaceID)
+                    let snapshot = try provider.read(c)
+                    guard snapshot["ready"].bool == true, snapshot["running"].bool != true else { continue }
+                } catch {
+                    // Hold the entry with its reason; queue.resume rearms it.
+                    catalog.queue[index].status = "held"
+                    catalog.queue[index].error = error.localizedDescription
+                    catalog.heldConversations.insert(command.conversationID)
+                    try save()
+                    continue
+                }
                 catalog.queue[index].status = "dispatching"
                 try save()
                 do {
@@ -512,9 +589,10 @@ public final class ExecutionHost: @unchecked Sendable {
                 for index in catalog.scheduleRuns!.indices {
                     let run = catalog.scheduleRuns![index]
                     guard let queued = catalog.queue.first(where: { $0.command.id == run.id }),
-                          !["completed", "failed", "interrupted", "cancelled"].contains(run.status) else { continue }
-                    let snapshot = try run.conversationID.flatMap { id in
-                        provider.isConnected(id) ? try provider.read(conversation(id)) : nil
+                          !HostScheduleRun.finalStatuses.contains(run.status) else { continue }
+                    // A snapshot failure leaves this run's status unchanged until a later pass.
+                    let snapshot = run.conversationID.flatMap { id in
+                        provider.isConnected(id) ? try? provider.read(conversation(id)) : nil
                     }
                     let queueStatus = queued.status == "queued" && catalog.heldConversations.contains(queued.command.conversationID) ? "held" : queued.status
                     catalog.scheduleRuns![index].reconcile(queueStatus: queueStatus, snapshot: snapshot, at: now())
@@ -522,6 +600,18 @@ public final class ExecutionHost: @unchecked Sendable {
                 if beforeRuns != catalog.scheduleRuns { try save() }
             }
         }
+    }
+
+    /// A missed fixed-time occurrence is a visible inbox entry, not only a timestamp.
+    private func recordSkippedRun(_ index: Int, commandID: String, lateness: TimeInterval) {
+        let schedule = catalog.schedules[index]
+        catalog.schedules[index].lastSkippedAt = schedule.nextRunAt
+        guard !(catalog.scheduleRuns ?? []).contains(where: { $0.id == commandID }) else { return }
+        var run = HostScheduleRun(id: commandID, scheduleID: schedule.id, createdAt: now(), updatedAt: now(),
+            status: "skipped", notificationPolicy: schedule.notificationPolicy ?? "attention")
+        run.conversationID = schedule.conversationID.isEmpty ? nil : schedule.conversationID
+        run.error = "Skipped: the host reached this fixed-time run \(Int(lateness / 60)) minute(s) late (asleep or busy). Missed fixed-time runs are not replayed."
+        catalog.scheduleRuns = (catalog.scheduleRuns ?? []) + [run]
     }
 
     private func enqueueSchedule(_ index: Int, commandID: String) throws {
@@ -630,11 +720,15 @@ public final class ExecutionHost: @unchecked Sendable {
     }
     private func authorizedWorkspace(_ id: String) throws -> String {
         if catalog.workspaces.contains(where: { $0.id == id }) { return try registeredWorkspace(id) }
+        // Managed checkout validation runs Git subprocesses while the host lock is
+        // held. Conversation polls reuse a just-verified result briefly.
+        if let cached = verifiedManagedWorkspaces[id], Date().timeIntervalSince(cached) < Self.managedVerificationLifetime { return id }
         guard let entry = try managedEntries().first(where: { $0.workspace.workingDirectory.path == id && !$0.removed && $0.workspace.state == .ready }) else {
             throw HostFailure("workspace_denied", "Workspace is not registered on this execution host")
         }
         _ = try registeredWorkspace(entry.workspace.sourceDirectory.path)
         try ManagedWorkspaceStore.validateManaged(entry.workspace, managedRoot: worktrees.managedRoot, requireCheckout: true, command: CommandRun())
+        verifiedManagedWorkspaces[id] = Date()
         return entry.workspace.workingDirectory.path
     }
     private func registeredWorkspace(_ id: String) throws -> String {
@@ -644,18 +738,34 @@ public final class ExecutionHost: @unchecked Sendable {
         }
         return workspace.path
     }
-    private func managedEntries() throws -> [ManagedWorkspaceEntry] {
+    private func managedEntries() throws -> [ManagedWorkspaceEntry] { try managedScan().entries }
+    /// One invalid manifest never breaks workspace or worktree listing; it is
+    /// skipped here and reported by worktree.list.
+    private func managedScan() throws -> (entries: [ManagedWorkspaceEntry], invalid: [InvalidManagedWorkspace]) {
         if FileManager.default.fileExists(atPath: worktrees.managedRoot.path) {
             try Self.requirePrivateDirectory(worktrees.managedRoot)
         }
-        return try worktrees.managedWorkspaces().filter { entry in
+        let scan = try worktrees.scanManagedWorkspaces()
+        var invalid = scan.invalid
+        let entries = scan.entries.filter { entry in
             let workspace = entry.workspace
+            guard workspace.repositoryRoot?.path == workspace.sourceDirectory.path,
+                  catalog.workspaces.contains(where: { $0.id == workspace.sourceDirectory.path }) else { return false }
             if workspace.state == .ready {
-                try ManagedWorkspaceStore.validateManaged(workspace, managedRoot: worktrees.managedRoot, requireCheckout: false, command: CommandRun())
+                do { try ManagedWorkspaceStore.validateManaged(workspace, managedRoot: worktrees.managedRoot, requireCheckout: false, command: CommandRun()) }
+                catch {
+                    invalid.append(InvalidManagedWorkspace(id: entry.id, path: workspace.workingDirectory.path, reason: error.localizedDescription))
+                    return false
+                }
             }
-            return workspace.repositoryRoot?.path == workspace.sourceDirectory.path
-                && catalog.workspaces.contains(where: { $0.id == workspace.sourceDirectory.path })
+            return true
         }
+        return (entries, invalid)
+    }
+    private static func invalidWorktreeValue(_ entry: InvalidManagedWorkspace) -> HostValue {
+        .object(["id": .string(entry.id), "workspaceId": .string(""), "repositoryWorkspaceId": .string(""), "path": .string(entry.path),
+            "branch": .null, "baseRef": .null, "state": .string("invalid"), "failure": .string(entry.reason),
+            "archived": .bool(false), "removed": .bool(false), "referencedBy": .array([])])
     }
     private func availableWorkspaces() throws -> [Workspace] {
         catalog.workspaces + (try managedEntries().filter { !$0.archived && !$0.removed && $0.workspace.state == .ready }.map { entry in
@@ -685,6 +795,7 @@ public final class ExecutionHost: @unchecked Sendable {
         let format = ISO8601DateFormatter(); format.formatOptions.insert(.withFractionalSeconds); return format.date(from: value)
     }
     private func save() throws {
+        pruneHistory()
         let file = directory.appendingPathComponent("catalog.json")
         try JSONEncoder().encode(catalog).write(to: file, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
@@ -702,6 +813,72 @@ public final class ExecutionHost: @unchecked Sendable {
         guard lstat(directory.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFDIR,
               info.st_uid == getuid(), info.st_mode & 0o077 == 0 else {
             throw HostFailure("permissions", "Execution directory must be owned by this user, mode 0700, and not a symlink")
+        }
+    }
+}
+
+/// Bounded durable history. The catalog is rewritten on every mutation, so
+/// receipts, finished runs and dispatched queue entries are retained by age and count.
+extension ExecutionHost {
+    static let receiptResultLimit = 64 * 1024
+    static let receiptLifetime: TimeInterval = 7 * 24 * 60 * 60
+    static let receiptLimit = 1000
+    static let finishedRunLifetime: TimeInterval = 30 * 24 * 60 * 60
+    static let finishedRunLimit = 500
+    static let finishedQueueLimit = 200
+    static let scheduleRunsDefaultLimit = 200
+    static let scheduleRunsMaximumLimit = 1000
+
+    static func requestDigest(_ identity: HostValue) throws -> String {
+        SHA256.hash(data: try HostHandoffSigner.encoded(identity)).map { String(format: "%02x", $0) }.joined()
+    }
+    static func retainsResult(_ result: HostValue) throws -> Bool {
+        try JSONEncoder().encode(result).count <= receiptResultLimit
+    }
+
+    /// A completed command whose large result was not retained. State-view
+    /// results are recomputed; others never re-execute.
+    private func replayOmittedResult(_ request: HostRequest) throws -> HostValue {
+        let p = request.params
+        switch request.method {
+        case "conversation.resume": return try read(required(p, "conversationId"))
+        case "workspace.terminal.open", "workspace.terminal.input", "workspace.terminal.resize":
+            return try workspaceAccess.handle(HostRequest(id: request.id, method: "workspace.terminal.read", params: p),
+                root: URL(fileURLWithPath: authorizedWorkspace(required(p, "workspaceId"))))
+        default:
+            throw HostFailure("result_not_retained", "This command already completed. Its large result was not retained; reload the current state instead of retrying.")
+        }
+    }
+
+    /// Never drops an executing receipt, an unfinished or attention-needing run,
+    /// or a queue entry an unfinished run still reconciles against.
+    private func pruneHistory() {
+        let current = now()
+        var receipts = catalog.receipts.filter { _, receipt in
+            receipt.status == "executing" || current.timeIntervalSince(receipt.createdAt ?? current) < Self.receiptLifetime
+        }
+        if receipts.count > Self.receiptLimit {
+            let removable = receipts.filter { $0.value.status != "executing" }
+                .sorted { ($0.value.createdAt ?? .distantPast) < ($1.value.createdAt ?? .distantPast) }
+            for (key, _) in removable.prefix(receipts.count - Self.receiptLimit) { receipts.removeValue(forKey: key) }
+        }
+        if receipts.count != catalog.receipts.count { catalog.receipts = receipts }
+
+        if let runs = catalog.scheduleRuns {
+            func prunable(_ run: HostScheduleRun) -> Bool { HostScheduleRun.finalStatuses.contains(run.status) && !run.needsAttention }
+            let recent = Set(runs.filter(prunable).sorted { $0.updatedAt > $1.updatedAt }
+                .prefix(Self.finishedRunLimit).filter { current.timeIntervalSince($0.updatedAt) < Self.finishedRunLifetime }.map(\.id))
+            let kept = runs.filter { !prunable($0) || recent.contains($0.id) }
+            if kept.count != runs.count { catalog.scheduleRuns = kept }
+        }
+
+        let reconciling = Set((catalog.scheduleRuns ?? []).filter { !HostScheduleRun.finalStatuses.contains($0.status) }.map(\.id))
+        let finished = catalog.queue.indices.filter {
+            ["dispatched", "cancelled"].contains(catalog.queue[$0].status) && !reconciling.contains(catalog.queue[$0].command.id)
+        }
+        if finished.count > Self.finishedQueueLimit {
+            let removed = Set(finished.prefix(finished.count - Self.finishedQueueLimit))
+            catalog.queue = catalog.queue.indices.filter { !removed.contains($0) }.map { catalog.queue[$0] }
         }
     }
 }
@@ -778,6 +955,39 @@ private extension ExecutionHost {
         }
         return root
     }
+    /// Trust on first verified use, per peer host identity. A later operation
+    /// naming that host with another signing key is rejected, whatever the viewer sends.
+    func requirePinnedPeer(_ hostID: String, key: String) throws {
+        if let pinned = catalog.peerHandoffKeys?[hostID], pinned != key {
+            throw HostFailure("handoff_identity", "Host \(hostID) previously used a different handoff signing key; this host refuses the changed identity")
+        }
+    }
+    func pinPeer(_ hostID: String, key: String) {
+        if catalog.peerHandoffKeys?[hostID] == nil { catalog.peerHandoffKeys = (catalog.peerHandoffKeys ?? [:]).merging([hostID: key]) { old, _ in old } }
+    }
+    /// Measures the exact transfer before the source is fenced or detached, so
+    /// an oversized move fails while ownership is unchanged.
+    func preflightHandoffSize(_ c: HostedConversation, destinationHostID: String, destinationWorkspaceID: String) throws {
+        var transcriptBytes = 0
+        if let path = c.transcriptPath {
+            var info = stat()
+            if lstat(path, &info) == 0 { transcriptBytes = Int(info.st_size) }
+        }
+        guard transcriptBytes <= NativeConversationTransferValidation.limit else {
+            throw HostFailure("handoff_limit", "The native transcript exceeds the 8 MiB transfer bound; nothing was fenced or moved")
+        }
+        let workspace = try handoffFiles.export(root: URL(fileURLWithPath: authorizedWorkspace(c.workspaceID)))
+        let estimate = HostHandoffPackage(operationID: UUID().uuidString, sourceHostID: catalog.hostID, destinationHostID: destinationHostID,
+            destinationWorkspaceID: destinationWorkspaceID,
+            native: NativeConversationTransfer(conversation: c, transcript: Data(count: transcriptBytes), transcriptSHA256: String(repeating: "0", count: 64)),
+            workspace: workspace)
+        // Placeholder transcript bytes encode to the same base64 length; allow
+        // generously for JSON-escaped "/" characters in the real transcript.
+        let escapeAllowance = (transcriptBytes + 2) / 3 * 4 / 16
+        guard try HostHandoffSigner.encoded(estimate).count + escapeAllowance <= HostHandoffSigner.packageLimit else {
+            throw HostFailure("handoff_limit", "Combined native and workspace transfer would exceed 30 MiB; nothing was fenced or moved")
+        }
+    }
     func handoffPackageURL(_ id: String) throws -> URL {
         guard UUID(uuidString: id) != nil else { throw HostFailure("invalid_params", "Handoff identity must be a UUID") }
         let path = directory.appendingPathComponent("handoff-packages")
@@ -835,20 +1045,23 @@ private extension ExecutionHost {
                 }
                 return try handoffValue(existing)
             }
+            let peerKey = local ? handoffSigner.publicKey : try required(p, "destinationPublicKey")
+            guard let key = Data(base64Encoded: peerKey), key.count == 32 else { throw HostFailure("invalid_params", "A pinned destination public key is required") }
+            if !local { try requirePinnedPeer(destinationHost, key: peerKey) }
             try requireHandoffAvailable(c.id); try requireWorkspaceNotMoving(c.workspaceID); try requireIdleForHandoff(c)
+            try preflightHandoffSize(c, destinationHostID: destinationHost, destinationWorkspaceID: destinationID)
             let destination = local ? try requireHandoffDestination(destinationID) : nil
             let retained = local ? try retainedWorkspace(c.id, workspaceID: destinationID) : nil
             if let destination {
                 if let retained { try handoffFiles.requireSnapshot(retained, at: destination) }
                 else { try handoffFiles.requireCleanDestination(destination) }
             }
-            let peerKey = local ? handoffSigner.publicKey : try required(p, "destinationPublicKey")
-            guard let key = Data(base64Encoded: peerKey), key.count == 32 else { throw HostFailure("invalid_params", "A pinned destination public key is required") }
             var record = HostHandoffRecord(id: id, role: local ? "local" : "source", phase: "preparing",
                 sourceHostID: catalog.hostID, destinationHostID: destinationHost, peerPublicKey: peerKey, source: c,
                 destinationWorkspaceID: destinationID)
             catalog.handoffs = (catalog.handoffs ?? []) + [record]
             catalog.heldConversations.insert(c.id)
+            if !local { pinPeer(destinationHost, key: peerKey) }
             try save() // Fence every writer/queue path before native detach and capture.
             let index = try handoffIndex(id)
             do {
@@ -887,6 +1100,7 @@ private extension ExecutionHost {
             guard package.operationID == id, package.destinationHostID == catalog.hostID, package.sourceHostID != catalog.hostID else {
                 throw HostFailure("handoff_identity", "Transfer names another operation or destination host")
             }
+            try requirePinnedPeer(package.sourceHostID, key: sourceKey)
             try HostHandoffSigner.verify(decodeHandoff(p["certificate"], as: HostHandoffCertificate.self), publicKey: sourceKey, record: record, stage: "exported")
             if let existing = catalog.handoffs?.first(where: { $0.id == id }) {
                 guard existing.digest == record.digest, existing.peerPublicKey == sourceKey, ["installed", "active"].contains(existing.phase) else {
@@ -911,6 +1125,7 @@ private extension ExecutionHost {
             if let reason = provider.handoffUnavailableReason(record.source) { throw HostFailure("handoff_unsupported", reason) }
             try saveHandoffPackage(package)
             record.recoveryID = id
+            pinPeer(package.sourceHostID, key: sourceKey)
             catalog.handoffs = (catalog.handoffs ?? []) + [record]; try save()
             let index = try handoffIndex(id)
             do {
@@ -997,8 +1212,12 @@ private extension ExecutionHost {
             let record = HostHandoffRecord(id: id, role: "destination", phase: "aborted", sourceHostID: package.sourceHostID,
                 destinationHostID: package.destinationHostID, peerPublicKey: sourceKey, source: package.native.conversation,
                 destinationWorkspaceID: package.destinationWorkspaceID, digest: try HostHandoffSigner.digest(package))
-            guard package.operationID == id, package.destinationHostID == catalog.hostID else { throw HostFailure("handoff_identity", "Wrong destination for cancellation") }
+            guard package.operationID == id, package.destinationHostID == catalog.hostID, package.sourceHostID != catalog.hostID else {
+                throw HostFailure("handoff_identity", "Wrong destination or source for cancellation")
+            }
+            try requirePinnedPeer(package.sourceHostID, key: sourceKey)
             try HostHandoffSigner.verify(decodeHandoff(params["certificate"], as: HostHandoffCertificate.self), publicKey: sourceKey, record: record, stage: "aborting")
+            pinPeer(package.sourceHostID, key: sourceKey)
             catalog.handoffs = (catalog.handoffs ?? []) + [record]; try save()
             return try handoffValue(record)
         }

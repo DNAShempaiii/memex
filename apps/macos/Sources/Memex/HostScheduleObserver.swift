@@ -17,6 +17,7 @@ struct HostScheduleNotificationEvent: Equatable, Sendable {
         case "failed": "Scheduled work failed. Open the run inbox for details."
         case "uncertain": "Scheduled delivery is uncertain. Inspect the run before retrying."
         case "held": "Scheduled work is held and needs attention."
+        case "skipped": "A fixed-time scheduled run was missed and skipped."
         default: "Scheduled work needs attention."
         }
     }
@@ -61,10 +62,19 @@ struct HostScheduleNotificationEvent: Equatable, Sendable {
 
     func stop() { task?.cancel(); task = nil }
 
+    private func persistSeen() {
+        if let data = try? JSONEncoder().encode(seen) { defaults?.set(data, forKey: Self.key) }
+    }
+
     func pollOnce() async {
         guard !polling, isActive(), !Task.isCancelled else { return }
         polling = true
         defer { polling = false }
+        let paired = Set(connections.hosts.map(\.id))
+        if seen.keys.contains(where: { !paired.contains($0) }) {
+            seen = seen.filter { paired.contains($0.key) }
+            persistSeen()
+        }
         for host in connections.hosts {
             guard isActive(), !Task.isCancelled else { return }
             do {
@@ -99,25 +109,28 @@ struct HostScheduleNotificationEvent: Equatable, Sendable {
 
     /// Public to the module for deterministic receipt/dedup tests. First sight of
     /// a host establishes a baseline; old inbox items never become startup spam.
+    /// `runs` is the host's bounded newest-first window, so versions of runs that
+    /// left it are dropped; a run that changes again re-enters as a new observation.
     func observe(hostID: String, hostName: String, runs: [HostValue]) async {
         let old = seen[hostID]
-        var updated = old ?? [:]
+        var updated: [String: String] = [:]
         var events: [HostScheduleNotificationEvent] = []
         for run in runs {
             guard let id = run["id"].string, let status = run["status"].string else { continue }
             let version = status + ":" + (run["updatedAt"].string ?? "")
-            let prior = updated.updateValue(version, forKey: id)
+            let prior = updated[id] ?? old?[id]
+            updated[id] = version
             guard old != nil, prior != version,
                   run["read"].bool != true, run["needsAttention"].bool == true else { continue }
             let policy = run["notificationPolicy"].string ?? "attention"
-            let needsInput = ["failed", "uncertain", "needs_input", "held"].contains(status)
+            let needsInput = ["failed", "uncertain", "needs_input", "held", "skipped"].contains(status)
             let completion = ["completed", "interrupted"].contains(status)
             guard (policy == "attention" && needsInput) || (policy == "all" && (needsInput || completion)) else { continue }
             events.append(.init(hostID: hostID, runID: id, conversationID: run["conversationID"].string,
                                 title: "Scheduled work on " + hostName, status: status))
         }
         seen[hostID] = updated
-        if let data = try? JSONEncoder().encode(seen) { defaults?.set(data, forKey: Self.key) }
+        persistSeen()
         for event in events {
             guard isActive(), !Task.isCancelled else { return }
             _ = await notifications.receiveScheduleRun(event)

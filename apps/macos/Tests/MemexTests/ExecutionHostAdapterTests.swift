@@ -35,6 +35,22 @@ struct ExecutionHostAdapterTests {
         #expect(fixture.authorizations == ["Bearer fixture-token", "Bearer fixture-token"])
     }
 
+    @Test func failedTransportCheckNeverSavesOrSendsTheCredential() async throws {
+        let root = try temporaryRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixture = try ExecutionHTTPFixture { request, _ in HostResponse(id: request.id, result: .bool(true)) }
+        defer { fixture.stop() }
+        let client = try ExecutionHostHTTPClient(endpoint: try await fixture.endpoint(), token: "fixture-token", hostID: "fixture-host",
+            outbox: root, transportCheck: { throw HostFailure("ssh_tunnel", "Listener is not owned by the tunnel") })
+        do {
+            _ = try await client.call("conversation.send", params: ["conversationId": .string("c"), "text": .string("x")], mutation: true)
+            Issue.record("An unproven transport must not carry the request")
+        } catch let error as HostFailure { #expect(error.code == "ssh_tunnel") }
+        #expect(fixture.requests.isEmpty)
+        #expect(fixture.authorizations.isEmpty)
+        #expect(try await client.pending().isEmpty)
+    }
+
     @Test func remoteIdentityMismatchNeverResumesOrSendsToAnotherTranscript() async throws {
         let root = try temporaryRoot()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -81,6 +97,12 @@ struct ExecutionHostAdapterTests {
                 try HostSocketClient.request(HostRequest(method: method, params: params), directory: directory)
             }.value
         }
+        // Only the process serving this root's control endpoint (the execution
+        // host) may relay; an agent shell connecting directly is refused.
+        let unauthenticated = try await request("browser.describe", ["conversationId": .string("native-conversation")])
+        #expect(unauthenticated.error?.code == "desktop_peer")
+        let host = try HostSocketServer(directory: directory)
+        defer { host.stop() }
         let denied = try await request("browser.describe", ["conversationId": .string("native-conversation")])
         #expect(denied.error?.code == "browser_denied")
         let grant = try automation.allow(conversationID: "native-conversation", capabilities: [.snapshot])
