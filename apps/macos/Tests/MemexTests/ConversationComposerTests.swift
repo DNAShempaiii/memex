@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import Memex
@@ -42,6 +43,50 @@ import Testing
         #expect(unreadable.error != nil)
         #expect(!(await unreadable.stash(text: "New work", attachments: [])))
         #expect(try Data(contentsOf: file) == invalid)
+    }
+
+    @Test func promptRecallOnlyRunsInTheComposerAtTheDraftEdge() throws {
+        #expect(PromptRecallKeys.shouldRecall(-1, selection: NSRange(location: 0, length: 0), length: 20))
+        #expect(!PromptRecallKeys.shouldRecall(-1, selection: NSRange(location: 5, length: 0), length: 20))
+        #expect(PromptRecallKeys.shouldRecall(1, selection: NSRange(location: 20, length: 0), length: 20))
+        #expect(!PromptRecallKeys.shouldRecall(1, selection: NSRange(location: 0, length: 3), length: 20))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 400, height: 300), styleMask: [.titled],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: 300))
+        window.contentView = content
+        let monitor = PromptRecallKeyMonitor.MonitorView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        let composer = NSTextView(frame: NSRect(x: 10, y: 10, width: 300, height: 60))
+        let find = NSTextView(frame: NSRect(x: 10, y: 200, width: 300, height: 30))
+        for view in [monitor, composer, find] as [NSView] { content.addSubview(view) }
+        window.orderFront(nil)
+        var history = ["earlier prompt"]
+        monitor.recall = { direction in direction < 0 ? history.popLast() : nil }
+        func commandKey(_ code: UInt16) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command, .numericPad, .function],
+                timestamp: 0, windowNumber: window.windowNumber, context: nil, characters: "",
+                charactersIgnoringModifiers: "", isARepeat: false, keyCode: code))
+        }
+        composer.string = "a long draft"
+        window.makeFirstResponder(composer)
+        composer.setSelectedRange(NSRange(location: 4, length: 0))
+        #expect(!monitor.handle(try commandKey(126))) // Mid-draft ⌘↑ keeps moving to the start.
+        composer.setSelectedRange(NSRange(location: 0, length: 0))
+        #expect(monitor.handle(try commandKey(126)))
+        #expect(composer.string == "earlier prompt")
+        #expect(composer.selectedRange() == NSRange(location: 0, length: 0))
+        find.string = ""
+        history = ["another"]
+        window.makeFirstResponder(find)
+        #expect(!monitor.handle(try commandKey(126))) // Other text views keep the standard shortcut.
+        #expect(find.string.isEmpty)
+    }
+
+    @Test func ownershipNoticeNamesTheOwningProvider() {
+        #expect(ConversationOwnershipNotice.message(for: "codex").contains("other Codex app or CLI"))
+        #expect(ConversationOwnershipNotice.message(for: "claude").contains("other Claude Code app or CLI"))
+        #expect(!ConversationOwnershipNotice.message(for: "acp:gemini").contains("Codex"))
     }
 
     @Test func recallRestoresUnsentDraftAndAnEditStartsANewRecallSession() {

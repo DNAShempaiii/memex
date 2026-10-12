@@ -75,12 +75,17 @@ import SwiftUI
             disabled = Set(saved.disabled.filter { Command(rawValue: $0) != nil })
             // Load the complete map before checking conflicts so valid swaps survive relaunch.
             bindings = saved.bindings.filter { Command(rawValue: $0.key) != nil }
-            if Command.allCases.contains(where: { command in
-                guard let binding = binding(for: command) else { return false }
-                return validationError(binding, for: command) != nil
-            }) {
-                bindings = [:]
-                disabled = []
+            // Drop only invalid saved bindings, returning each to its default.
+            // Repeat because a restored default can conflict with another binding.
+            var dropped = true
+            while dropped {
+                dropped = false
+                for command in Command.allCases where bindings[command.rawValue] != nil {
+                    if let binding = binding(for: command), validationError(binding, for: command) != nil {
+                        bindings.removeValue(forKey: command.rawValue)
+                        dropped = true
+                    }
+                }
             }
         }
     }
@@ -101,17 +106,23 @@ import SwiftUI
             return "Choose a single letter or number."
         }
         guard binding.command || binding.control else { return "Include Command or Control so typing remains available." }
-        // Native editing/window commands and fixed transcript/composer shortcuts still own these keys.
-        let reserved = [Binding(key: "q"), Binding(key: "w"), Binding(key: "h"), Binding(key: "m"),
-                        Binding(key: "a"), Binding(key: "c"), Binding(key: "v"), Binding(key: "x"),
-                        Binding(key: "z"), Binding(key: "z", shift: true), Binding(key: "s"),
-                        Binding(key: "s", shift: true), Binding(key: "g"), Binding(key: "g", shift: true)]
-        if reserved.contains(binding) { return "This shortcut is reserved by an editing, window or conversation command." }
+        // Arrow keys and other non-alphanumeric keys are rejected above, so
+        // ⌘↑/⌘↓ text navigation can never be rebound to a command.
+        if Self.reserved.contains(binding) { return "This shortcut is reserved by an editing, window or conversation command." }
         if let conflict = Command.allCases.first(where: { $0 != command && self.binding(for: $0) == binding }) {
             return "Already assigned to \(conflict.title). Remove or change that binding first."
         }
         return nil
     }
+    /// Native editing, window and Find commands, plus fixed transcript and
+    /// composer shortcuts, still own these keys.
+    static let reserved: [Binding] = [
+        Binding(key: "q"), Binding(key: "w"), Binding(key: "w", option: true), Binding(key: "h"),
+        Binding(key: "h", option: true), Binding(key: "m"), Binding(key: "m", option: true),
+        Binding(key: "f", control: true), Binding(key: "e"),
+        Binding(key: "a"), Binding(key: "c"), Binding(key: "v"), Binding(key: "x"),
+        Binding(key: "z"), Binding(key: "z", shift: true), Binding(key: "s"),
+        Binding(key: "s", shift: true), Binding(key: "g"), Binding(key: "g", shift: true)]
     @discardableResult func setBinding(_ binding: Binding?, for command: Command) -> String? {
         if let binding, let error = validationError(binding, for: command) { return error }
         if let binding { bindings[command.rawValue] = binding; disabled.remove(command.rawValue) }
@@ -137,4 +148,9 @@ import SwiftUI
         return base.fontDescriptor.withDesign(design).flatMap { NSFont(descriptor: $0, size: interfaceSize) } ?? base
     }
     var codeNSFont: NSFont { .monospacedSystemFont(ofSize: codeSize, weight: .regular) }
+    /// Sidebar titles track the text size, one point below the reading size.
+    var sidebarNSFont: NSFont {
+        let body = bodyNSFont
+        return NSFont(descriptor: body.fontDescriptor, size: max(10, interfaceSize - 1)) ?? body
+    }
 }

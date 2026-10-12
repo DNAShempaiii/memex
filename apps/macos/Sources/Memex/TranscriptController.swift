@@ -142,6 +142,10 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         }
     }
 
+    /// Heights, in points, above which a row collapses and how much stays visible.
+    static let longDetailCollapse: (threshold: CGFloat, preview: CGFloat) = (440, 360)
+    static let longMessageCollapse: (threshold: CGFloat, preview: CGFloat) = (4_000, 1_200)
+
     struct Measurement {
         let rowID: String
         let title: String
@@ -390,12 +394,18 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         revealedSelectionView = nil
         let sourceIDs = Set(request.selection.sourceIDs)
         let matchesSource: (TranscriptRecord) -> Bool = { sourceIDs.contains($0.sourceID) }
+        // Disclosures opened only to search for the passage are closed again
+        // unless they contain it, so a reveal does not rewrite the reader's layout.
+        var openedDisclosures = Set<String>()
+        var openedBodies = Set<String>()
         for item in TranscriptItem.group(records) where item.records.contains(where: matchesSource) {
-            if item.isActivity || item.isInstructions { expanded.insert("group:\(item.id)") }
+            var ids: [String] = []
+            if item.isActivity || item.isInstructions { ids.append("group:\(item.id)") }
             for activity in item.activities where activity.records.contains(where: matchesSource) {
-                expanded.insert("activity:\(activity.id)")
+                ids.append("activity:\(activity.id)")
             }
-            for record in item.records where matchesSource(record) { expanded.insert("message:\(record.id)") }
+            for record in item.records where matchesSource(record) { ids.append("message:\(record.id)") }
+            for id in ids where expanded.insert(id).inserted { openedDisclosures.insert(id) }
         }
         // A selected passage may live inside a previously collapsed tool result.
         rebuildRows()
@@ -404,24 +414,53 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             return rows[index].records.contains(where: matchesSource)
         }
         var matches: [(NSTextView, NSRange)] = []
+        var matchedRowID: String?
         for index in candidates {
             let id = rows[index].id
             if fullBodies.insert(id).inserted {
+                openedBodies.insert(id)
                 measurements.removeValue(forKey: id)
                 table.noteHeightOfRows(withIndexesChanged: IndexSet(integer: index))
             }
             guard let cell = table.view(atColumn: 0, row: index, makeIfNecessary: true) as? TranscriptCell else { continue }
             configure(cell, row: index)
             cell.layoutSubtreeIfNeeded()
-            matches += request.selection.matches(in: cell.selectionTextViews)
+            let found = request.selection.matches(in: cell.selectionTextViews)
+            if !found.isEmpty { matchedRowID = id }
+            matches += found
+        }
+        let unique = matches.count == 1
+        var keep = Set<String>()
+        if unique, let matchedRowID, let matched = rows.first(where: { $0.id == matchedRowID }) {
+            keep.insert(matchedRowID)
+            for row in rows {
+                if case .group = row, row.records.contains(matched.records[0]) { keep.insert(row.id) }
+            }
+        }
+        let closedDisclosures = openedDisclosures.subtracting(keep)
+        let closedBodies = openedBodies.subtracting(keep)
+        if !closedDisclosures.isEmpty || !closedBodies.isEmpty {
+            expanded.subtract(closedDisclosures)
+            fullBodies.subtract(closedBodies)
+            for id in closedDisclosures.union(closedBodies) { measurements.removeValue(forKey: id) }
+            rebuildRows(regroup: false)
+            // Reloading may replace cells; locate the passage again in its row.
+            if unique, let index = rows.firstIndex(where: { $0.id == matchedRowID }),
+               let cell = table.view(atColumn: 0, row: index, makeIfNecessary: true) as? TranscriptCell {
+                configure(cell, row: index)
+                cell.layoutSubtreeIfNeeded()
+                matches = request.selection.matches(in: cell.selectionTextViews)
+            } else if unique {
+                matches = []
+            }
         }
         guard matches.count == 1, let (text, range) = matches.first else {
             completion("The saved passage cannot be located uniquely in this transcript. Its captured text is still attached.")
             return
         }
         needsInitialPosition = false
+        // Select without taking focus: the user is still typing in the composer.
         text.setSelectedRange(range)
-        text.window?.makeFirstResponder(text)
         if let manager = text.layoutManager, let container = text.textContainer {
             manager.ensureLayout(for: container)
             let glyphs = manager.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
@@ -836,7 +875,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         else if rawMessage {
             textLayout = TranscriptTextLayout(rendered: NSAttributedString(string: body, attributes: [.font: codeFont, .foregroundColor: NSColor.labelColor]), trimEdges: false)
         } else if isTool && isExpanded && !body.isEmpty {
-            let rendered = ToolContentRenderer.render(row.records, raw: showsRaw)
+            let rendered = ToolContentRenderer.render(row.records, raw: showsRaw, proseFont: bodyFont)
             renderedTool = rendered
             textLayout = TranscriptTextLayout(rendered: rendered, trimEdges: !showsRaw)
         } else { textLayout = TranscriptTextLayout(text: body, font: font) }
@@ -845,7 +884,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             let source = ConversationMatcher.body(record)
             findRange = RenderedFindMapping.range(source: source, hit: hit.range, rendered: textLayout.attributedText.string) { token in
                 if isTool {
-                    return TranscriptTextLayout(rendered: ToolContentRenderer.render(row.records, raw: showsRaw, replacing: hit, with: token), trimEdges: !showsRaw).attributedText.string
+                    return TranscriptTextLayout(rendered: ToolContentRenderer.render(row.records, raw: showsRaw, replacing: hit, with: token, proseFont: bodyFont), trimEdges: !showsRaw).attributedText.string
                 }
                 guard row.records.count == 1, !rawMessage else { return "" }
                 let changed = (source as NSString).replacingCharacters(in: hit.range, with: token)
@@ -883,9 +922,12 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             }
         }
         let fullTextHeight = richLayout?.height(for: bodyWidth) ?? textLayout.height(for: bodyWidth)
-        let isLong = !isConversationMessage && fullTextHeight > 440
-        let showsFullBody = isConversationMessage || fullBodies.contains(row.id) || !findQuery.isEmpty
-        let textHeight = isLong && !showsFullBody ? 360 : fullTextHeight
+        // Ordinary chat messages stay expanded; only pathological ones (a pasted
+        // log or file) collapse so the reader does not lay out the whole body.
+        let collapse = isConversationMessage ? Self.longMessageCollapse : Self.longDetailCollapse
+        let isLong = fullTextHeight > collapse.threshold
+        let showsFullBody = !isLong || fullBodies.contains(row.id) || !findQuery.isEmpty
+        let textHeight = isLong && !showsFullBody ? collapse.preview : fullTextHeight
         let hasBody = !body.isEmpty || richLayout != nil
         let showsRawControl = isTool && isExpanded && !body.isEmpty && !findQuery.isEmpty && showsRaw
         let bodyY: CGFloat = isDisclosure ? (showsRawControl ? 74 : 44) : 8

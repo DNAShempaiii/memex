@@ -321,14 +321,16 @@ struct BrowserSidebar: View {
                     sectionName = ""
                     showingSectionEditor = true
                 }
-                Button("Add New Project") { store.addNewProject() }
-                if !store.localProjects.projects.isEmpty {
-                    Menu("New chat in project") {
-                        ForEach(store.localProjects.projects) { project in
-                            Button(project.name) { store.beginNewConversation(project: project) }
+                if InAppAgentRuntime.isAvailable {
+                    Button("Add New Project") { store.addNewProject() }
+                    if !store.localProjects.projects.isEmpty {
+                        Menu("New chat in project") {
+                            ForEach(store.localProjects.projects) { project in
+                                Button(project.name) { store.beginNewConversation(project: project) }
+                            }
                         }
+                        Button("Manage projects…") { store.manageProjects() }
                     }
-                    Button("Manage projects…") { store.manageProjects() }
                 }
                 Divider()
                 Picker("Conversations", selection: $store.conversationLibraryScope) {
@@ -368,7 +370,8 @@ struct BrowserSidebar: View {
                     Circle().fill(.tint).frame(width: 6, height: 6).accessibilityLabel("Unread")
                 }
                 Text(session.title)
-                    .font(.system(size: 13, weight: store.conversationLibrary.isUnread(session) ? .semibold : .regular))
+                    .font(Font(AppPreferences.shared.sidebarNSFont)
+                        .weight(store.conversationLibrary.isUnread(session) ? .semibold : .regular))
                     .lineLimit(2)
                 ConversationStateLabel(state: .init(activity: state.activity == .openElsewhere ? nil : state.activity,
                                                    hasDraft: state.hasDraft))

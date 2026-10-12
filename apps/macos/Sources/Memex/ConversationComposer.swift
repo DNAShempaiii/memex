@@ -59,7 +59,7 @@ struct ConversationComposer: View {
                 // Keep any saved draft intact while the ownership notice occupies the disabled field.
                 text: conversation.isOpenElsewhere ? .constant("") : $conversation.draft,
                 placeholder: conversation.isOpenElsewhere
-                    ? "Close this conversation in the other Codex app or CLI to continue here."
+                    ? ConversationOwnershipNotice.message(for: conversation.session.source)
                     : "Ask the agent…",
                 isRunning: conversation.isWorking,
                 canSend: (conversation.canSubmit || (conversation.isWorking && conversation.canQueue)) && conversation.hasPrompt && !loadingContext,
@@ -93,7 +93,7 @@ struct ConversationComposer: View {
                           let selection = attachment.selectedTranscriptText(in: conversation.session.id) else { return }
                     onRevealSelection?(selection)
                 },
-                composerFont: .system(size: 14),
+                composerFont: Font(AppPreferences.shared.bodyNSFont),
                 mentionConfiguration: .init(suggestions: mentionSuggestions, onSelect: selectMention),
                 onSubmit: submit,
                 onSteerSubmit: { Task { if !loadingContext { await conversation.steerDraft() } } },
@@ -103,6 +103,7 @@ struct ConversationComposer: View {
                 cancelButton: { AcpStopButton().accessibilityLabel("Stop") }
             )
             .editorHeader { workspaceSummary }
+            .background { PromptRecallKeyMonitor { direction in recalledPrompt(direction) } }
             .disabled(conversation.isOpenElsewhere)
             .onPasteCommand(of: ConversationClipboard.supportedTypes) { providers in
                 Task { await captureClipboard(providers) }
@@ -147,7 +148,7 @@ struct ConversationComposer: View {
         if conversation.isOpenElsewhere {
             Label("Open elsewhere", systemImage: "lock")
                 .font(.system(size: 12)).foregroundStyle(.secondary)
-                .help("Close this conversation in the other Codex app or CLI to continue here.")
+                .help(ConversationOwnershipNotice.message(for: conversation.session.source))
         } else {
             HStack(spacing: 2) {
                 inputMenu
@@ -488,9 +489,11 @@ struct ConversationComposer: View {
                 }
             }.disabled(library.entries.isEmpty || library.saving)
             Divider()
-            Button("Previous prompt") { recallPrompt(-1) }.keyboardShortcut(.upArrow, modifiers: [.command])
+            // ⌘↑/⌘↓ recall is handled by PromptRecallKeyMonitor, only inside the
+            // composer; menu key equivalents would apply to the whole window.
+            Button("Previous prompt (⌘↑ at start of draft)") { recallPrompt(-1) }
                 .disabled(promptHistory.isEmpty)
-            Button("Next prompt / original draft") { recallPrompt(1) }.keyboardShortcut(.downArrow, modifiers: [.command])
+            Button("Next prompt / original draft (⌘↓ at end)") { recallPrompt(1) }
                 .disabled(recall.position == nil)
             Menu("Recent prompts") {
                 ForEach(Array(promptHistory.suffix(12).enumerated()), id: \.offset) { _, text in
@@ -510,10 +513,15 @@ struct ConversationComposer: View {
     }
 
     private func recallPrompt(_ direction: Int) {
-        if let text = recall.move(direction, current: conversation.draft, history: promptHistory) {
+        if let text = recalledPrompt(direction) {
             conversation.draft = text
             conversation.focus()
         }
+    }
+
+    private func recalledPrompt(_ direction: Int) -> String? {
+        guard !conversation.isOpenElsewhere else { return nil }
+        return recall.move(direction, current: conversation.draft, history: promptHistory)
     }
 
     private func joined(_ left: String, _ right: String, separator: String = "\n\n") -> String {
@@ -798,3 +806,80 @@ struct ConversationComposer: View {
     var body: some View { EmptyView() }
 }
 #endif
+
+/// Shell-style prompt recall: ⌘↑ at the start of the draft and ⌘↓ at its end,
+/// where the standard move-to-start/end would do nothing anyway.
+enum PromptRecallKeys {
+    static func direction(for event: NSEvent) -> Int? {
+        guard event.type == .keyDown,
+              event.modifierFlags.intersection([.command, .shift, .option, .control]) == .command else { return nil }
+        switch event.keyCode {
+        case 126: return -1
+        case 125: return 1
+        default: return nil
+        }
+    }
+
+    static func shouldRecall(_ direction: Int, selection: NSRange, length: Int) -> Bool {
+        guard selection.length == 0 else { return false }
+        return length == 0 || (direction < 0 ? selection.location == 0 : selection.location >= length)
+    }
+}
+
+/// Watches ⌘↑/⌘↓ only for the editor inside this view's frame. The Find field,
+/// transcript and other text views keep their standard behavior.
+struct PromptRecallKeyMonitor: NSViewRepresentable {
+    /// Returns the text to show, or nil when there is nothing to recall.
+    let recall: (Int) -> String?
+
+    func makeNSView(context: Context) -> MonitorView { MonitorView() }
+    func updateNSView(_ view: MonitorView, context: Context) { view.recall = recall }
+
+    @MainActor final class MonitorView: NSView {
+        var recall: ((Int) -> String?)?
+        private var monitor: Any?
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                // Local monitors run on the main thread.
+                let handled = MainActor.assumeIsolated { self?.handle(event) == true }
+                return handled ? nil : event
+            }
+        }
+
+        /// Replaces the draft through the text view, as typing would, so the
+        /// editor's binding, undo and caret stay consistent.
+        func handle(_ event: NSEvent) -> Bool {
+            guard let window, event.windowNumber == window.windowNumber, let direction = PromptRecallKeys.direction(for: event),
+                  let text = window.firstResponder as? NSTextView, text.isEditable, contains(text) else { return false }
+            let length = (text.string as NSString).length
+            guard PromptRecallKeys.shouldRecall(direction, selection: text.selectedRange(), length: length),
+                  let recalled = recall?(direction) else { return false }
+            text.insertText(recalled, replacementRange: NSRange(location: 0, length: length))
+            // Leave the caret where the next press continues through history.
+            text.setSelectedRange(NSRange(location: direction < 0 ? 0 : (recalled as NSString).length, length: 0))
+            return true
+        }
+
+        private func contains(_ text: NSTextView) -> Bool {
+            // A scrolling editor's document can be taller than the composer.
+            let target: NSView = text.enclosingScrollView ?? text
+            let editor = target.convert(target.bounds, to: nil)
+            return convert(bounds, to: nil).contains(NSPoint(x: editor.midX, y: editor.midY))
+        }
+    }
+}
+
+/// Names the provider whose other client currently owns the conversation.
+enum ConversationOwnershipNotice {
+    static func message(for source: String) -> String {
+        let provider = ConversationProviderCatalog.builtins.first { $0.id == source }?.name
+        return "Close this conversation in the other \(provider.map { "\($0) app or CLI" } ?? "agent client") to continue here."
+    }
+}

@@ -14,6 +14,7 @@ struct ReaderView: View {
     @State private var planBranch: PlanBranch?
     @State private var selectionReveal: TranscriptSelectionReveal?
     @State private var selectionLoadID = UUID()
+    @State private var revealError: String?
     @FocusState private var findFocused: Bool
 
     var body: some View {
@@ -43,7 +44,8 @@ struct ReaderView: View {
                                 GeometryReader { geometry in
                                     ConversationOutlineRail(outline: outline,
                                         previewWidth: min(360, max(80, geometry.size.width - 64)),
-                                        reveal: revealPrompt)
+                                        reveal: revealPrompt,
+                                        activate: { outline.completeIfNeeded(session: store.selected, client: store.client) })
                                         .frame(height: max(0, geometry.size.height - footerHeight - 16))
                                         .padding(.leading, 4).padding(.top, 8)
                                 }
@@ -71,11 +73,11 @@ struct ReaderView: View {
             outlineRevealID = UUID()
             requestedRecordID = nil
         }
-        .task(id: store.readerTranscriptKey) {
-            if store.readerUsesLiveSnapshot { outline.load(records: currentRecords) }
-            else { await outline.load(session: store.selected, client: store.client) }
-            outline.follow(navigation.visibleRecordID)
+        .onChange(of: outlineSource, initial: true) { _, _ in
+            outline.reset()
+            updateOutline()
         }
+        .onChange(of: historyWindow) { _, _ in updateOutline() }
         .onChange(of: navigation.visibleRecordID) { _, id in outline.follow(id) }
         .task(id: store.selectedLiveConversation?.session.id) {
             guard let live = store.selectedLiveConversation else { return }
@@ -94,9 +96,8 @@ struct ReaderView: View {
         .onChange(of: find?.query) { _, _ in search() }
         .onChange(of: store.selectedLiveConversation?.revision) { _, _ in
             if store.readerUsesLiveSnapshot {
-                search()
-                outline.load(records: currentRecords)
-                outline.follow(navigation.visibleRecordID)
+                if find?.isOpen == true { search() }
+                updateOutline()
             }
             store.updateCreatedConversationTitle()
         }
@@ -121,8 +122,8 @@ struct ReaderView: View {
                                  provider: session.source, hasMore: false, isLoading: false, onLoadMore: {},
                                  hasEarlier: live.hasEarlierRecords, startsAtEnd: true, navigation: navigation,
                                  onLoadEarlier: { live.loadEarlierRecords() },
-                                 findQuery: find?.isOpen == true ? find?.query ?? "" : "",
-                                 findHit: find?.selectedHit, findGeneration: find?.generation ?? 0,
+                                 findQuery: activeFind?.query ?? "",
+                                 findHit: activeFind?.selectedHit, findGeneration: activeFind?.generation ?? 0,
                                  rawTranscript: rawTranscript, isLocalHost: store.canAccessLocalFiles(for: session),
                                  mcpAppTransport: live.snapshot.connected ? live.snapshot.mcpAppConnection?.transport : nil, sourcePath: session.sourcePath,
                                  requestedRecordID: requestedRecordID, requestGeneration: requestGeneration,
@@ -138,8 +139,8 @@ struct ReaderView: View {
                                  hasEarlier: store.hasEarlierRecords, startsAtEnd: store.readerStartsAtEnd,
                                  anchorID: store.readerAnchorID, navigation: navigation,
                                  onLoadEarlier: { Task { await store.loadEarlierRecords() } },
-                                 findQuery: find?.isOpen == true ? find?.query ?? "" : "",
-                                 findHit: find?.selectedHit, findGeneration: find?.generation ?? 0,
+                                 findQuery: activeFind?.query ?? "",
+                                 findHit: activeFind?.selectedHit, findGeneration: activeFind?.generation ?? 0,
                                  rawTranscript: rawTranscript, isLocalHost: store.canAccessLocalFiles(for: session),
                                  sourcePath: session.sourcePath, requestedRecordID: requestedRecordID,
                                  requestGeneration: requestGeneration, bottomInset: footerHeight,
@@ -175,9 +176,8 @@ struct ReaderView: View {
                         AnyView(WorkspaceChangeSummary(directory: directory, isWorking: live.isWorking,
                             review: store.reviewWorkspaceChange, horizontalInset: 0))
                     })
-            } else if !InAppResumeTarget.isArchived(session) {
-                Label(InAppResumeTarget.unavailableReason(for: session)
-                      ?? "This build supports continuing conversations through Open in.", systemImage: "info.circle")
+            } else if let notice = Self.continuationNotice(for: session) {
+                Label(notice, systemImage: "info.circle")
                     .font(.caption).foregroundStyle(.secondary)
                     .padding(8).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
                     .frame(maxWidth: ConversationReadingLane.maximumWidth, alignment: .leading)
@@ -187,9 +187,44 @@ struct ReaderView: View {
         }
     }
 
+    /// Find state reaches the transcript only while the bar is open, so a
+    /// closed Find never invalidates rows or interrupts streaming updates.
+    private var activeFind: ConversationFindState? {
+        guard let find, find.isOpen, !find.query.isEmpty else { return nil }
+        return find
+    }
+
+    /// Explains why a history conversation cannot continue here, only when the
+    /// user can act on it. History-only builds and imported transcripts without
+    /// an executable provider show no notice.
+    static func continuationNotice(for session: Session, runtimeAvailable: Bool = InAppAgentRuntime.isAvailable) -> String? {
+        guard runtimeAvailable, !InAppResumeTarget.isArchived(session) else { return nil }
+        let actionable = session.machineID != "local" || session.isSubagent || session.conversationKind == "guardian_review"
+        return actionable ? InAppResumeTarget.unavailableReason(for: session) : nil
+    }
+
     private func search() {
         if let live = store.selectedLiveConversation, store.readerUsesLiveSnapshot { find?.search(records: live.snapshot.records) }
         else { find?.search(in: store.selected) }
+    }
+
+    /// The outline restarts when the conversation or its record source changes.
+    private var outlineSource: String {
+        (store.selected?.id ?? "") + (store.readerUsesLiveSnapshot ? ":live" : ":history")
+    }
+
+    /// Changes whenever the reader's loaded history window grows or moves.
+    private var historyWindow: String {
+        "\(store.loadedReaderKey ?? "")#\(store.recordsOffset)#\(store.records.count)"
+    }
+
+    private func updateOutline() {
+        if let live = store.selectedLiveConversation, store.readerUsesLiveSnapshot {
+            outline.load(records: live.snapshot.records)
+        } else if store.loadedReaderKey == store.readerPositionKey {
+            outline.absorb(records: store.records, offset: store.recordsOffset)
+        }
+        outline.follow(navigation.visibleRecordID)
     }
 
     private func revealPrompt(_ prompt: ConversationPrompt) {
@@ -248,8 +283,16 @@ struct ReaderView: View {
     }
 
     private func selectionRevealResult(_ id: UUID, _ error: String?) {
-        guard selectionReveal?.id == id, selectionReveal?.selection.sessionID == store.selected?.id else { return }
-        store.selectedLiveConversation?.reportAttachmentError(error)
+        guard selectionReveal?.id == id, selectionReveal?.selection.sessionID == store.selected?.id,
+              let live = store.selectedLiveConversation else { return }
+        if let error {
+            live.reportAttachmentError(error)
+            revealError = error
+        } else if let revealError, live.attachmentError == revealError {
+            // Clear only a stale reveal failure, never an unrelated attachment error.
+            live.reportAttachmentError(nil)
+            self.revealError = nil
+        }
     }
 
     private func findBar(_ state: ConversationFindState) -> some View {
@@ -279,7 +322,7 @@ struct ReaderView: View {
     }
 
     private func header(_ session: Session) -> some View {
-        ConversationHistoryActions(store: store, session: session)
+        ConversationHistoryStatus(store: store, session: session)
             .frame(maxWidth: ConversationReadingLane.maximumWidth, alignment: .leading)
             .padding(.horizontal, ConversationReadingLane.minimumMargin)
             .frame(maxWidth: .infinity)

@@ -36,6 +36,32 @@ import Testing
         #expect(reopened.binding(for: .refresh)?.key == "n")
     }
 
+    @Test func systemShortcutsAndArrowKeysAreRejected() throws {
+        let suite = "MemexPreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = AppPreferences(defaults: defaults)
+        for binding in [AppPreferences.Binding(key: "f", control: true), .init(key: "h", option: true),
+                        .init(key: "m", option: true), .init(key: "e"), .init(key: "\u{F700}"), .init(key: "\u{F701}")] {
+            #expect(preferences.setBinding(binding, for: .refresh) != nil)
+        }
+        #expect(preferences.binding(for: .refresh) == .init(key: "r"))
+    }
+
+    @Test func oneInvalidSavedBindingDoesNotResetTheOthers() throws {
+        let suite = "MemexPreferencesTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let saved: [String: Any] = ["bindings": ["refresh": ["key": "e", "command": true, "shift": false, "option": false, "control": false],
+                                                 "find": ["key": "k", "command": true, "shift": true, "option": false, "control": false]],
+                                    "disabled": ["browser"]]
+        defaults.set(try JSONSerialization.data(withJSONObject: saved), forKey: "keyboard.bindings")
+        let preferences = AppPreferences(defaults: defaults)
+        #expect(preferences.binding(for: .refresh) == .init(key: "r")) // ⌘E is reserved: back to its default.
+        #expect(preferences.binding(for: .find) == .init(key: "k", shift: true))
+        #expect(preferences.binding(for: .browser) == nil)
+    }
+
     @Test func appearancePersistsAndChangesRenderedFonts() throws {
         let suite = "MemexPreferencesTests.\(UUID().uuidString)"
         let defaults = try #require(UserDefaults(suiteName: suite))

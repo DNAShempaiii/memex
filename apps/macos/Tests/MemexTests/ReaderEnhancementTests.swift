@@ -3,6 +3,19 @@ import Testing
 @testable import Memex
 
 @Suite(.serialized) @MainActor struct ReaderEnhancementTests {
+    @Test func continuationNoticeAppearsOnlyWhenActionable() {
+        var imported = Session(source: "chatgpt", sessionID: "imported", sourcePath: "/fixture", project: "p", cwd: "/tmp")
+        #expect(ReaderView.continuationNotice(for: imported, runtimeAvailable: true) == nil)
+        imported.machine = "remote-peer"
+        #expect(ReaderView.continuationNotice(for: imported, runtimeAvailable: true)?.contains("remote-peer") == true)
+        #expect(ReaderView.continuationNotice(for: imported, runtimeAvailable: false) == nil)
+        var child = Session(source: "codex", sessionID: "child", sourcePath: "/fixture", project: "p", cwd: "/tmp")
+        child.conversationKind = "subagent"
+        #expect(ReaderView.continuationNotice(for: child, runtimeAvailable: true) != nil)
+        let noDirectory = Session(source: "codex", sessionID: "plain", sourcePath: "/fixture", project: "p")
+        #expect(ReaderView.continuationNotice(for: noDirectory, runtimeAvailable: true) == nil)
+    }
+
     @Test func floatingComposerInsetKeepsLatestVisibleAndHistoryPositionStable() {
         let records = (0..<40).map { record("\($0)", "assistant", "Message \($0)") }
         let reader = TranscriptController()

@@ -10,12 +10,17 @@ struct MemexApp: App {
         Settings { MemexSettingsView(preferences: .shared) { ProviderToolsSettingsView() } }
             .commands {
                 CommandGroup(replacing: .newItem) {
-                    Button("New Conversation") {
-                        delegate.showBrowser()
-                        delegate.store.beginNewConversation()
+                    if InAppAgentRuntime.isAvailable {
+                        Button("New Conversation") {
+                            delegate.showBrowser()
+                            delegate.store.beginNewConversation()
+                        }
+                            .keyboardShortcut(AppPreferences.shared.shortcut(for: .newConversation))
+                    } else {
+                        // History-only builds cannot create conversations; ⌘N reopens the window.
+                        Button("Open Memex") { delegate.showBrowser() }
+                            .keyboardShortcut(AppPreferences.shared.shortcut(for: .newConversation))
                     }
-                        .keyboardShortcut(AppPreferences.shared.shortcut(for: .newConversation))
-                        .disabled(!InAppAgentRuntime.isAvailable)
                 }
                 CommandGroup(after: .newItem) {
                     Button("Refresh Conversations") { Task { await delegate.store.refresh() } }
@@ -32,8 +37,10 @@ struct MemexApp: App {
                     Button("Toggle Terminal Drawer") { delegate.store.toggleTerminalDrawer() }
                         .keyboardShortcut(AppPreferences.shared.shortcut(for: .terminal))
                         .disabled(!delegate.store.hasSelectedWorkspace && !delegate.store.showingTerminalDrawer)
-                    Button("Add New Project") { delegate.store.addNewProject() }
-                    Button("Execution Hosts and Schedules…") { delegate.store.showingExecutionHosts = true }
+                    if InAppAgentRuntime.isAvailable {
+                        Button("Add New Project") { delegate.store.addNewProject() }
+                        Button("Execution Hosts and Schedules…") { delegate.store.showingExecutionHosts = true }
+                    }
                 }
             }
     }
@@ -81,10 +88,13 @@ struct MemexApp: App {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let root = store.client.root.map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".memex")
-        do {
-            try store.workspaceBrowserExecution.start(root: root, automation: store.workspaceBrowser.automation)
+        // Browser control serves in-app agents only.
+        if InAppAgentRuntime.isAvailable {
+            do {
+                try store.workspaceBrowserExecution.start(root: root, automation: store.workspaceBrowser.automation)
+            }
+            catch { store.executionHostError = "Browser control is unavailable: \(error.localizedDescription)" }
         }
-        catch { store.executionHostError = "Browser control is unavailable: \(error.localizedDescription)" }
         store.conversationNotifications.activate()
         store.conversationNotifications.isConversationVisible = { [weak self] id in
             guard let self else { return false }

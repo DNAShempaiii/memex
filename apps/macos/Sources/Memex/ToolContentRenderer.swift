@@ -88,8 +88,11 @@ import AppKit
         }
     }
 
+    /// `proseFont` renders natural-language fields (messages, prompts,
+    /// descriptions) at the reader's configured text size.
     static func render(_ records: [TranscriptRecord], raw: Bool = false,
-                       replacing hit: ConversationFindHit? = nil, with replacement: String = "") -> NSAttributedString {
+                       replacing hit: ConversationFindHit? = nil, with replacement: String = "",
+                       proseFont: NSFont = .systemFont(ofSize: 14)) -> NSAttributedString {
         let result = NSMutableAttributedString(string: "")
         for record in records {
             let message = record.record
@@ -110,7 +113,7 @@ import AppKit
                 sourceOffset += length + 2 // ConversationMatcher.body joins distinct fields with two newlines.
                 if index > 0 { append(raw ? "\n\n" : "\n", to: result) }
                 if raw { append(part, to: result, code: true) }
-                else { content(part, to: result, code: message.role == "tool_use", toolName: message.toolName ?? records.first?.record.toolName ?? "") }
+                else { content(part, to: result, code: message.role == "tool_use", toolName: message.toolName ?? records.first?.record.toolName ?? "", proseFont: proseFont) }
             }
             if record.id != records.last?.id {
                 if raw { append("\n\n", to: result) }
@@ -120,10 +123,11 @@ import AppKit
         return result
     }
 
-    private static func content(_ text: String, to result: NSMutableAttributedString, code: Bool, toolName: String, prose: Bool = false) {
+    private static func content(_ text: String, to result: NSMutableAttributedString, code: Bool, toolName: String,
+                                prose: Bool = false, proseFont: NSFont) {
         let text = text.trimmingCharacters(in: .newlines)
         if let value = json(text) {
-            valueBlocks(value, to: result, toolName: toolName)
+            valueBlocks(value, to: result, toolName: toolName, proseFont: proseFont)
             return
         }
         // Scan once for complete JSON containers, including adjacent exec results.
@@ -156,7 +160,7 @@ import AppKit
                 } while cursor < text.endIndex && depth > 0
                 if depth == 0, let value = json(String(text[start..<cursor])) {
                     append(String(text[plainStart..<start]), to: result, code: code)
-                    valueBlocks(value, to: result, toolName: toolName)
+                    valueBlocks(value, to: result, toolName: toolName, proseFont: proseFont)
                     plainStart = cursor
                 }
             }
@@ -167,7 +171,7 @@ import AppKit
         }
         if isOpaque(text) { opaque(text, to: result) }
         else if let decorated = ToolPresentationSupport.decorate(text, path: "", toolName: toolName, code: code) { result.append(decorated) }
-        else if prose { result.append(RichTextRenderer.render(text, font: .systemFont(ofSize: 14))) }
+        else if prose { result.append(RichTextRenderer.render(text, font: proseFont)) }
         else { append(text, to: result, code: code) }
     }
 
@@ -180,28 +184,29 @@ import AppKit
         return try? JSONSerialization.jsonObject(with: Data(trimmed.utf8))
     }
 
-    private static func valueBlocks(_ value: Any, to result: NSMutableAttributedString, path: String = "", toolName: String) {
+    private static func valueBlocks(_ value: Any, to result: NSMutableAttributedString, path: String = "", toolName: String,
+                                    proseFont: NSFont) {
         if let object = value as? [String: Any], !object.isEmpty {
             // Provider/MCP text blocks are transport containers, not field names
             // readers need before the result. Unknown fields still follow the text.
             if let type = object["type"] as? String, ["text", "input_text", "output_text"].contains(type),
                let text = object["text"] as? String {
-                content(text, to: result, code: false, toolName: toolName, prose: true)
+                content(text, to: result, code: false, toolName: toolName, prose: true, proseFont: proseFont)
                 if !result.string.hasSuffix("\n") { append("\n", to: result) }
                 for key in object.keys.sorted() where key != "type" && key != "text" {
-                    valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName)
+                    valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName, proseFont: proseFont)
                 }
                 return
             }
             if object["type"] as? String == "resource", let resource = object["resource"] as? [String: Any],
                let text = resource["text"] as? String {
-                content(text, to: result, code: false, toolName: toolName, prose: true)
+                content(text, to: result, code: false, toolName: toolName, prose: true, proseFont: proseFont)
                 if !result.string.hasSuffix("\n") { append("\n", to: result) }
                 for key in resource.keys.sorted() where key != "text" {
-                    valueBlocks(resource[key]!, to: result, path: "resource.\(key)", toolName: toolName)
+                    valueBlocks(resource[key]!, to: result, path: "resource.\(key)", toolName: toolName, proseFont: proseFont)
                 }
                 for key in object.keys.sorted() where key != "type" && key != "resource" {
-                    valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName)
+                    valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName, proseFont: proseFont)
                 }
                 return
             }
@@ -213,7 +218,7 @@ import AppKit
             // other field retains the generic walk and is also available raw.
             let keys = priority.filter { object[$0] != nil } + object.keys.sorted().filter { !priority.contains($0) }
             for key in keys {
-                valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName)
+                valueBlocks(object[key]!, to: result, path: path.isEmpty ? key : "\(path).\(key)", toolName: toolName, proseFont: proseFont)
             }
         } else if let array = value as? [Any], !array.isEmpty {
             // functions.exec emits a separate text block for its timing banner.
@@ -221,17 +226,17 @@ import AppKit
             // for any fields the generic renderer still needs to label.
             let entries = Array(array.enumerated())
             for (index, entry) in entries.filter({ !isExecutionBanner($0.element) }) + entries.filter({ isExecutionBanner($0.element) }) {
-                valueBlocks(entry, to: result, path: "\(path)[\(index)]", toolName: toolName)
+                valueBlocks(entry, to: result, path: "\(path)[\(index)]", toolName: toolName, proseFont: proseFont)
             }
         } else {
             if result.length > 0, !result.string.hasSuffix("\n") { append("\n", to: result) }
             if !path.isEmpty { label(path, to: result) }
             if let text = value as? String {
                 if isOpaque(text) { opaque(text, to: result) }
-                else if let nested = json(text) { valueBlocks(nested, to: result, toolName: toolName) }
+                else if let nested = json(text) { valueBlocks(nested, to: result, toolName: toolName, proseFont: proseFont) }
                 else if let decorated = ToolPresentationSupport.decorate(text, path: path, toolName: toolName, code: false) { result.append(decorated) }
                 else if ["message", "description", "prompt", "instructions", "text"].contains(path.components(separatedBy: ".").last ?? "") {
-                    result.append(RichTextRenderer.render(text, font: .systemFont(ofSize: 14)))
+                    result.append(RichTextRenderer.render(text, font: proseFont))
                 } else { append(text, to: result, code: ["cmd", "command", "code", "script", "output"].contains(path.components(separatedBy: ".").last ?? "")) }
             } else if let data = try? JSONSerialization.data(withJSONObject: value, options: [.fragmentsAllowed, .sortedKeys]),
                       let text = String(data: data, encoding: .utf8) {

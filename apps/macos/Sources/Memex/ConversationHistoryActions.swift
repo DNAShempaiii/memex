@@ -13,42 +13,34 @@ import Observation
     }
 }
 
-struct ConversationHistoryActions: View {
+/// Recovery notices and errors for history actions, shown in the reader header.
+struct ConversationHistoryStatus: View {
     @Bindable var store: Store
     let session: Session
-    @Bindable var presentation: ConversationHistoryPresentation = .init()
-    var showsStatus = true
     @State private var inspectedOperation: ConversationRelationships.Pending?
 
     private var pending: [ConversationRelationships.Pending] {
         store.conversationRelationships.pending.filter { $0.source.id == session.id }
     }
-    private var boundaries: [ConversationHistoryBoundary] { store.selectedHistoryBoundaries }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if showsStatus {
-                if store.historyActionInProgress { ProgressView().controlSize(.small) }
-                ForEach(pending) { request in
-                    HStack(alignment: .top) {
-                        Text("A previous \(request.operation) request needs inspection. It will not be retried automatically.")
-                        if let result = request.result {
-                            Button("Open result") { store.openRelatedConversation(result) }
-                        }
-                        Button("Mark inspected…") { inspectedOperation = request }
-                    }.font(.caption).foregroundStyle(.orange)
-                }
-                if let error = store.historyActionError ?? store.conversationRelationships.error {
-                    Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
-                }
-                if let warning = store.workspaceCheckpointWarning {
-                    Text(warning).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-                }
+            if store.historyActionInProgress { ProgressView().controlSize(.small) }
+            ForEach(pending) { request in
+                HStack(alignment: .top) {
+                    Text("A previous \(request.operation) request needs inspection. It will not be retried automatically.")
+                    if let result = request.result {
+                        Button("Open result") { store.openRelatedConversation(result) }
+                    }
+                    Button("Mark inspected…") { inspectedOperation = request }
+                }.font(.caption).foregroundStyle(.orange)
             }
-        }
-        .sheet(isPresented: $presentation.showingBranch) { ConversationContextBranchSheet(store: store, source: session) }
-        .sheet(isPresented: Binding(get: { presentation.operation != nil }, set: { if !$0 { presentation.operation = nil } })) {
-            mutationSheet
+            if let error = store.historyActionError ?? store.conversationRelationships.error {
+                Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled)
+            }
+            if let warning = store.workspaceCheckpointWarning {
+                Text(warning).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
         }
         .confirmationDialog("Mark the previous history request as inspected?", isPresented: Binding(
             get: { inspectedOperation != nil }, set: { if !$0 { inspectedOperation = nil } }), titleVisibility: .visible) {
@@ -62,6 +54,23 @@ struct ConversationHistoryActions: View {
         } message: {
             Text("Inspect native history and any resulting conversation first. Clearing this recovery marker does not undo provider changes or send any message.")
         }
+    }
+}
+
+/// Branch, fork and rewind sheets driven by the toolbar's shared presentation.
+struct ConversationHistoryActions: View {
+    @Bindable var store: Store
+    let session: Session
+    @Bindable var presentation: ConversationHistoryPresentation
+
+    private var boundaries: [ConversationHistoryBoundary] { store.selectedHistoryBoundaries }
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .sheet(isPresented: $presentation.showingBranch) { ConversationContextBranchSheet(store: store, source: session) }
+            .sheet(isPresented: Binding(get: { presentation.operation != nil }, set: { if !$0 { presentation.operation = nil } })) {
+                mutationSheet
+            }
     }
 
     private var mutationSheet: some View {
