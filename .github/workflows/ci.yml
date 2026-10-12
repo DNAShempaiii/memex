@@ -122,8 +122,12 @@ jobs:
       - name: Set up Homebrew
         run: |
           if [[ "$RUNNER_OS" == Linux ]]; then
+            export PATH="/home/linuxbrew/.linuxbrew/bin:$PATH"
             echo /home/linuxbrew/.linuxbrew/bin >> "$GITHUB_PATH"
           fi
+          # Runner images lag Homebrew; core formulae use the current DSL.
+          brew update
+          brew --version
 
       - name: Stage the core formula against this checkout
         run: |
