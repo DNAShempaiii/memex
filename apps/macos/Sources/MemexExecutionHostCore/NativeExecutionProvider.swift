@@ -30,7 +30,16 @@ public final class NativeExecutionProvider: ExecutionProvider {
         executables = Dictionary(uniqueKeysWithValues: ["codex", "claude"].compactMap { name in
             Self.executable(name, environment: environment).map { (name, $0) }
         })
-        claudeHelper = environment["MEMEX_CLAUDE_HELPER"].flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
+        // Release builds run only the signed helper bundled beside this executable in
+        // Contents/Helpers; the environment override is for development.
+        #if DEBUG
+        let helperOverride = environment["MEMEX_CLAUDE_HELPER"]
+        #else
+        let helperOverride: String? = nil
+        #endif
+        let bundledHelper = Bundle.main.executableURL?.deletingLastPathComponent()
+            .appendingPathComponent("claude-agent-sdk-host").path
+        claudeHelper = (helperOverride ?? bundledHelper).flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
         runtime = try AgentRuntimeClient(databaseURL: directory.appendingPathComponent("runtime.sqlite"))
         service = try AgentConversationService(runtime: runtime, archiveURL: directory.appendingPathComponent("history"), executionHostID: hostID)
     }

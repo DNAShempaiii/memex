@@ -75,7 +75,13 @@ struct InAppResumeTarget: Sendable, Equatable {
         }
         let helper: URL?
         if session.source == "claude" {
-            helper = helperURL ?? environment["MEMEX_CLAUDE_HELPER"].map { URL(fileURLWithPath: $0) }
+            // Release builds run only the bundled, signed helper; the override is for development.
+            #if DEBUG
+            let helperOverride = environment["MEMEX_CLAUDE_HELPER"].map { URL(fileURLWithPath: $0) }
+            #else
+            let helperOverride: URL? = nil
+            #endif
+            helper = helperURL ?? helperOverride
                 ?? Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/claude-agent-sdk-host")
             guard let helper, manager.isExecutableFile(atPath: helper.path) else {
                 throw ConversationRuntimeError(message: "The Claude session helper is missing from this build. Rebuild Memex with its local agent runtime.")
