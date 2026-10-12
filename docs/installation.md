@@ -4,7 +4,7 @@
 
 ## Install
 ```bash
-brew install nicosuave/tap/memex
+brew install memex
 ```
 
 Or
@@ -143,8 +143,8 @@ running Homebrew; use `brew` directly to upgrade that installation.
 After updating, run `memex` again to start that version.
 
 Enabled daemons follow binary upgrades automatically between indexing passes.
-Homebrew registrations use `opt/memex/bin/memex`, so direct `brew upgrade
-nicosuave/tap/memex` works without a second service manager. Cargo/manual installs
+Homebrew registrations use `opt/memex/bin/memex`, so direct `brew upgrade memex`
+works without a second service manager. Cargo/manual installs
 follow replacement at their registered executable path; replace binaries atomically.
 Nix profile registrations follow the profile link. A running indexing pass finishes
 before handoff; Web UI and MCP connections reconnect when the process reloads.
