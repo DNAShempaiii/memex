@@ -8,6 +8,7 @@ final class WorkspaceTerminalStore {
     private(set) var sessions: [URL: WorkspaceTerminalSession] = [:]
     private(set) var workspaces: [URL: WorkspaceTerminalGroup] = [:]
     private var isShutdown = false
+    private var maintainedHistory = false
 
     func session(for directory: URL) async throws -> WorkspaceTerminalSession {
         try await group(for: directory).selected
@@ -19,6 +20,13 @@ final class WorkspaceTerminalStore {
         guard !isShutdown else { throw WorkspaceChangesError(message: "Terminals have shut down.") }
         _ = try Self.validate(root)
         if let group = workspaces[root] { return group }
+        if !maintainedHistory {
+            maintainedHistory = true
+            // Migration precedes the first load; pruning only reads and removes
+            // snapshots of missing directories, so it can run in the background.
+            WorkspaceTerminalGroup.migrateHistory()
+            Task.detached(priority: .utility) { WorkspaceTerminalGroup.pruneHistory() }
+        }
         let session = WorkspaceTerminalSession(directory: root)
         let group = WorkspaceTerminalGroup(directory: root, initial: session)
         sessions[root] = group.selected

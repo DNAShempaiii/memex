@@ -234,3 +234,196 @@ private struct WorkspaceGitFixture {
     #expect(retried.lastPathComponent == "clone-2")
     #expect(try String(contentsOf: fixture.root.appendingPathComponent("clone/user.txt"), encoding: .utf8) == "after failure")
 }
+
+@Test func checkpointCaptureSkipsUntrackedNestedRepositoryAndChangesRefuseToStageIt() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    let nested = fixture.repository.appendingPathComponent("n")
+    try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+    _ = try fixture.git(["init", "-q"], at: nested)
+    try fixture.write("inner.txt", "inner\n", at: nested)
+    try fixture.write("outer.txt", "outer\n")
+    let checkpoints = WorkspaceCheckpointClient(storage: fixture.records, managedRoot: fixture.managed)
+    let checkpoint = try await checkpoints.capture(directory: fixture.repository, conversationID: "nested", label: "Nested")
+    #expect(checkpoint.skippedPaths == ["n"])
+    let files = try fixture.git(["ls-tree", "-r", "--name-only", checkpoint.tree])
+    #expect(files.split(separator: "\n").sorted() == ["outer.txt", "tracked.txt"])
+    let snapshot = try #require(try await WorkspaceChangesClient().snapshot(directory: fixture.repository))
+    let entry = try #require(snapshot.files.first { $0.path == "n/" })
+    #expect(entry.isNestedRepository && entry.status == "Nested repository")
+    await #expect(throws: (any Error).self) { try await WorkspaceGitClient().stage(directory: fixture.repository, paths: ["n/"]) }
+    #expect(try fixture.git(["diff", "--cached", "--name-only"]).isEmpty)
+}
+
+@Test func checkpointCaptureReusesUnchangedBlobsButDetectsSameSizeRewrites() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    let file = fixture.repository.appendingPathComponent("tracked.txt")
+    try Data("aaaa\n".utf8).write(to: file)
+    let checkpoints = WorkspaceCheckpointClient(storage: fixture.records, managedRoot: fixture.managed)
+    let first = try await checkpoints.capture(directory: fixture.repository, conversationID: "cache", label: "First")
+    let unchanged = try await checkpoints.capture(directory: fixture.repository, conversationID: "cache", label: "Unchanged")
+    #expect(unchanged.tree == first.tree)
+    // Same size and a restored modification time: only ctime and the bytes differ.
+    let modified = try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date
+    try Data("bbbb\n".utf8).write(to: file)
+    try FileManager.default.setAttributes([.modificationDate: try #require(modified)], ofItemAtPath: file.path)
+    let rewritten = try await checkpoints.capture(directory: fixture.repository, conversationID: "cache", label: "Rewritten")
+    #expect(try fixture.git(["show", rewritten.tree + ":tracked.txt"]) == "bbbb")
+    // A blob collected after its checkpoint was pruned is hashed again.
+    try fixture.write("tracked.txt", "cccc\n")
+    let cached = try await checkpoints.capture(directory: fixture.repository, conversationID: "cache", label: "Cached")
+    let blob = try fixture.git(["rev-parse", cached.tree + ":tracked.txt"])
+    let objects = try fixture.git(["rev-parse", "--git-path", "objects"])
+    let loose = fixture.repository.appendingPathComponent(objects).appendingPathComponent(String(blob.prefix(2)))
+        .appendingPathComponent(String(blob.dropFirst(2)))
+    try FileManager.default.removeItem(at: loose)
+    let recovered = try await checkpoints.capture(directory: fixture.repository, conversationID: "cache", label: "Recovered")
+    #expect(try fixture.git(["cat-file", "-p", recovered.tree + ":tracked.txt"]) == "cccc")
+}
+
+@Test func checkpointRetentionPrunesOldestRefsButKeepsRestoreTarget() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    let workspace = try await ConversationWorkspaceClient(managedRoot: fixture.managed)
+        .prepare(directory: fixture.repository, mode: .newWorktree, baseRef: "HEAD")
+    let checkout = workspace.workingDirectory
+    let checkpoints = WorkspaceCheckpointClient(storage: fixture.records, managedRoot: fixture.managed, retainedCheckpoints: 2)
+    func refs() throws -> Set<String> {
+        Set(try fixture.git(["for-each-ref", "--format=%(refname)", "refs/memex/checkpoints/"], at: checkout)
+            .split(separator: "\n").map(String.init))
+    }
+    let oldest = try await checkpoints.capture(directory: checkout, conversationID: "retain", label: "Oldest")
+    try fixture.write("tracked.txt", "second\n", at: checkout)
+    _ = try await checkpoints.capture(directory: checkout, conversationID: "retain", label: "Second")
+    try fixture.write("tracked.txt", "third\n", at: checkout)
+    let third = try await checkpoints.capture(directory: checkout, conversationID: "retain", label: "Third")
+    #expect(try await checkpoints.list(directory: checkout, conversationID: "retain").map(\.label) == ["Second", "Third"])
+    #expect(try refs().count == 4)
+    #expect(try !refs().contains("refs/memex/checkpoints/\(oldest.id)/files"))
+    // The recovery capture inside restore would evict the oldest record, but
+    // never the checkpoint being restored.
+    let second = try #require(try await checkpoints.list(directory: checkout, conversationID: "retain").first)
+    let restored = try await checkpoints.restore(second, isolation: .init(workspace: workspace, otherWorkspaceDirectories: [], isBusy: false))
+    #expect(try String(contentsOf: checkout.appendingPathComponent("tracked.txt"), encoding: .utf8) == "second\n")
+    #expect(Set(try await checkpoints.list(directory: checkout, conversationID: "retain").map(\.id)) == [second.id, restored.recovery.id])
+    #expect(try !refs().contains("refs/memex/checkpoints/\(third.id)/files"))
+    try await checkpoints.discard(conversationID: "retain")
+    #expect(try refs().isEmpty)
+    #expect(try await checkpoints.list(directory: checkout, conversationID: "retain").isEmpty)
+}
+
+@Test func checkpointRestoreReplacesSymlinksAndModesFromStagedBlobs() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    let workspace = try await ConversationWorkspaceClient(managedRoot: fixture.managed)
+        .prepare(directory: fixture.repository, mode: .newWorktree, baseRef: "HEAD")
+    let checkout = workspace.workingDirectory
+    let large = Data((0..<3_000_000).map { UInt8($0 % 251) })
+    try large.write(to: checkout.appendingPathComponent("large.bin"))
+    try fixture.write("script.sh", "#!/bin/sh\n", at: checkout)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: checkout.appendingPathComponent("script.sh").path)
+    try FileManager.default.createDirectory(at: checkout.appendingPathComponent("dir/sub"), withIntermediateDirectories: true)
+    try fixture.write("deep.txt", "deep\n", at: checkout.appendingPathComponent("dir/sub"))
+    let checkpoints = WorkspaceCheckpointClient(storage: fixture.records, managedRoot: fixture.managed)
+    let checkpoint = try await checkpoints.capture(directory: checkout, conversationID: "modes", label: "Modes")
+    try FileManager.default.removeItem(at: checkout.appendingPathComponent("large.bin"))
+    try FileManager.default.createSymbolicLink(atPath: checkout.appendingPathComponent("large.bin").path, withDestinationPath: "tracked.txt")
+    try FileManager.default.removeItem(at: checkout.appendingPathComponent("dir"))
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: checkout.appendingPathComponent("script.sh").path)
+    _ = try await checkpoints.restore(checkpoint, isolation: .init(workspace: workspace, otherWorkspaceDirectories: [], isBusy: false))
+    let attributes = try FileManager.default.attributesOfItem(atPath: checkout.appendingPathComponent("large.bin").path)
+    #expect(attributes[.type] as? FileAttributeType == .typeRegular)
+    #expect(try Data(contentsOf: checkout.appendingPathComponent("large.bin")) == large)
+    #expect(try String(contentsOf: checkout.appendingPathComponent("dir/sub/deep.txt"), encoding: .utf8) == "deep\n")
+    #expect((try FileManager.default.attributesOfItem(atPath: checkout.appendingPathComponent("script.sh").path)[.posixPermissions] as? NSNumber)?.intValue == 0o755)
+    #expect(try String(contentsOf: checkout.appendingPathComponent("tracked.txt"), encoding: .utf8) == "base\n")
+}
+
+@Test func explicitCommitAndPushRunRepositoryHooksAndReportTheirOutput() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    let hooks = fixture.repository.appendingPathComponent(".git/hooks").path
+    try FileManager.default.createDirectory(atPath: hooks, withIntermediateDirectories: true)
+    func hook(_ name: String, _ body: String) throws {
+        let url = URL(fileURLWithPath: hooks).appendingPathComponent(name)
+        try Data("#!/bin/sh\n\(body)\n".utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
+    let marker = fixture.root.appendingPathComponent("pre-push-ran")
+    try hook("pre-commit", "for i in $(seq 1 400); do echo \"lint progress $i\" >&2; done\necho 'lint: trailing whitespace' >&2\nexit 1")
+    try hook("pre-push", "touch '\(marker.path)'")
+    try fixture.write("tracked.txt", "staged\n")
+    let client = WorkspaceGitClient()
+    try await client.stage(directory: fixture.repository, paths: ["tracked.txt"])
+    do {
+        _ = try await client.commit(directory: fixture.repository, message: "Blocked")
+        Issue.record("The failing pre-commit hook did not block the commit.")
+    } catch {
+        // The tail of hook output carries the actual failure.
+        #expect(error.localizedDescription.contains("lint: trailing whitespace"))
+    }
+    // App-internal Git commands keep hooks disabled.
+    _ = try fixture.git(["commit", "-qm", "Internal"])
+    try hook("pre-commit", "exit 0")
+    try fixture.write("tracked.txt", "allowed\n")
+    try await client.stage(directory: fixture.repository, paths: ["tracked.txt"])
+    _ = try await client.commit(directory: fixture.repository, message: "Allowed")
+    #expect(try fixture.git(["log", "--format=%s"]).split(separator: "\n").prefix(2) == ["Allowed", "Internal"])
+    let remote = fixture.root.appendingPathComponent("remote.git")
+    _ = try fixture.git(["init", "-q", "--bare", remote.path])
+    _ = try fixture.git(["remote", "add", "origin", remote.path])
+    #expect(!FileManager.default.fileExists(atPath: marker.path))
+    try await client.push(directory: fixture.repository, remote: "origin")
+    #expect(FileManager.default.fileExists(atPath: marker.path))
+}
+
+@Test func gitCommandPathIncludesHomebrewToolsAfterInheritedEntries() {
+    #expect(WorkspaceGitCommand.toolPath("/usr/bin:/custom/bin") == "/usr/bin:/custom/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/bin:/usr/sbin:/sbin")
+    #expect(WorkspaceGitCommand.toolPath(nil).hasPrefix("/opt/homebrew/bin:"))
+}
+
+@Test func draftPullRequestTargetsPushedForkBranchAgainstParentRepository() throws {
+    let fork = try WorkspaceGitClient.pullRequestTarget(branch: "feature",
+        remoteURLs: ["origin": "git@github.com:me/memex.git", "upstream": "https://github.com/nicosuave/memex.git"],
+        pushRemote: nil, upstreamRemote: "origin", mergeRef: "refs/heads/feature-remote")
+    #expect(fork == .init(repository: "https://github.com/nicosuave/memex.git", head: "me:feature-remote"))
+    let same = try WorkspaceGitClient.pullRequestTarget(branch: "feature",
+        remoteURLs: ["origin": "ssh://git@github.com/nicosuave/memex"], pushRemote: nil, upstreamRemote: "origin", mergeRef: "refs/heads/feature")
+    #expect(same == .init(repository: "ssh://git@github.com/nicosuave/memex", head: "feature"))
+    #expect(throws: (any Error).self) {
+        try WorkspaceGitClient.pullRequestTarget(branch: "feature", remoteURLs: ["origin": "git@github.com:me/memex.git"],
+            pushRemote: nil, upstreamRemote: nil, mergeRef: nil)
+    }
+    #expect(throws: (any Error).self) {
+        try WorkspaceGitClient.pullRequestTarget(branch: "feature", remoteURLs: ["origin": "git@github.com:-x/memex.git"],
+            pushRemote: nil, upstreamRemote: "origin", mergeRef: "refs/heads/feature")
+    }
+}
+
+@Test func branchDiffStopsAtTheDisplayLimitAndDisclosesTruncation() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    try fixture.write("tracked.txt", String(repeating: "a long changed line for the bounded diff\n", count: 20_000))
+    let client = WorkspaceChangesClient()
+    let snapshot = try #require(try await client.snapshot(directory: fixture.repository, scope: .branch("trunk")))
+    let file = try #require(snapshot.files.first { $0.path == "tracked.txt" })
+    let patch = try await client.diff(file: file, root: fixture.repository, scope: .branch("trunk"))
+    #expect(patch.hasSuffix("[Diff truncated at 512 KB.]"))
+    #expect(patch.utf8.count <= WorkspaceChangesClient.outputLimit + 64)
+}
+
+@Test func setupReportsStandardErrorOnSuccessAndTheTailOnFailure() async throws {
+    let fixture = try WorkspaceGitFixture()
+    defer { fixture.clean() }
+    let setup = WorkspaceSetupClient()
+    let output = try await setup.run(directory: fixture.repository, script: "echo out; echo warning >&2")
+    #expect(output.contains("out") && output.contains("warning"))
+    do {
+        _ = try await setup.run(directory: fixture.repository, script: "for i in $(seq 1 3000); do echo \"line $i\"; done; echo 'final failure' >&2; exit 3")
+        Issue.record("The failing setup command succeeded.")
+    } catch {
+        #expect(error.localizedDescription.contains("final failure"))
+        #expect(!error.localizedDescription.contains("line 1\n"))
+    }
+}

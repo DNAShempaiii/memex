@@ -252,31 +252,36 @@ extension WorkspaceBrowserSession {
         let configuration = WKSnapshotConfiguration()
         configuration.snapshotWidth = NSNumber(value: Double(min(1600, webView.bounds.width)))
         return try await withCheckedThrowingContinuation { continuation in
+            // Like recording frames, a snapshot WebKit never completes fails
+            // after a bound; a late completion is ignored, never resumed twice.
+            let reply = WorkspaceBrowserScriptReply(continuation, seconds: 5,
+                message: "WebKit did not capture this viewport within 5 seconds. Show the tab and retry.")
             webView.takeSnapshot(with: configuration) { image, error in
-                if let error { continuation.resume(throwing: error); return }
+                if let error { reply.finish(.failure(error)); return }
                 guard let data = image?.tiffRepresentation,
                       let bitmap = NSBitmapImageRep(data: data), let png = bitmap.representation(using: .png, properties: [:]) else {
-                    continuation.resume(throwing: WorkspaceBrowserAutomationError(message: "WebKit could not capture this viewport.")); return
+                    reply.finish(.failure(WorkspaceBrowserAutomationError(message: "WebKit could not capture this viewport."))); return
                 }
-                continuation.resume(returning: png)
+                reply.finish(.success(png))
             }
         }
     }
 }
 
-@MainActor private final class WorkspaceBrowserScriptReply {
-    private var continuation: CheckedContinuation<String, any Error>?
+@MainActor private final class WorkspaceBrowserScriptReply<Value: Sendable> {
+    private var continuation: CheckedContinuation<Value, any Error>?
     private var timeout: Task<Void, Never>?
 
-    init(_ continuation: CheckedContinuation<String, any Error>) {
+    init(_ continuation: CheckedContinuation<Value, any Error>, seconds: Int = 15,
+         message: String = "The page did not finish this browser operation within 15 seconds. Its outcome may be unknown; inspect the page before retrying.") {
         self.continuation = continuation
         timeout = Task { @MainActor [weak self] in
-            do { try await Task.sleep(for: .seconds(15)) } catch { return }
-            self?.finish(.failure(WorkspaceBrowserAutomationError(message: "The page did not finish this browser operation within 15 seconds. Its outcome may be unknown; inspect the page before retrying.")))
+            do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+            self?.finish(.failure(WorkspaceBrowserAutomationError(message: message)))
         }
     }
 
-    func finish(_ result: Result<String, any Error>) {
+    func finish(_ result: Result<Value, any Error>) {
         guard let continuation else { return }
         self.continuation = nil
         timeout?.cancel()

@@ -38,7 +38,7 @@ struct WorkspaceGitActionsView: View {
                 switch action {
                 case .commit:
                     Text("Commit staged changes").font(.headline)
-                    Text("Only the Git index is committed. Unstaged and untracked files stay outside this commit.")
+                    Text("Only the Git index is committed. Unstaged and untracked files stay outside this commit. The repository's pre-commit and commit-msg hooks run.")
                         .font(.caption).foregroundStyle(.secondary)
                     TextField("Commit message", text: $message, axis: .vertical).lineLimit(3...8)
                 case .push:
@@ -46,15 +46,21 @@ struct WorkspaceGitActionsView: View {
                     Picker("Remote", selection: $remote) {
                         ForEach(status?.remotes ?? [], id: \.self) { Text($0).tag($0) }
                     }
-                    Text("Pushes this branch without force. Authentication uses your configured Git tools.").font(.caption)
+                    Text("Pushes this branch without force and runs the repository's pre-push hook, including Git LFS uploads. Authentication uses your configured Git tools.").font(.caption)
                 case .pullRequest:
                     Text("Create draft pull request").font(.headline)
-                    Text("Push the branch first. This action uses the origin repository and your configured GitHub CLI.").font(.caption)
+                    Text("Push the branch first. The base repository is upstream when present, otherwise origin; the head is the remote this branch was pushed to. Uses your configured GitHub CLI.").font(.caption)
                     TextField("Title", text: $title)
                     TextField("Base branch", text: $base)
                     TextEditor(text: $bodyText).frame(minHeight: 140)
                 }
-                if let error { Text(error).foregroundStyle(.orange).textSelection(.enabled) }
+                if let error {
+                    // Hook output can be long; keep it readable and selectable.
+                    ScrollView {
+                        Text(error).font(.system(.caption, design: .monospaced)).foregroundStyle(.orange)
+                            .textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                    }.frame(maxHeight: 180)
+                }
                 HStack {
                     Spacer()
                     Button("Cancel") { self.action = nil }.disabled(busy)

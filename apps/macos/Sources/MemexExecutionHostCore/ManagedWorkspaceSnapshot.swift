@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 /// A durable archive of filesystem bytes, plus independent HEAD/index trees.
@@ -45,29 +46,41 @@ extension ManagedWorkspaceStore {
         guard !tracked.split(separator: "\n").contains(where: { $0.hasPrefix("160000 ") }) else {
             throw WorkspaceGitError(message: "Snapshot recovery does not support submodules. The checkout was retained.")
         }
-        let before = try Self.filesystemFingerprint(checkout)
-        // tar preserves binary contents, names, file modes, empty directories,
-        // and symlinks without following them. Only the checkout's .git pointer
-        // is excluded; ignored files and nested .gitignore files are retained.
-        _ = try command.execute(executable: URL(fileURLWithPath: "/usr/bin/tar"),
-            arguments: ["-czf", archive.path, "--exclude=./.git", "-C", checkout.path, "."], timeout: 300)
-        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: archive.path)
-        // Do not publish a mixed read if another process changed the checkout
-        // during capture. No original files or index entries have been touched.
-        try manager.removeItem(at: index)
-        try manager.copyItem(at: URL(fileURLWithPath: indexPath), to: index)
-        let finalIndexTree = try WorkspaceGitCommand.text(checkout, ["write-tree"], command: command, environment: ["GIT_INDEX_FILE": index.path])
-        guard before == (try Self.filesystemFingerprint(checkout)), finalIndexTree == indexTree,
-              try WorkspaceGitCommand.text(checkout, ["rev-parse", "HEAD"], command: command) == head else {
-            throw WorkspaceGitError(message: "The checkout changed during snapshot capture. No recovery snapshot was published; retry when it is idle.")
+        // Entries changed at or after this instant are content-hashed in both
+        // passes; older ones compare by inode, size, mode and timestamps.
+        let captureStart = Date().addingTimeInterval(-2)
+        let before = try Self.filesystemFingerprint(checkout, hashingChangesSince: captureStart)
+        // A failed, cancelled or mismatched capture never leaves a partial
+        // archive beside published snapshots.
+        do {
+            // tar preserves binary contents, names, file modes, empty directories,
+            // and symlinks without following them. Only the checkout's .git pointer
+            // is excluded; ignored files and nested .gitignore files are retained.
+            _ = try command.execute(executable: URL(fileURLWithPath: "/usr/bin/tar"),
+                arguments: ["-czf", archive.path, "--exclude=./.git", "-C", checkout.path, "."], timeout: 300)
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: archive.path)
+            // Do not publish a mixed read if another process changed the checkout
+            // during capture. No original files or index entries have been touched.
+            try manager.removeItem(at: index)
+            try manager.copyItem(at: URL(fileURLWithPath: indexPath), to: index)
+            let finalIndexTree = try WorkspaceGitCommand.text(checkout, ["write-tree"], command: command, environment: ["GIT_INDEX_FILE": index.path])
+            guard before == (try Self.filesystemFingerprint(checkout, hashingChangesSince: captureStart)), finalIndexTree == indexTree,
+                  try WorkspaceGitCommand.text(checkout, ["rev-parse", "HEAD"], command: command) == head else {
+                throw WorkspaceGitError(message: "The checkout changed during snapshot capture. No recovery snapshot was published; retry when it is idle.")
+            }
+            let snapshot = ManagedWorkspaceSnapshot(id: id, workspaceID: workspace.id, createdAt: Date(), head: head,
+                indexTree: indexTree, archiveSHA256: try Self.snapshotDigest(archive))
+            // Anchor both commits and staged contents independently of the branch.
+            _ = try WorkspaceGitCommand.text(checkout, ["update-ref", "refs/memex/snapshots/" + id + "/head", head], command: command)
+            _ = try WorkspaceGitCommand.text(checkout, ["update-ref", "refs/memex/snapshots/" + id + "/index", indexTree], command: command)
+            try JSONEncoder().encode(snapshot).write(to: folder.appendingPathComponent(id + ".json"), options: .atomic)
+            return snapshot
+        } catch {
+            try? manager.removeItem(at: archive)
+            _ = try? WorkspaceGitCommand.text(checkout, ["update-ref", "-d", "refs/memex/snapshots/" + id + "/head"], command: CommandRun())
+            _ = try? WorkspaceGitCommand.text(checkout, ["update-ref", "-d", "refs/memex/snapshots/" + id + "/index"], command: CommandRun())
+            throw error
         }
-        let snapshot = ManagedWorkspaceSnapshot(id: id, workspaceID: workspace.id, createdAt: Date(), head: head,
-            indexTree: indexTree, archiveSHA256: try Self.snapshotDigest(archive))
-        // Anchor both commits and staged contents independently of the branch.
-        _ = try WorkspaceGitCommand.text(checkout, ["update-ref", "refs/memex/snapshots/" + id + "/head", head], command: command)
-        _ = try WorkspaceGitCommand.text(checkout, ["update-ref", "refs/memex/snapshots/" + id + "/index", indexTree], command: command)
-        try JSONEncoder().encode(snapshot).write(to: folder.appendingPathComponent(id + ".json"), options: .atomic)
-        return snapshot
     }
 
     public func recoverSnapshot(_ snapshot: ManagedWorkspaceSnapshot, workspace: ConversationWorkspace,
@@ -104,8 +117,14 @@ extension ManagedWorkspaceStore {
         return metadata.deletingLastPathComponent().appendingPathComponent("snapshots", isDirectory: true)
     }
 
-    private static func filesystemFingerprint(_ checkout: URL) throws -> [String: String] {
+    /// Stat identity (inode, mode, size, modification and status-change times
+    /// in nanoseconds) detects any completed write, because each write moves
+    /// ctime forward. Only entries whose times fall at or after `since` could
+    /// share a timestamp with a concurrent write, so only those are also
+    /// content-hashed, in both passes, rather than every file twice.
+    static func filesystemFingerprint(_ checkout: URL, hashingChangesSince since: Date) throws -> [String: String] {
         let manager = FileManager.default
+        let threshold = since.timeIntervalSince1970
         var result: [String: String] = [:]
         var enumerationError: Error?
         guard let enumerator = manager.enumerator(at: checkout, includingPropertiesForKeys: nil,
@@ -120,16 +139,22 @@ extension ManagedWorkspaceStore {
                 enumerator.skipDescendants()
                 continue
             }
-            let attributes = try manager.attributesOfItem(atPath: path.path)
-            let mode = String(describing: attributes[.posixPermissions])
-            switch attributes[.type] as? FileAttributeType {
-            case .typeRegular:
-                result[path.path] = mode + ":file:" + (try snapshotDigest(path))
-            case .typeSymbolicLink:
-                result[path.path] = mode + ":link:" + (try manager.destinationOfSymbolicLink(atPath: path.path))
+            var info = stat()
+            guard lstat(path.path, &info) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            func seconds(_ time: timespec) -> Double { Double(time.tv_sec) + Double(time.tv_nsec) / 1_000_000_000 }
+            let identity = "\(info.st_mode):\(info.st_ino):\(info.st_size):\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec):"
+                + "\(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
+            let recent = seconds(info.st_mtimespec) >= threshold || seconds(info.st_ctimespec) >= threshold
+            switch info.st_mode & S_IFMT {
+            case S_IFREG:
+                result[path.path] = identity + ":file" + (recent ? ":" + (try snapshotDigest(path)) : "")
+            case S_IFLNK:
+                result[path.path] = identity + ":link:" + (try manager.destinationOfSymbolicLink(atPath: path.path))
                 enumerator.skipDescendants()
-            case .typeDirectory:
-                result[path.path] = mode + ":directory"
+            case S_IFDIR:
+                // Directory times are not compared; entries added or removed
+                // beneath it appear or disappear as their own keys.
+                result[path.path] = "\(info.st_mode):directory"
             default:
                 throw WorkspaceGitError(message: "The checkout contains a special filesystem entry that cannot be safely snapshotted: \(path.path)")
             }

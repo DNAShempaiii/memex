@@ -101,7 +101,7 @@ struct WorkspaceChangesView: View {
                             List(snapshot.files, selection: Binding(get: { state.selectedPath }, set: { state.select($0) })) { file in
                                 VStack(alignment: .leading, spacing: 3) {
                                     Text(file.label).lineLimit(2).truncationMode(.middle)
-                                    Text(scope == .current ? file.status : file.isUntracked ? "Untracked" : String(file.worktreeStatus))
+                                    Text(scope == .current || file.isNestedRepository ? file.status : file.isUntracked ? "Untracked" : String(file.worktreeStatus))
                                         .font(.caption).foregroundStyle(.secondary)
                                 }.tag(file.id).help(file.label)
                             }.listStyle(.sidebar).frame(minWidth: 150, idealWidth: 230, maxWidth: 340)
@@ -109,7 +109,8 @@ struct WorkspaceChangesView: View {
                                 if let error = state.patchError {
                                     errorBanner(error, retained: state.patch != nil) { state.retryPatch() }
                                 }
-                                if scope == .current, let path = state.selectedPath {
+                                if scope == .current, let path = state.selectedPath,
+                                   snapshot.files.first(where: { $0.path == path })?.isNestedRepository != true {
                                     HStack {
                                         Button("Stage file") { Task { await changeIndex(path: path, stage: true) } }
                                         Button("Unstage file") { Task { await changeIndex(path: path, stage: false) } }

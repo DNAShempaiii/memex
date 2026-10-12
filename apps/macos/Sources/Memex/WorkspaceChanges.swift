@@ -8,8 +8,12 @@ struct WorkspaceChange: Identifiable, Hashable, Sendable {
     let worktreeStatus: Character
     var id: String { path }
     var isUntracked: Bool { indexStatus == "?" }
+    /// Git reports an untracked directory containing its own repository as
+    /// `dir/`. Staging it would record an embedded gitlink, not its files.
+    var isNestedRepository: Bool { isUntracked && path.hasSuffix("/") }
     var label: String { originalPath.map { "\($0) → \(path)" } ?? path }
     var status: String {
+        if isNestedRepository { return "Nested repository" }
         if isUntracked { return "Untracked" }
         if indexStatus == "U" || worktreeStatus == "U" { return "Conflict" }
         return [indexStatus != " " ? "Staged \(indexStatus)" : nil,
@@ -90,6 +94,9 @@ struct WorkspaceChangesClient: Sendable {
                 let url = root.appendingPathComponent(file.path)
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 if values.isDirectory == true && values.isSymbolicLink != true {
+                    if file.isNestedRepository {
+                        return "Nested repository: \(file.path)\nThis folder is its own Git repository. Memex does not stage it or include it in checkpoints; commit its changes inside that repository, or add it as a submodule with Git."
+                    }
                     return "Untracked directory: \(file.path)\nGit does not provide a file patch for this directory."
                 }
                 let result = try Self.git(root, common + ["--no-index", "--", "/dev/null", url.path])
@@ -112,7 +119,7 @@ struct WorkspaceChangesClient: Sendable {
         }.value
     }
 
-    private struct Output {
+    struct Output {
         let code: Int32
         let text: String
         let error: String
@@ -130,7 +137,7 @@ struct WorkspaceChangesClient: Sendable {
 
     /// Temporary output files avoid pipe deadlocks. Size and time watchdogs bound
     /// each read; Git cannot invoke external diff drivers, text conversion or fsmonitor hooks.
-    private static func git(_ directory: URL, _ arguments: [String]) throws -> Output {
+    static func git(_ directory: URL, _ arguments: [String]) throws -> Output {
         let temp = FileManager.default.temporaryDirectory.appendingPathComponent("memex-diff-" + UUID().uuidString)
         try FileManager.default.createDirectory(at: temp, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: temp) }
