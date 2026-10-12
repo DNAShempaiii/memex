@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 import Foundation
 
@@ -27,8 +27,16 @@ if let runtimeRoot, !runtimeRoot.isEmpty {
     appDependencies.append(.product(name: "SQACPUI", package: "sq-ui"))
     appDependencies.append(.product(name: "SQMcpApps", package: "sq-acp"))
     appDependencies.append(.product(name: "SQMcpAppsUI", package: "sq-acp"))
-    let archive = ProcessInfo.processInfo.environment["MEMEX_AGENT_RUNTIME_LIBRARY"]
-        ?? runtimeRoot + "/packages/sq-acp/target/runtime-native/aarch64-apple-darwin/release/libsq_acp_runtime.a"
+    // Link only the archive that prepare-runtime.sh qualified and build.sh verified.
+    // Never fall back to whatever archive happens to exist in the runtime checkout.
+    guard let archive = ProcessInfo.processInfo.environment["MEMEX_AGENT_RUNTIME_LIBRARY"], !archive.isEmpty else {
+        fatalError("""
+            A Memex agent runtime checkout is configured (\(runtimeRoot)), but MEMEX_AGENT_RUNTIME_LIBRARY is not set. \
+            Build with apps/macos/scripts/build.sh, which verifies the prepared runtime, or set \
+            MEMEX_AGENT_RUNTIME_LIBRARY to the archive from prepare-runtime.sh (see apps/macos/RUNTIME.md). \
+            Set MEMEX_HISTORY_ONLY=1 to build without the runtime.
+            """)
+    }
     linkerSettings = [.unsafeFlags(["-Xlinker", archive]),
                       .linkedFramework("CoreFoundation"), .linkedFramework("CoreServices"), .linkedLibrary("iconv")]
 }
