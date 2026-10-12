@@ -3,7 +3,17 @@ import SwiftUI
 struct SidebarConversationGroup: Identifiable {
     let name: String
     let sessions: [Session]
+    /// The project's indexed conversation count, which can exceed the loaded rows.
+    var count: Int
     var id: String { name }
+}
+
+/// Sidebar rows derived once per render from a single sort of the library.
+struct SidebarListing {
+    let pinned: [Session]
+    let sections: [String: [Session]]
+    let unpinned: [Session]
+    let groups: [SidebarConversationGroup]
 }
 
 extension Store {
@@ -12,12 +22,16 @@ extension Store {
         conversationLibrary.sorted(librarySessions, preservingSearchRank: query.nilIfBlank != nil)
     }
 
-    var sidebarGroups: [SidebarConversationGroup] {
-        let groups = Dictionary(grouping: sidebarSessions, by: projectName(for:))
-            .map { SidebarConversationGroup(name: $0.key, sessions: $0.value) }
-        let sort = projectSort
+    var sidebarGroups: [SidebarConversationGroup] { sidebarGroups(from: sidebarSessions) }
+
+    func sidebarGroups(from sessions: [Session]) -> [SidebarConversationGroup] {
         let projectCounts = Dictionary(projects.map { ($0.project, $0.sessionCount) },
                                        uniquingKeysWith: { first, _ in first })
+        let groups = Dictionary(grouping: sessions, by: projectName(for:)).map {
+            SidebarConversationGroup(name: $0.key, sessions: $0.value,
+                                     count: max($0.value.count, projectCounts[$0.key] ?? 0))
+        }
+        let sort = projectSort
         return groups.sorted { lhs, rhs in
             switch sort {
             case .recent:
@@ -25,13 +39,35 @@ extension Store {
                 let right = rhs.sessions.map { $0.lastAt ?? "" }.max() ?? ""
                 if left != right { return left > right }
             case .conversations:
-                let left = projectCounts[lhs.name] ?? lhs.sessions.count
-                let right = projectCounts[rhs.name] ?? rhs.sessions.count
-                if left != right { return left > right }
+                if lhs.count != rhs.count { return lhs.count > rhs.count }
             case .name: break
             }
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }
+    }
+
+    var sidebarListing: SidebarListing {
+        let sessions = sidebarSessions
+        let organizing = conversationLibraryScope == .active && query.nilIfBlank == nil
+        let pinned = organizing ? sessions.filter { conversationLibrary.isPinned($0) } : []
+        let pinnedIDs = Set(pinned.map(\.id))
+        var sections: [String: [Session]] = [:]
+        var unpinned: [Session] = []
+        for session in sessions where !pinnedIDs.contains(session.id) {
+            if organizing, let section = conversationLibrary.sectionID(for: session) {
+                sections[section, default: []].append(session)
+            } else {
+                unpinned.append(session)
+            }
+        }
+        return SidebarListing(pinned: pinned, sections: sections, unpinned: unpinned,
+                              groups: sidebarMode == .projects ? sidebarGroups(from: unpinned) : [])
+    }
+
+    /// A search hit's matching passage, trimmed so the hit survives two lines.
+    func sidebarExcerpt(for session: Session) -> String? {
+        guard query.nilIfBlank != nil, let snippet = session.snippet?.nilIfBlank else { return nil }
+        return ConversationExcerpt.text(snippet, query: query)
     }
 }
 
@@ -68,29 +104,13 @@ struct BrowserSidebar: View {
         })
     }
 
-    private var pinned: [Session] {
-        guard store.conversationLibraryScope == .active, store.query.nilIfBlank == nil else { return [] }
-        return store.sidebarSessions.filter { store.conversationLibrary.isPinned($0) }
-    }
     private var showsCustomSections: Bool {
         store.conversationLibraryScope == .active && store.query.nilIfBlank == nil
     }
-    private func customRows(_ section: ConversationLibrary.CustomSection) -> [Session] {
-        store.sidebarSessions.filter {
-            !store.conversationLibrary.isPinned($0) && store.conversationLibrary.sectionID(for: $0) == section.id
-        }
-    }
-    private var unpinned: [Session] {
-        let ids = Set(pinned.map(\.id))
-        return store.sidebarSessions.filter {
-            !ids.contains($0.id) && (!showsCustomSections || store.conversationLibrary.sectionID(for: $0) == nil)
-        }
-    }
 
     var body: some View {
-        let pinned = self.pinned
-        let unpinned = self.unpinned
-        let unpinnedIDs = Set(unpinned.map(\.id))
+        let listing = store.sidebarListing
+        let pinned = listing.pinned
         // SwiftUI prepares row menus during layout; resolve native rows once.
         let nativeSessions = Dictionary(store.sessions.map { ($0.id, $0) },
                                         uniquingKeysWith: { first, _ in first })
@@ -132,7 +152,7 @@ struct BrowserSidebar: View {
                     if showsCustomSections {
                         ForEach(store.conversationLibrary.sections) { section in
                             Section {
-                                conversationRows(customRows(section), showsProject: true, nativeSessions: nativeSessions,
+                                conversationRows(listing.sections[section.id] ?? [], showsProject: true, nativeSessions: nativeSessions,
                                                  managedSelection: managedSelection)
                             } header: {
                                 HStack {
@@ -157,31 +177,40 @@ struct BrowserSidebar: View {
                         }
                     }
                     if store.sidebarMode == .projects {
-                        ForEach(store.sidebarGroups) { group in
-                            let rows = group.sessions.filter { unpinnedIDs.contains($0.id) }
-                            if !rows.isEmpty {
-                                DisclosureGroup(isExpanded: Binding(get: { !collapsedProjects.contains(group.id) }, set: {
-                                    if $0 { collapsedProjects.remove(group.id) } else { collapsedProjects.insert(group.id) }
-                                })) {
-                                    conversationRows(rows, showsProject: false, nativeSessions: nativeSessions,
-                                                     managedSelection: managedSelection)
-                                } label: {
+                        ForEach(listing.groups) { group in
+                            DisclosureGroup(isExpanded: Binding(get: { !collapsedProjects.contains(group.id) }, set: {
+                                if $0 { collapsedProjects.remove(group.id) } else { collapsedProjects.insert(group.id) }
+                            })) {
+                                conversationRows(group.sessions, showsProject: false, nativeSessions: nativeSessions,
+                                                 managedSelection: managedSelection)
+                            } label: {
+                                HStack {
                                     Label(group.name, systemImage: "folder").lineLimit(1)
+                                    Spacer(minLength: 4)
+                                    Text("\(group.count)").font(.caption).foregroundStyle(.secondary).monospacedDigit()
                                 }
+                                .help("\(group.count) conversation\(group.count == 1 ? "" : "s") in \(group.name)")
                             }
                         }
                     } else {
-                        conversationRows(unpinned, showsProject: true, nativeSessions: nativeSessions,
+                        conversationRows(listing.unpinned, showsProject: true, nativeSessions: nativeSessions,
                                          managedSelection: managedSelection)
                     }
                     if store.loadingSessions {
                         ProgressView().controlSize(.small).frame(maxWidth: .infinity)
                     } else if store.hasMoreSessions, let last = store.sessions.last {
-                        Button("Load older conversations") { store.loadMoreSessionsIfNeeded(visibleID: last.id) }
-                            .buttonStyle(.plain).foregroundStyle(.secondary)
+                        // Reaching the end of the list loads the next page. A new
+                        // identity per page re-triggers while the end stays visible.
+                        ProgressView().controlSize(.small).frame(maxWidth: .infinity)
+                            .id("page-\(store.sessions.count)")
+                            .onAppear { store.loadMoreSessionsIfNeeded(visibleID: last.id) }
                     } else if store.librarySessions.isEmpty && store.listError == nil {
-                        Text(store.query.isEmpty ? "No conversations" : "No matching conversations")
-                            .font(.callout).foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(Self.emptyTitle(query: store.query, filtered: store.filters.isActive))
+                                .font(.callout).foregroundStyle(.secondary)
+                            Text(Self.emptyHint(query: store.query, filtered: store.filters.isActive))
+                                .font(.caption).foregroundStyle(.tertiary)
+                        }
                     }
                     if let error = store.listError {
                         Button("Retry loading conversations") { Task { await store.loadSessions() } }
@@ -253,6 +282,16 @@ struct BrowserSidebar: View {
         .sheet(isPresented: $showingNotifications) {
             ConversationNotificationSettingsView(notifications: store.conversationNotifications)
         }
+    }
+
+    static func emptyTitle(query: String, filtered: Bool) -> String {
+        filtered ? "No matching conversations" : (query.nilIfBlank == nil ? "No conversations yet" : "No matches")
+    }
+
+    static func emptyHint(query: String, filtered: Bool) -> String {
+        filtered ? "Try another timeframe, provider, or conversation type."
+            : (query.nilIfBlank == nil ? "Run memex index to index your local history, then refresh."
+               : "Try different words or another project.")
     }
 
     private func conversationRows(_ sessions: [Session], showsProject: Bool,
@@ -375,6 +414,9 @@ struct BrowserSidebar: View {
                     .lineLimit(2)
                 ConversationStateLabel(state: .init(activity: state.activity == .openElsewhere ? nil : state.activity,
                                                    hasDraft: state.hasDraft))
+            }
+            if let excerpt = store.sidebarExcerpt(for: session) {
+                Text(excerpt).font(.caption).foregroundStyle(.secondary).lineLimit(2)
             }
             HStack(spacing: 4) {
                 if store.conversationLibrary.isPinned(session) { Image(systemName: "pin.fill").accessibilityLabel("Pinned") }

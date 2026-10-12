@@ -66,17 +66,12 @@ private actor HomeConversationRuntime: ConversationRuntime {
         #expect(reopened.contexts[session.id]?.projectName == "My project")
         #expect(reopened.contexts[session.id]?.workspace.workingDirectory == root.resolvingSymlinksInPath())
         #expect(drafts.drafts[session.id]?.pendingPrompt?.text == "Build the requested feature")
-        let list = ConversationListController()
-        list.update(sessions: [session], selectedID: session.id, projectNames: store.conversationProjectNames,
-                    select: { _ in }, loadMore: { _ in })
-        #expect(list.rows[0].metadata == "My project · codex")
-        #expect(list.rows[0].session == session)
+        #expect(store.projectName(for: session) == "My project")
+        #expect(store.sidebarGroups(from: [session]).map(\.name) == ["My project"])
         var renamed = project
         renamed.name = "Renamed project"
         try projects.update(renamed)
-        list.update(sessions: [session], selectedID: session.id, projectNames: store.conversationProjectNames,
-                    select: { _ in }, loadMore: { _ in })
-        #expect(list.rows[0].metadata == "Renamed project · codex")
+        #expect(store.sidebarGroups(from: [session]).map(\.name) == ["Renamed project"])
         #expect(store.projectName(for: session) == "Renamed project")
         try projects.remove(id: project.id)
         #expect(store.projectName(for: session) == "My project")

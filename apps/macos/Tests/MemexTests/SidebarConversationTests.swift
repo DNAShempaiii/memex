@@ -29,6 +29,26 @@ import Testing
         #expect(store.sessions == [older, newer])
     }
 
+    @Test func listingPartitionsOneSortIntoPinnedAndProjectGroups() throws {
+        let name = "Memex-sidebar-test-\(UUID())"
+        let preferences = try #require(UserDefaults(suiteName: name))
+        defer { preferences.removePersistentDomain(forName: name) }
+        let store = Store(filterPreferences: preferences)
+        let sessions = (0..<3).map { Session(source: "codex", sessionID: "s\($0)", sourcePath: "/s\($0)",
+                                             project: $0 == 2 ? "two" : "one", lastAt: "2026-10-0\($0 + 1)T12:00:00Z") }
+        store.scope = .all
+        store.sessions = sessions
+        store.sidebarMode = .projects
+        _ = store.conversationLibrary.pin([sessions[0]], pinned: true)
+        let listing = store.sidebarListing
+        #expect(listing.pinned.map(\.id) == [sessions[0].id])
+        #expect(listing.unpinned.map(\.id) == [sessions[2].id, sessions[1].id])
+        #expect(listing.groups.map(\.name) == ["two", "one"])
+        #expect(listing.groups.map(\.count) == [1, 1]) // Loaded rows stand in until project counts arrive.
+        store.query = "anything"
+        #expect(store.sidebarListing.pinned.isEmpty)
+    }
+
     @Test func savedProjectlessContextGroupsWithoutChangingSourceIdentity() {
         let catalog = CreatedConversationCatalog()
         let store = Store(createdConversations: catalog)
