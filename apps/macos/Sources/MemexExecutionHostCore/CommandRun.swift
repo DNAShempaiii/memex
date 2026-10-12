@@ -29,19 +29,26 @@ public final class CommandRun: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// `outputFile` streams stdout to a caller-owned file (truncated first) and
+    /// returns empty data, so large outputs never enter memory. With
+    /// `mergeStandardError`, stderr interleaves into stdout and failures report
+    /// the tail of that combined stream.
     public func execute(executable: URL, arguments: [String], timeout: TimeInterval, progress: ActivityProgressHandler? = nil,
-                 inputFile: URL? = nil, maximumOutputBytes: Int? = nil) throws -> Data {
+                 inputFile: URL? = nil, maximumOutputBytes: Int? = nil, outputFile: URL? = nil,
+                 mergeStandardError: Bool = false) throws -> Data {
         if let maximumOutputBytes, maximumOutputBytes < 0 || maximumOutputBytes == Int.max { throw ClientError(message: "Output limit must be a nonnegative bounded integer.") }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let outputURL = directory.appendingPathComponent("stdout")
-        let errorURL = directory.appendingPathComponent("stderr")
-        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
-        FileManager.default.createFile(atPath: errorURL.path, contents: nil)
+        let outputURL = outputFile ?? directory.appendingPathComponent("stdout")
+        let errorURL = mergeStandardError ? outputURL : directory.appendingPathComponent("stderr")
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil),
+              mergeStandardError || FileManager.default.createFile(atPath: errorURL.path, contents: nil) else {
+            throw ClientError(message: "Memex could not create a command output file.")
+        }
         let output = try FileHandle(forWritingTo: outputURL)
-        let errors = try FileHandle(forWritingTo: errorURL)
-        defer { try? output.close(); try? errors.close() }
+        let errors = mergeStandardError ? output : try FileHandle(forWritingTo: errorURL)
+        defer { try? output.close(); if !mergeStandardError { try? errors.close() } }
         let progressReader = progress == nil ? nil : try FileHandle(forReadingFrom: errorURL)
         defer { try? progressReader?.close() }
         let child = Process()
@@ -95,7 +102,7 @@ public final class CommandRun: @unchecked Sendable {
         func exceedsOutputLimit() -> Bool {
             guard let limit = maximumOutputBytes else { return false }
             let stdoutBytes = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? NSNumber)?.int64Value ?? 0
-            let stderrBytes = (try? FileManager.default.attributesOfItem(atPath: errorURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+            let stderrBytes = mergeStandardError ? 0 : (try? FileManager.default.attributesOfItem(atPath: errorURL.path)[.size] as? NSNumber)?.int64Value ?? 0
             return stdoutBytes > Int64(limit) || stderrBytes > Int64(limit) - stdoutBytes
         }
         while child.isRunning {
@@ -128,14 +135,20 @@ public final class CommandRun: @unchecked Sendable {
         if outputLimitExceeded || exceedsOutputLimit() { throw ClientError(message: "Command output exceeded the \(maximumOutputBytes ?? 0) byte limit.") }
         if timedOut { throw ClientError(message: "Memex took too long to respond. Try again.") }
         guard child.terminationStatus == 0 else {
+            // The final lines carry the actual failure (a hook, test or Git
+            // error); earlier output is progress. Report the tail, not the head.
             let errorReader = try? FileHandle(forReadingFrom: errorURL)
-            let errorBytes = try? errorReader?.read(upToCount: 8192)
+            let size = (try? errorReader?.seekToEnd()) ?? 0
+            try? errorReader?.seek(toOffset: size > 8192 ? size - 8192 : 0)
+            let errorBytes = try? errorReader?.readToEnd()
             try? errorReader?.close()
             let message = errorBytes.map { String(decoding: $0, as: UTF8.self) } ?? "Memex could not complete the request."
             let failure = message.split(separator: "\n", omittingEmptySubsequences: false)
                 .filter { !$0.hasPrefix("MEMEX_PROGRESS ") }.joined(separator: "\n")
-            throw ClientError(message: String(failure.prefix(4000)))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw ClientError(message: failure.isEmpty ? "The command failed with exit status \(child.terminationStatus)." : String(failure.suffix(4000)))
         }
+        if outputFile != nil { return Data() }
         if let maximumOutputBytes {
             let reader = try FileHandle(forReadingFrom: outputURL); defer { try? reader.close() }
             let bytes = try reader.read(upToCount: maximumOutputBytes + 1) ?? Data()

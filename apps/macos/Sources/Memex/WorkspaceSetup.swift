@@ -11,8 +11,11 @@ struct WorkspaceSetupClient: Sendable {
             let directory = try LocalProjects.validatedDirectory(directory)
             // Pass cwd and script as separate positional arguments; neither is
             // interpolated into shell source. Script itself is user-authored code.
+            // Setup tools report progress and warnings on stderr; keep both
+            // streams in order so success and failure show the same log tail.
             let data = try command.execute(executable: URL(fileURLWithPath: "/bin/zsh"),
-                arguments: ["-lc", "cd -- \"$1\" && exec /bin/zsh -c \"$2\"", "memex-setup", directory.path, script], timeout: 1800)
+                arguments: ["-lc", "cd -- \"$1\" && exec /bin/zsh -c \"$2\"", "memex-setup", directory.path, script], timeout: 1800,
+                mergeStandardError: true)
             return String(decoding: data.suffix(512 * 1024), as: UTF8.self)
         }
     }

@@ -21,7 +21,11 @@ struct WorkspaceSetupView: View {
                 ScrollView { Text(output).font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading) }.frame(height: 180)
             }
-            if let error { Text(error).font(.caption).foregroundStyle(.orange).textSelection(.enabled) }
+            if let error {
+                // A failure reports the last lines of combined output.
+                ScrollView { Text(error).font(.system(.caption, design: .monospaced)).foregroundStyle(.orange).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading) }.frame(maxHeight: 180)
+            }
             HStack {
                 if operation != nil {
                     ProgressView().controlSize(.small)
