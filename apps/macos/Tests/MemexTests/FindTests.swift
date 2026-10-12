@@ -239,6 +239,36 @@ struct FindTests {
         #expect(state.query.isEmpty && !state.isOpen && state.selectedHit == nil)
     }
 
+    @Test func liveRevisionsKeepSelectionAndRevealGeneration() {
+        let state = ConversationFindState(client: MemexClient())
+        var records = [entry("a", "first needle"), entry("b", "streaming")]
+        state.search(records: records)
+        #expect(state.generation == 0 && state.hits.isEmpty) // Closed Find never searches.
+        state.isOpen = true
+        state.query = "needle"
+        state.search(records: records)
+        #expect(state.generation == 1)
+        #expect(state.selectedHit?.recordID == "a")
+        records[1] = entry("b", "streaming needle")
+        records.append(entry("c", "another needle"))
+        state.search(records: records)
+        #expect(state.hits.map(\.recordID) == ["a", "b", "c"])
+        #expect(state.selectedHit?.recordID == "a")
+        #expect(state.generation == 1)
+        state.move(1)
+        #expect(state.generation == 2)
+        state.search(records: records + [entry("d", "plain")])
+        #expect(state.selectedHit?.recordID == "b")
+        #expect(state.generation == 2)
+        state.query = "another"
+        state.search(records: records)
+        #expect(state.selectedHit?.recordID == "c")
+        #expect(state.generation == 3)
+        state.close()
+        state.search(records: records)
+        #expect(state.generation == 3 && state.selectedHit == nil)
+    }
+
     private func wait(_ condition: () -> Bool) async throws {
         let deadline = ContinuousClock.now.advanced(by: .seconds(20))
         while !condition(), ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }

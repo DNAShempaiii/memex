@@ -106,6 +106,68 @@ import Testing
         try expectActionsAboveSelection(controller.selectionActions, text: text)
     }
 
+    @Test func streamingUpdatesKeepSelectionActionsOpen() throws {
+        let controller = TranscriptController()
+        let window = window(controller)
+        defer { controller.selectionActions.dismiss(); window.close() }
+        var records = [record("Choose this text")]
+        controller.update(sessionID: "live", records: records, provider: "codex", followLatest: true)
+        controller.onAddSelection = { _ in nil }
+        let cell = try #require(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: true))
+        cell.layoutSubtreeIfNeeded()
+        let text = try #require(textViews(in: cell).first { !$0.isHidden })
+        text.setSelectedRange(NSRange(location: 0, length: 6))
+        try showActions(in: text)
+        #expect(controller.selectionActions.popover?.isShown == true)
+        records.append(TranscriptRecord(recordID: "streamed", record: Message(role: "assistant", text: "More output",
+            toolName: nil, toolInput: nil, toolOutput: nil)))
+        controller.update(sessionID: "live", records: records, provider: "codex", followLatest: true)
+        #expect(controller.selectionActions.popover?.isShown == true)
+        #expect(controller.table.view(atColumn: 0, row: 0, makeIfNecessary: false) === cell)
+    }
+
+    @Test func revealKeepsComposerFocusAndRestoresUnmatchedDisclosures() throws {
+        let controller = TranscriptController()
+        let window = window(controller)
+        defer { controller.selectionActions.dismiss(); window.close() }
+        let composer = NSTextField(frame: NSRect(x: 0, y: 0, width: 100, height: 20))
+        controller.view.addSubview(composer)
+        let tool = TranscriptRecord(recordID: "tool", record: Message(role: "tool_use", text: "ls -la",
+            toolName: "exec", toolInput: nil, toolOutput: nil))
+        let records = [record("Find the passage here"), tool]
+        controller.update(sessionID: "one", records: records, provider: "codex")
+        let rowsBefore = controller.rows.map(\.id)
+        #expect(window.makeFirstResponder(composer))
+        let responder = window.firstResponder
+        let found = TranscriptSelection(text: "passage", sourceIDs: [records[0].sourceID, tool.sourceID], sessionID: "one")
+        var result: String?? = .none
+        controller.revealSelection(.init(selection: found, transcriptKey: "one")) { result = .some($0) }
+        #expect(result == .some(nil))
+        #expect(window.firstResponder === responder)
+        #expect(controller.rows.map(\.id) == rowsBefore)
+        #expect(!controller.measurement(at: try #require(controller.rows.firstIndex { $0.id == "activity:tool" })).isExpanded)
+        let missing = TranscriptSelection(text: "not present", sourceIDs: [tool.sourceID], sessionID: "one")
+        controller.revealSelection(.init(selection: missing, transcriptKey: "one")) { result = .some($0) }
+        #expect(result != .some(nil))
+        #expect(controller.rows.map(\.id) == rowsBefore)
+    }
+
+    @Test func onlyPathologicallyLongMessagesCollapse() throws {
+        let controller = TranscriptController()
+        let window = window(controller)
+        defer { window.close() }
+        let normal = record(String(repeating: "A normal paragraph of prose. ", count: 80))
+        let pasted = TranscriptRecord(recordID: "pasted", record: Message(role: "user",
+            text: String(repeating: "pasted log line\n", count: 2_000), toolName: nil, toolInput: nil, toolOutput: nil))
+        controller.update(sessionID: "long", records: [normal, pasted], provider: "codex")
+        #expect(!controller.measurement(at: 0).isLong)
+        let collapsed = controller.measurement(at: 1)
+        #expect(collapsed.isLong && !collapsed.showsFullBody)
+        #expect(collapsed.textHeight == TranscriptController.longMessageCollapse.preview)
+        controller.toggleFullBody(controller.rows[1].id)
+        #expect(controller.measurement(at: 1).textHeight == collapsed.fullTextHeight)
+    }
+
     @Test func emptyAndWhitespaceSelectionsHaveNoAction() {
         let text = TranscriptSelectionTextView()
         text.string = "one   two"
@@ -229,7 +291,7 @@ import Testing
             let cell = try #require(controller.table.view(atColumn: 0, row: 40, makeIfNecessary: true))
             let text = try #require(textViews(in: cell).first)
             #expect(TranscriptSelectionActions.selectedText(in: text) == "selected passage")
-            #expect(window.firstResponder === text)
+            #expect(window.firstResponder !== text) // The composer keeps focus.
             #expect(controller.scrollView.contentView.bounds.minY > 0)
             #expect(text.convert(text.bounds, to: controller.table).maxY <= controller.scrollView.contentView.bounds.maxY - 120)
             #expect(controller.selectedFindRange != nil)

@@ -44,7 +44,7 @@ struct HomeConversationComposer: View {
                 canSend: store.canStartConversation && !inspecting
                     && (draft.value.workspaceMode == .existingDirectory || (repository != nil && draft.value.baseRef != nil)),
                 focusRequestID: draft.focusRequest,
-                composerFont: .system(size: 14),
+                composerFont: Font(AppPreferences.shared.bodyNSFont),
                 onSubmit: { Task { await store.startConversationFromHome() } },
                 onCancel: {},
                 leadingAccessory: { controls },

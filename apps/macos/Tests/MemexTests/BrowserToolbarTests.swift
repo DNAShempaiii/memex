@@ -42,10 +42,16 @@ struct BrowserToolbarTests {
     @Test func newAndWorkspaceActionsUseCurrentLocalSelection() throws {
         let (window, _, controller) = fixture()
         defer { window.close() }
-        let new = try item(BrowserToolbarController.newConversation, in: controller)
-        #expect(NSApplication.shared.sendAction(try #require(new.action), to: new.target, from: new))
-        #expect(controller.store.scope == .home)
-        #expect(controller.store.newConversationDraft.focusRequest == 1)
+        if InAppAgentRuntime.isAvailable {
+            let new = try item(BrowserToolbarController.newConversation, in: controller)
+            #expect(new.toolTip == BrowserToolbarController.newConversationTitle())
+            #expect(NSApplication.shared.sendAction(try #require(new.action), to: new.target, from: new))
+            #expect(controller.store.scope == .home)
+            #expect(controller.store.newConversationDraft.focusRequest == 1)
+        } else {
+            // History-only builds cannot back a new conversation.
+            #expect(!allItems(controller.toolbar).contains { $0.itemIdentifier == BrowserToolbarController.newConversation })
+        }
         controller.store.scope = .all
         let changes = try item(BrowserToolbarController.workspaceChanges, in: controller)
         #expect(!changes.isEnabled)
@@ -63,7 +69,20 @@ struct BrowserToolbarTests {
         #expect(changes.isEnabled) // Remote chats can still use the browser pane.
         controller.store.scope = .home
         controller.update()
-        #expect(controller.toolbar.items.contains { $0.itemIdentifier == BrowserToolbarController.newConversation })
+        #expect(controller.toolbar.items.contains { $0.itemIdentifier == BrowserToolbarController.newConversation }
+                == InAppAgentRuntime.isAvailable)
+    }
+
+    @Test func newConversationTooltipFollowsConfiguredShortcut() throws {
+        let suite = "MemexToolbarTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let preferences = AppPreferences(defaults: defaults)
+        #expect(BrowserToolbarController.newConversationTitle(preferences: preferences) == "New conversation (⌘N)")
+        #expect(preferences.setBinding(.init(key: "k", shift: true), for: .newConversation) == nil)
+        #expect(BrowserToolbarController.newConversationTitle(preferences: preferences) == "New conversation (⇧⌘K)")
+        #expect(preferences.setBinding(nil, for: .newConversation) == nil)
+        #expect(BrowserToolbarController.newConversationTitle(preferences: preferences) == "New conversation")
     }
 
     @Test func resumeUsesNativeToolbarSegmentsAndTracksSelection() throws {
@@ -312,9 +331,9 @@ struct BrowserToolbarTests {
         let (window, _, controller) = fixture()
         defer { window.close() }
         let group = try #require(controller.toolbar.items.last as? NSToolbarItemGroup)
-        #expect(group.subitems.map(\.itemIdentifier) == [BrowserToolbarController.newConversation,
-            BrowserToolbarController.refresh, BrowserToolbarController.find,
-            BrowserToolbarController.workspaceChanges, BrowserToolbarController.more])
+        #expect(group.subitems.map(\.itemIdentifier) == (InAppAgentRuntime.isAvailable ? [BrowserToolbarController.newConversation] : [])
+            + [BrowserToolbarController.refresh, BrowserToolbarController.find,
+               BrowserToolbarController.workspaceChanges, BrowserToolbarController.more])
         let session = Session(source: "codex", sessionID: "group-title", sourcePath: "/fixture",
                               project: "memex", label: "Selected chat title")
         controller.store.sessions = [session]
@@ -326,6 +345,13 @@ struct BrowserToolbarTests {
         #expect(try item(BrowserToolbarController.title, in: controller).label == session.title)
         let more = try #require(group.subitems.last as? NSMenuToolbarItem)
         controller.menuNeedsUpdate(more.menu)
+        guard InAppAgentRuntime.isAvailable else {
+            // History-only builds offer no branching or draft actions.
+            #expect(!more.menu.items.contains { ["Branch with context…", "Fork native history…", "Rewind conversation…",
+                                                 "Add context to parent draft"].contains($0.title) })
+            #expect(more.menu.items.last?.isSeparatorItem == false)
+            return
+        }
         let branch = try #require(more.menu.items.first { $0.title == "Branch with context…" })
         #expect(branch.isEnabled)
         #expect(NSApplication.shared.sendAction(try #require(branch.action), to: branch.target, from: branch))

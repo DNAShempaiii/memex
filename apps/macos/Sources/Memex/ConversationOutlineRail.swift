@@ -7,6 +7,8 @@ struct ConversationOutlineRail: View {
     let outline: ConversationOutline
     var previewWidth: CGFloat = 300
     let reveal: (ConversationPrompt) -> Void
+    /// Called when the reader starts using the rail, to index unread prompts.
+    var activate: () -> Void = {}
     @State private var hoveredID: String?
     @FocusState private var focusedID: String?
 
@@ -48,6 +50,8 @@ struct ConversationOutlineRail: View {
             }
         }
         .frame(width: Self.railWidth)
+        .onHover { if $0 { activate() } }
+        .onChange(of: focusedID) { _, id in if id != nil { activate() } }
         .overlayPreferenceValue(OutlinePreviewAnchor.self) { anchor in
             GeometryReader { geometry in
                 if let anchor, let prompt = outline.prompts.first(where: { $0.id == previewID }) {

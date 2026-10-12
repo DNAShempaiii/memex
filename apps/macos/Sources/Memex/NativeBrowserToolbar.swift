@@ -125,7 +125,9 @@ import SwiftUI
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         if store.scope == .home {
-            return [.toggleSidebar, Self.sidebarBoundary, Self.newConversation, .flexibleSpace]
+            // History-only builds cannot create conversations.
+            return [.toggleSidebar, Self.sidebarBoundary] + (InAppAgentRuntime.isAvailable ? [Self.newConversation] : [])
+                + [.flexibleSpace]
         }
         let sidebarItems: [NSToolbarItem.Identifier] = sidebarVisible
             ? [.toggleSidebar, .flexibleSpace, Self.filters] : [.toggleSidebar]
@@ -143,7 +145,8 @@ import SwiftUI
             group.isBordered = true
             group.autovalidates = false
             group.controlRepresentation = .expanded
-            group.subitems = [Self.newConversation, Self.refresh, Self.find, Self.workspaceChanges, Self.more].compactMap {
+            let creation = InAppAgentRuntime.isAvailable ? [Self.newConversation] : []
+            group.subitems = (creation + [Self.refresh, Self.find, Self.workspaceChanges, Self.more]).compactMap {
                 self.toolbar(toolbar, itemForItemIdentifier: $0, willBeInsertedIntoToolbar: flag)
             }
             return group
@@ -202,7 +205,8 @@ import SwiftUI
             utilityMenu = menu
             actionItems[id] = item
             return item
-        case Self.newConversation: return action(id, title: "New conversation (⌘N)", symbol: "square.and.pencil", selector: #selector(newConversation))
+        case Self.newConversation:
+            return action(id, title: Self.newConversationTitle(), symbol: "square.and.pencil", selector: #selector(newConversation))
         case Self.workspaceChanges: return action(id, title: "Workspace panel", symbol: "sidebar.right", selector: #selector(toggleWorkspaceChanges))
         case .toggleSidebar:
             let item = action(id, title: "Toggle sidebar", symbol: "sidebar.left", selector: #selector(toggleSidebar))
@@ -247,9 +251,14 @@ import SwiftUI
                 ? store.selected?.machineID == "local" : store.selected != nil
         }
         actionItems[Self.newConversation]?.isEnabled = InAppAgentRuntime.isAvailable
+        actionItems[Self.newConversation]?.toolTip = Self.newConversationTitle()
         actionItems[Self.workspaceChanges]?.isEnabled = store.selected != nil
         actionItems[Self.workspaceChanges]?.toolTip = store.showingWorkspaceChanges ? "Hide workspace panel" : "Show workspace panel"
         if let field = searchItem?.searchField, field.stringValue != store.query { field.stringValue = store.query }
+    }
+    /// Mirrors the user's configured shortcut, or omits it when disabled.
+    static func newConversationTitle(preferences: AppPreferences = .shared) -> String {
+        preferences.binding(for: .newConversation).map { "New conversation (\($0.label))" } ?? "New conversation"
     }
     static func titleHelp(store: Store) -> String {
         guard let session = store.selected else { return "Chats" }
@@ -286,6 +295,11 @@ import SwiftUI
             item.submenu = branches
             item.isEnabled = enabled
             menu.addItem(item)
+        }
+        // Branching, history mutation and draft context need the in-app agent runtime.
+        guard InAppAgentRuntime.isAvailable else {
+            if menu.items.last?.isSeparatorItem == true { menu.removeItem(at: menu.items.count - 1) }
+            return
         }
         add("Branch with context…", #selector(branchWithContext), enabled: enabled, to: menu)
         let canMutate = enabled && store.selectedLiveConversation?.canMutateHistory == true && !store.selectedHistoryBoundaries.isEmpty
@@ -372,8 +386,7 @@ private struct ConversationToolbarTitle: View {
         .frame(minWidth: 70, idealWidth: 260, maxWidth: 400, alignment: .leading)
         .background {
             if let session = store.selected {
-                ConversationHistoryActions(store: store, session: session,
-                                           presentation: historyPresentation, showsStatus: false)
+                ConversationHistoryActions(store: store, session: session, presentation: historyPresentation)
                     .id(session.id)
             }
         }
