@@ -158,3 +158,13 @@ MEMORY.md:1-2|note=[prior context]
     let code = "`multiline\n:codex-annotation{index=\"1\"}\nexample`"
     #expect(TranscriptPresentation.project([presentationRecord("a", "assistant", code)])[0].record.text == code)
 }
+
+@Test func unreadableReasoningIsNotDisplayedButSummariesAre() {
+    let projected = TranscriptPresentation.project([
+        presentationRecord("encrypted", "reasoning", ""),
+        presentationRecord("blank", "reasoning", "  \n"),
+        presentationRecord("summary", "reasoning", "Checked the toolbar layout"),
+        presentationRecord("answer", "assistant", "Done"),
+    ])
+    #expect(projected.map(\.id) == ["summary", "answer"])
+}

@@ -12,6 +12,13 @@ enum TranscriptPresentation {
             if displayMessage.role == "assistant" {
                 displayMessage.text = assistantDisplayText(displayMessage.text)
             }
+            // Encrypted or signature-only reasoning has nothing readable to show.
+            // It remains in the raw transcript instead of an empty disclosure.
+            if displayMessage.role == "reasoning",
+               displayMessage.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               SourceContent.blocks(displayMessage).isEmpty {
+                return []
+            }
             let entry = TranscriptRecord(recordID: sourceEntry.id, record: displayMessage,
                                          sourceRecordID: sourceEntry.sourceRecordID,
                                          rawJSON: sourceEntry.rawJSON ?? (displayMessage.text != sourceEntry.record.text ? sourceEntry.rawTranscriptBody : nil))
