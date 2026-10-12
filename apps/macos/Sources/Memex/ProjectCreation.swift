@@ -49,7 +49,8 @@ struct ProjectCreationClient: Sendable {
             var reserved = false
             for attempt in 1...(retryInNewFolder ? 1000 : 1) {
                 destination = parent.appendingPathComponent(attempt == 1 ? cleanName : "\(cleanName)-\(attempt)", isDirectory: true)
-                if destination.path.withCString({ mkdir($0, 0o700) }) == 0 { reserved = true; break }
+                // A project folder gets the default mode filtered by umask, like Finder.
+                if destination.path.withCString({ mkdir($0, 0o777) }) == 0 { reserved = true; break }
                 if errno != EEXIST { throw WorkspaceGitError(message: "Could not create the project folder: \(String(cString: strerror(errno)))") }
             }
             guard reserved else { throw WorkspaceGitError(message: "The destination already exists. Choose another name or retry in a new folder.") }

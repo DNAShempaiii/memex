@@ -63,3 +63,24 @@ import Testing
     #expect(WorkspaceDelimitedRows.parse(csv, delimiter: ",") == [["name", "value"], ["two, words", "a\"b"], ["multiple\nlines", "end"]])
     #expect(WorkspaceDelimitedRows.parse(csv, delimiter: ",", limit: 1) == [["name", "value"]])
 }
+
+@Test func fileEditorRejectsGitDirectoryInAnyCaseAndCreatesDefaultModes() async throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data("[core]\n".utf8).write(to: root.appendingPathComponent(".git/config"))
+    let client = WorkspaceFilesClient()
+    await #expect(throws: (any Error).self) { try await client.read(root: root, path: ".GIT/config") }
+    await #expect(throws: (any Error).self) { try await client.read(root: root, path: ".Git/config") }
+    await #expect(throws: (any Error).self) { try await client.create(root: root, folder: "", name: ".GiT", isDirectory: true) }
+    #expect(try await client.entries(root: root).isEmpty)
+    let mask = umask(0)
+    umask(mask)
+    _ = try await client.create(root: root, folder: "", name: "folder", isDirectory: true)
+    _ = try await client.create(root: root, folder: "folder", name: "file.txt", isDirectory: false)
+    func mode(_ path: String) throws -> Int {
+        try (FileManager.default.attributesOfItem(atPath: root.appendingPathComponent(path).path)[.posixPermissions] as? NSNumber)?.intValue ?? -1
+    }
+    #expect(try mode("folder") == 0o777 & ~Int(mask))
+    #expect(try mode("folder/file.txt") == 0o666 & ~Int(mask))
+}

@@ -38,7 +38,7 @@ actor WorkspaceFilesClient {
         let directory = try resolve(root: root, path: path, allowDirectory: true)
         return try FileManager.default.contentsOfDirectory(at: directory,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey])
-            .filter { $0.lastPathComponent != ".git" }
+            .filter { $0.lastPathComponent.lowercased() != ".git" }
             .map { url in
                 let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
                 return WorkspaceFileEntry(path: path.isEmpty ? url.lastPathComponent : path + "/" + url.lastPathComponent,
@@ -85,7 +85,7 @@ actor WorkspaceFilesClient {
     /// file. The hard link is atomic and exclusive across actors and processes;
     /// readers never observe a placeholder or partially written document.
     func openOrCreate(root: URL, name: String, contents: String) throws -> WorkspaceFileRevision {
-        guard !name.isEmpty, name != ".", name != "..", name != ".git", !name.contains("/"), !name.contains("\0") else {
+        guard !name.isEmpty, name != ".", name != "..", name.lowercased() != ".git", !name.contains("/"), !name.contains("\0") else {
             throw WorkspaceFileError.outsideWorkspace
         }
         let parent = try resolve(root: root, path: "", allowDirectory: true)
@@ -123,18 +123,20 @@ actor WorkspaceFilesClient {
     }
 
     func create(root: URL, folder: String, name: String, isDirectory: Bool) throws -> String {
-        guard !name.isEmpty, name != ".", name != "..", name != ".git", !name.contains("/"), !name.contains("\0") else {
+        guard !name.isEmpty, name != ".", name != "..", name.lowercased() != ".git", !name.contains("/"), !name.contains("\0") else {
             throw WorkspaceFileError.outsideWorkspace
         }
         let parent = try resolve(root: root, path: folder, allowDirectory: true)
         guard try parent.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { throw WorkspaceFileError.outsideWorkspace }
         let url = parent.appendingPathComponent(name)
+        // Like Finder and editors: default modes filtered by the user's umask,
+        // so new files are readable by tools and commit with normal modes.
         if isDirectory {
-            guard url.path.withCString({ mkdir($0, 0o700) }) == 0 else {
+            guard url.path.withCString({ mkdir($0, 0o777) }) == 0 else {
                 throw WorkspaceGitError(message: "Could not create folder: \(String(cString: strerror(errno)))")
             }
         } else {
-            let descriptor = url.path.withCString { Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600) }
+            let descriptor = url.path.withCString { Darwin.open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o666) }
             guard descriptor >= 0 else { throw WorkspaceGitError(message: "Could not create file: \(String(cString: strerror(errno)))") }
             Darwin.close(descriptor)
         }
@@ -158,7 +160,8 @@ actor WorkspaceFilesClient {
         let root = try LocalProjects.validatedDirectory(root)
         guard !path.hasPrefix("/"), !path.contains("\0") else { throw WorkspaceFileError.outsideWorkspace }
         let parts = path.split(separator: "/", omittingEmptySubsequences: false)
-        guard !parts.contains(".."), !parts.contains(".git") else { throw WorkspaceFileError.outsideWorkspace }
+        // Default macOS volumes are case-insensitive: `.GIT` names the Git directory.
+        guard !parts.contains(".."), !parts.contains(where: { $0.lowercased() == ".git" }) else { throw WorkspaceFileError.outsideWorkspace }
         var url = root
         for part in parts where !part.isEmpty {
             url.appendPathComponent(String(part))
