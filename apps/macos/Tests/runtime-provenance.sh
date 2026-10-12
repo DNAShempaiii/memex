@@ -136,6 +136,18 @@ expect_failure 'provenance mismatch' bash "$prepare" --verify --candidate-revisi
 bash "$prepare"
 bash "$prepare" --verify
 
+# Distributed builds require the pin to survive on the runtime's fetched main.
+expect_failure 'no fetched origin/main' bash "$prepare" --verify --require-published
+git init -q --bare "$scratch/origin.git"
+git -C "$scratch/source" remote add origin "$scratch/origin.git"
+git -C "$scratch/source" push -q origin "$revision:refs/heads/main"
+git -C "$scratch/source" fetch -q origin
+expect_failure 'not reachable from the runtime' bash "$prepare" --verify --require-published
+git -C "$scratch/source" push -q origin "$candidate:refs/heads/main"
+git -C "$scratch/source" fetch -q origin
+bash "$prepare" --verify --require-published
+expect_failure 'applies only to the locked' bash "$prepare" --verify --development --require-published
+
 # The wrapper must resolve the selected installed Cargo, even when a different
 # Cargo/rustc is ahead of rustup proxies in the caller's PATH. +stable is not
 # accepted by actual Cargo binaries, only by rustup proxies.

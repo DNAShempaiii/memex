@@ -9,18 +9,21 @@ OUTPUT=${MEMEX_RUNTIME_OUTPUT:-}
 MODE=locked
 CANDIDATE_REVISION=""
 VERIFY_ONLY=0
+REQUIRE_PUBLISHED=0
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'USAGE'
 Usage: prepare-runtime.sh [--source PATH] [--output PATH] [--verify]
-                          [--development | --candidate-revision FULL_SHA]
+                          [--development | --candidate-revision FULL_SHA] [--require-published]
 
 ARCHES="arm64 x86_64" selects output architectures (default: this Mac).
 The normal build requires the clean revision in runtime-source.json.
 --development explicitly records local uncommitted work; it is not release input.
 --candidate-revision tests a clean immutable candidate in private CI; it is not release input.
 --verify checks provenance, source identity, architectures and artifact hashes without compiling.
+--require-published also requires the locked revision to be an ancestor of the runtime
+  checkout's fetched origin/main. Distributed builds use it; it never fetches.
 USAGE
 }
 while [[ $# -gt 0 ]]; do
@@ -28,6 +31,7 @@ while [[ $# -gt 0 ]]; do
     --source) [[ $# -ge 2 ]] || fail "--source requires a directory"; RUNTIME_ROOT=$2; shift 2 ;;
     --output) [[ $# -ge 2 ]] || fail "--output requires a directory"; OUTPUT=$2; shift 2 ;;
     --verify) VERIFY_ONLY=1; shift ;;
+    --require-published) REQUIRE_PUBLISHED=1; shift ;;
     --development) [[ "$MODE" == locked ]] || fail "Choose one runtime mode"; MODE=development; shift ;;
     --candidate-revision)
       [[ $# -ge 2 && "$MODE" == locked ]] || fail "--candidate-revision requires a SHA and cannot be combined with --development"
@@ -59,6 +63,15 @@ case "$MODE" in
     [[ "$SOURCE_DIRTY" == false ]] || fail "Candidate CI builds require a clean source checkout"
     ;;
 esac
+if [[ "$REQUIRE_PUBLISHED" == 1 ]]; then
+  # A pinned pull-request head is orphaned if that pull request is squash-merged.
+  # Only revisions retained by the runtime's main branch may be distributed.
+  [[ "$MODE" == locked ]] || fail "--require-published applies only to the locked runtime revision"
+  git -C "$RUNTIME_ROOT" rev-parse --verify --quiet refs/remotes/origin/main >/dev/null ||
+    fail "Runtime checkout has no fetched origin/main. Run git fetch origin in the runtime checkout, then retry."
+  git -C "$RUNTIME_ROOT" merge-base --is-ancestor "$LOCK_REVISION" refs/remotes/origin/main ||
+    fail "Pinned runtime revision $LOCK_REVISION is not reachable from the runtime's origin/main. Fetch origin; if the pin is an unmerged or squash-merged pull request head, update runtime-source.json to the merged main commit before releasing."
+fi
 # Consumed packages currently have no submodule dependency. Do not pretend a
 # dirty nested worktree can be represented by its parent gitlink alone.
 git -C "$RUNTIME_ROOT" submodule foreach --quiet --recursive \

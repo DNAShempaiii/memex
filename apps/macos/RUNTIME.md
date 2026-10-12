@@ -2,7 +2,9 @@
 
 History browsing, search, workspace tools and external resume remain buildable
 without private source. `MEMEX_HISTORY_ONLY=1` explicitly selects that graph even
-when a local runtime path has previously been configured.
+when a local runtime path has previously been configured. Public releases
+(the GitHub release asset and the `memex-app` Homebrew cask) are always
+history-only and never contain the runtime.
 
 The runtime-enabled app consumes `SQACP`, `SQACPHost`, `SQACPUI`, `SQMcpApps`,
 `SQMcpAppsUI`, a Rust static
@@ -28,6 +30,13 @@ swift build --package-path apps/macos --product Memex --force-resolved-versions
 swift build --package-path apps/macos --product MemexExecutionHost --force-resolved-versions
 swift test --package-path apps/macos --force-resolved-versions --no-parallel
 ```
+
+When a runtime checkout is configured (`MEMEX_AGENT_RUNTIME_ROOT` or the ignored
+`apps/macos/.local-runtime-root`), the package manifest requires
+`MEMEX_AGENT_RUNTIME_LIBRARY` to name the prepared archive and stops otherwise.
+It never falls back to an unverified archive inside the runtime checkout.
+`build.sh` sets the variable from verified provenance. Set `MEMEX_HISTORY_ONLY=1`
+to build without the runtime.
 
 Preparation always invokes the selected checkout's Rust build with `--locked`
 and the helper's Bun install with `--frozen-lockfile`, then compiles the helper.
@@ -69,7 +78,16 @@ archive/helper hash fails packaging with an instruction to prepare again. Old
 `MEMEX_AGENT_RUNTIME_LIBRARY` or `MEMEX_CLAUDE_HELPER` overrides must be removed or
 match the verified generated outputs exactly.
 
-The app bundles and signs both `MemexExecutionHost` and the Claude helper. Its
+A runtime-enabled app bundles and signs both `MemexExecutionHost` and the Claude
+helper. The execution host is signed without entitlements. The Bun-compiled
+Claude helper is signed with `bundle/ClaudeHelper.entitlements`, Bun's documented
+JIT entitlements for compiled executables; neither helper receives the app's
+Apple Events or microphone entitlements. History-only bundles omit both helpers
+and the provenance file, because the app never launches the execution host and
+it could only report `runtime_unavailable`. `build.sh` prints the runtime mode
+and checks the bundle contents against it.
+
+A runtime-enabled bundle's
 signed Resources directory contains a sanitized provenance file: immutable
 source revision, source fingerprint, dirty/development state, dependency lock
 hashes, compiler versions, architecture slices, compiled-input hashes and signed
@@ -102,6 +120,30 @@ requires preparation again even if the old artifact still exists.
 Development and candidate builds are ad-hoc local/CI artifacts. Developer ID
 packaging rejects both modes and requires the clean locked source. No preparation
 or verification command signs, notarizes, uploads or creates a release.
+
+## Release builds
+
+`apps/macos/scripts/build-release.sh` requires an explicit runtime mode and
+fails when `MEMEX_RELEASE_RUNTIME` is unset:
+
+- `MEMEX_RELEASE_RUNTIME=history-only` builds without the runtime, even when
+  `MEMEX_AGENT_RUNTIME_ROOT` or `.local-runtime-root` is configured. Public
+  releases use this mode; `scripts/release_macos_local.sh` always selects it and
+  rejects any other value.
+- `MEMEX_RELEASE_RUNTIME=locked` requires a configured runtime checkout at the
+  clean pinned revision and rejects history-only, development and candidate
+  settings. It is not published to the public cask.
+
+After building, the script checks that `runtime-provenance.json`,
+`claude-agent-sdk-host` and `MemexExecutionHost` are present exactly when the
+mode includes the runtime, and prints the mode.
+
+Developer ID signing and locked release builds also pass `--require-published`
+to `prepare-runtime.sh`. The pinned revision must be an ancestor of the runtime
+checkout's fetched `origin/main`. A pinned pull-request head that has not merged,
+or was squash-merged and orphaned, fails packaging. The check never fetches; run
+`git fetch origin` in the runtime checkout first. Public CI has no runtime
+source and does not run it.
 
 ## Runtime integration CI
 

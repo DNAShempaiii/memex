@@ -19,7 +19,8 @@ brew install --cask nicosuave/tap/memex-app
 ```
 
 The app includes the Memex CLI and uses your existing Memex configuration and
-index. If you have not set up an index yet, install the terminal CLI and index
+index. The published app is history-only: it does not include the optional agent
+runtime. If you have not set up an index yet, install the terminal CLI and index
 your sources:
 
 ```sh

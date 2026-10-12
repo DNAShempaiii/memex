@@ -37,8 +37,13 @@ if [[ "${MEMEX_HISTORY_ONLY:-0}" == 1 ]]; then
 elif [[ -z "$RUNTIME_ROOT" && -f "$ROOT/.local-runtime-root" ]]; then
   RUNTIME_ROOT=$(cat "$ROOT/.local-runtime-root")
 fi
+if [[ "${MEMEX_REQUIRE_RUNTIME:-0}" == 1 && -z "$RUNTIME_ROOT" ]]; then
+  echo "A runtime build was requested, but no runtime checkout is configured. Set MEMEX_AGENT_RUNTIME_ROOT." >&2
+  exit 1
+fi
 CLAUDE_HELPER=""
 RUNTIME_PROVENANCE=""
+RUNTIME_MODE=history-only
 RUNTIME_VERIFY_ARGS=()
 if [[ -n "$RUNTIME_ROOT" ]]; then
   RUNTIME_ROOT=$(cd "$RUNTIME_ROOT" && pwd -P)
@@ -58,8 +63,14 @@ if [[ -n "$RUNTIME_ROOT" ]]; then
   if [[ -n "${MEMEX_RUNTIME_CANDIDATE_REVISION:-}" ]]; then
     RUNTIME_VERIFY_ARGS+=(--candidate-revision "$MEMEX_RUNTIME_CANDIDATE_REVISION")
   fi
+  # Distributed runtime builds must pin a revision that survives on the runtime's
+  # main branch; an unmerged pull request head can be orphaned by a squash merge.
+  if [[ "$SIGNING_MODE" == developer-id || "${MEMEX_RUNTIME_REQUIRE_PUBLISHED:-0}" == 1 ]]; then
+    RUNTIME_VERIFY_ARGS+=(--require-published)
+  fi
   ARCHES="${ARCH_LIST[*]}" bash "$ROOT/scripts/prepare-runtime.sh" "${RUNTIME_VERIFY_ARGS[@]}"
   RUNTIME_PROVENANCE="$RUNTIME_OUTPUT/runtime-provenance.json"
+  RUNTIME_MODE=$(jq -er '.mode' "$RUNTIME_PROVENANCE")
   RUNTIME_LIBRARY=$(jq -er '.artifacts.library.path' "$RUNTIME_PROVENANCE")
   CLAUDE_HELPER=$(jq -er '.artifacts.claudeHelper.path' "$RUNTIME_PROVENANCE")
   if [[ -n "${MEMEX_AGENT_RUNTIME_LIBRARY:-}" && "$MEMEX_AGENT_RUNTIME_LIBRARY" != "$RUNTIME_LIBRARY" ]] ||
@@ -81,7 +92,11 @@ if ! "$CLI" projects --help >/dev/null 2>&1 || ! "$CLI" machines --help >/dev/nu
   exit 1
 fi
 swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --product Memex --force-resolved-versions
-swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --product MemexExecutionHost --force-resolved-versions
+# Without the runtime, MemexExecutionHost can only report runtime_unavailable and
+# the app never launches it, so history-only bundles omit it.
+if [[ "$RUNTIME_MODE" != history-only ]]; then
+  swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --product MemexExecutionHost --force-resolved-versions
+fi
 BIN_DIR=$(swift build --package-path "$ROOT" -c "$CONFIGURATION" "${SWIFT_ARGS[@]}" --show-bin-path)
 if [[ -n "$RUNTIME_PROVENANCE" ]]; then
   # Swift source is part of the pinned runtime too. Do not package a build
@@ -95,9 +110,9 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Helpers" \
   "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN_DIR/Memex" "$APP/Contents/MacOS/Memex"
 cp "$CLI" "$APP/Contents/Helpers/memex"
-cp "$BIN_DIR/MemexExecutionHost" "$APP/Contents/Helpers/MemexExecutionHost"
-chmod u+w "$APP/Contents/Helpers/MemexExecutionHost"
 if [[ -n "$CLAUDE_HELPER" ]]; then
+  cp "$BIN_DIR/MemexExecutionHost" "$APP/Contents/Helpers/MemexExecutionHost"
+  chmod u+w "$APP/Contents/Helpers/MemexExecutionHost"
   cp "$CLAUDE_HELPER" "$APP/Contents/Helpers/claude-agent-sdk-host"
   chmod u+w "$APP/Contents/Helpers/claude-agent-sdk-host"
   lipo "$CLAUDE_HELPER" -verify_arch "${ARCH_LIST[@]}"
@@ -129,9 +144,12 @@ verify_dependencies() {
 }
 verify_dependencies "$CLI"
 verify_dependencies "$BIN_DIR/Memex"
-verify_dependencies "$BIN_DIR/MemexExecutionHost"
-if [[ -n "$CLAUDE_HELPER" ]]; then verify_dependencies "$CLAUDE_HELPER"; fi
-for binary in "$APP/Contents/MacOS/Memex" "$APP/Contents/Helpers/memex" "$APP/Contents/Helpers/MemexExecutionHost"; do
+if [[ -n "$CLAUDE_HELPER" ]]; then
+  verify_dependencies "$BIN_DIR/MemexExecutionHost"
+  verify_dependencies "$CLAUDE_HELPER"
+  lipo "$APP/Contents/Helpers/MemexExecutionHost" -verify_arch "${ARCH_LIST[@]}"
+fi
+for binary in "$APP/Contents/MacOS/Memex" "$APP/Contents/Helpers/memex"; do
   lipo "$binary" -verify_arch "${ARCH_LIST[@]}"
 done
 
@@ -157,9 +175,12 @@ PLIST
 plutil -lint "$APP/Contents/Info.plist"
 xattr -cr "$APP"
 codesign "${SIGN_ARGS[@]}" "$APP/Contents/Helpers/memex"
-codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/bundle/Release.entitlements" "$APP/Contents/Helpers/MemexExecutionHost"
 if [[ -n "$CLAUDE_HELPER" ]]; then
-  codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/bundle/Release.entitlements" "$APP/Contents/Helpers/claude-agent-sdk-host"
+  # Helpers do not inherit the app's Apple Events or microphone entitlements.
+  # The execution host needs none; the Bun-compiled helper needs only Bun's
+  # documented JIT entitlements.
+  codesign "${SIGN_ARGS[@]}" "$APP/Contents/Helpers/MemexExecutionHost"
+  codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/bundle/ClaudeHelper.entitlements" "$APP/Contents/Helpers/claude-agent-sdk-host"
   # Signing changes Mach-O bytes. Preserve both the qualified build hashes and
   # the hashes of the signed helpers users will actually run.
   provenance="$APP/Contents/Resources/runtime-provenance.json"
@@ -172,4 +193,5 @@ fi
 codesign "${SIGN_ARGS[@]}" --entitlements "$ROOT/bundle/Release.entitlements" "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 "$APP/Contents/Helpers/memex" --version
-echo "Built $APP"
+bash "$ROOT/scripts/verify-runtime-mode.sh" "$APP" "$RUNTIME_MODE"
+echo "Built $APP (runtime mode: $RUNTIME_MODE)"

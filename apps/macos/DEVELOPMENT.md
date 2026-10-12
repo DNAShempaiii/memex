@@ -85,6 +85,8 @@ An optional local Sidequery checkout supplies `SQACP`, `SQACPHost`, `SQACPUI`, t
 `MEMEX_AGENT_RUNTIME_ROOT` to that checkout, or put its absolute path in the
 ignored `apps/macos/.local-runtime-root` file. Ordinary builds without this
 configuration retain external resume only; no runtime source or binary is fetched.
+With a runtime checkout configured, direct `swift build` also needs
+`MEMEX_AGENT_RUNTIME_LIBRARY` (set by `build.sh`), or `MEMEX_HISTORY_ONLY=1`.
 
 Use [the runtime preparation and provenance workflow](RUNTIME.md) to build the
 locked source archive and Claude helper before packaging. `build.sh` rejects stale
@@ -100,7 +102,8 @@ launch a provider. The toolbar's **Open in** menu opens external applications.
 Continuing a chat requires the original native transcript and working directory. Each provider
 child receives the source installation's `CODEX_HOME` or `CLAUDE_CONFIG_DIR`.
 The provider's normal sign-in remains required. Optional executable overrides
-are `MEMEX_CODEX_EXECUTABLE`, `MEMEX_CLAUDE_EXECUTABLE`, and `MEMEX_CLAUDE_HELPER`.
+are `MEMEX_CODEX_EXECUTABLE`, `MEMEX_CLAUDE_EXECUTABLE`, and, in debug builds
+only, `MEMEX_CLAUDE_HELPER`. Release builds always use the bundled signed helper.
 
 The provider writes its original transcript; existing Memex indexing continues
 to pick it up. Private runtime sidecars live under
@@ -120,6 +123,12 @@ Never point this test at a working conversation.
 The app is distributed separately from the CLI archives. GitHub Actions continues
 to publish the CLI; app builds, Developer ID signing, and notarization run on a
 maintainer's Mac. Apple credentials stay in the local Keychain.
+
+Published app releases are history-only. `scripts/release_macos_local.sh` always
+builds with `MEMEX_RELEASE_RUNTIME=history-only`, ignores any configured local
+runtime checkout, refuses any other mode, and verifies that neither the built nor
+the extracted app contains the runtime helpers or provenance. See
+[RUNTIME.md](RUNTIME.md#release-builds) for the runtime modes.
 
 User installation instructions are in the [app README](README.md#install).
 
@@ -174,10 +183,10 @@ apps/macos/scripts/publish-cask.sh VERSION
 To validate Apple Silicon packaging without Apple credentials or publishing anything:
 
 ```sh
-apps/macos/scripts/build-release.sh
+MEMEX_RELEASE_RUNTIME=history-only apps/macos/scripts/build-release.sh
 ```
 
-This defaults to ad hoc signing. Both normal and release app builds derive their
+`MEMEX_RELEASE_RUNTIME` is required. This defaults to ad hoc signing. Both normal and release app builds derive their
 marketing version from `Cargo.toml` and build number from the commit count.
 `SIGNING_MODE=developer-id` enables distribution signing; it requires
 `CODESIGN_IDENTITY` and does not fall back to ad hoc signing on failure.
