@@ -78,12 +78,18 @@ impl Fixture {
 printf 'brew %s\n' "$*" >> "$MEMEX_TEST_LOG"
 if [ "$MEMEX_TEST_FAIL" = "$1" ]; then exit 17; fi
 if [ "$1" = "--prefix" ]; then printf '%s\n' "$MEMEX_TEST_PREFIX"; fi
+if [ "$1" = "info" ]; then printf '%s\n' "$MEMEX_TEST_BREW_INFO"; fi
 "#,
         );
         write_script(
             &bin.join("curl"),
             r#"#!/bin/sh
 printf 'curl %s\n' "$*" >> "$MEMEX_TEST_LOG"
+for url; do :; done
+if [ "$url" = "https://formulae.brew.sh/api/formula/memex.json" ] && [ -n "$MEMEX_TEST_FORMULA_JSON" ]; then
+  printf '%s\n' "$MEMEX_TEST_FORMULA_JSON"
+  exit 0
+fi
 exit 97
 "#,
         );
@@ -129,7 +135,10 @@ printf 'updated by installed binary\n' > "$HOME/.agents/skills/memex-search/SKIL
             .env("TERM", "xterm-256color")
             .env("MEMEX_TEST_LOG", &self.log)
             .env("MEMEX_TEST_PREFIX", &self.prefix)
-            .env("MEMEX_TEST_FAIL", "");
+            .env("MEMEX_TEST_FAIL", "")
+            .env_remove("HOMEBREW_API_DOMAIN")
+            .env_remove("MEMEX_TEST_BREW_INFO")
+            .env_remove("MEMEX_TEST_FORMULA_JSON");
         for name in AGENT_ENV {
             command.env_remove(name);
         }
@@ -228,7 +237,9 @@ esac
             .as_secs();
         std::fs::write(
             self.home.join(".memex/update-check.json"),
-            format!(r#"{{"checked_at":{now},"latest":"99.0.0"}}"#),
+            format!(
+                r#"{{"checked_at":{now},"latest":"99.0.0","source":"homebrew:nicosuave/tap/memex"}}"#
+            ),
         )
         .unwrap();
     }
@@ -749,4 +760,123 @@ fn no_update_check_keeps_stale_skill_warning_off_search_stdout() {
     let stderr = String::from_utf8_lossy(&toon.stderr);
     assert!(stderr.contains("memex-search skill is outdated or locally modified (shared)"));
     assert!(!stderr.contains("update: memex v99.0.0 is available"));
+}
+
+fn brew_info(version: &str) -> String {
+    serde_json::json!({"formulae": [{"versions": {"stable": version}}]}).to_string()
+}
+
+#[test]
+fn homebrew_tap_notice_reads_brew_info_and_points_to_brew_upgrade() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command();
+    command
+        .env("MEMEX_TEST_BREW_INFO", brew_info("99.0.0"))
+        .arg("--non-interactive");
+    let output = run(&mut command);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("update: memex v99.0.0 is available from Homebrew"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Run `brew upgrade nicosuave/tap/memex`"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("memex update"), "{stderr}");
+    // Only a read-only query; no GitHub request, brew update, or brew upgrade.
+    assert_eq!(
+        fixture.log(),
+        "brew info --json=v2 --formula nicosuave/tap/memex\n"
+    );
+
+    let cached = run(&mut command);
+    assert!(String::from_utf8_lossy(&cached.stderr).contains("brew upgrade nicosuave/tap/memex"));
+    assert_eq!(
+        fixture.log(),
+        "brew info --json=v2 --formula nicosuave/tap/memex\n"
+    );
+}
+
+#[test]
+fn homebrew_core_notice_reads_the_formulae_api() {
+    for (stable, expect_notice) in [("99.0.0", true), (env!("CARGO_PKG_VERSION"), false)] {
+        let fixture = Fixture::new();
+        std::fs::write(
+            fixture.receipt_path(),
+            r#"{"source":{"tap":"homebrew/core"}}"#,
+        )
+        .unwrap();
+        let output = run(fixture
+            .command()
+            .env(
+                "MEMEX_TEST_FORMULA_JSON",
+                serde_json::json!({"versions": {"stable": stable}}).to_string(),
+            )
+            .arg("--non-interactive"));
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.contains("Run `brew upgrade memex`"),
+            expect_notice,
+            "{stable}: {stderr}"
+        );
+        assert_eq!(stderr.contains("update: memex"), expect_notice, "{stderr}");
+        assert_eq!(
+            fixture.log(),
+            "curl -fsSL --connect-timeout 1 --max-time 2 https://formulae.brew.sh/api/formula/memex.json\n"
+        );
+    }
+}
+
+#[test]
+fn homebrew_ignores_a_github_release_cache() {
+    let fixture = Fixture::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Caches written before Homebrew-sourced checks carry no source and came from GitHub.
+    std::fs::write(
+        fixture.home.join(".memex/update-check.json"),
+        format!(r#"{{"checked_at":{now},"latest":"99.0.0"}}"#),
+    )
+    .unwrap();
+    let output = run(fixture
+        .command()
+        .env("MEMEX_TEST_BREW_INFO", brew_info(env!("CARGO_PKG_VERSION")))
+        .arg("--non-interactive"));
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("update: memex"), "{stderr}");
+    assert_eq!(
+        fixture.log(),
+        "brew info --json=v2 --formula nicosuave/tap/memex\n"
+    );
+}
+
+#[test]
+fn homebrew_without_a_known_formula_skips_the_check_instead_of_using_github() {
+    let fixture = Fixture::new();
+    std::fs::remove_file(fixture.receipt_path()).unwrap();
+    let output = run(fixture.command().arg("--non-interactive"));
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("update: memex"));
+    assert!(fixture.log().is_empty(), "{}", fixture.log());
+}
+
+#[test]
+fn standalone_notice_reads_github_releases_and_points_to_memex_update() {
+    let fixture = Fixture::standalone();
+    let output = run(fixture.command().arg("--non-interactive"));
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("update: memex v99.0.0 is available (current"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("Run `memex update`"), "{stderr}");
+    assert!(!stderr.contains("brew upgrade"), "{stderr}");
+    assert_eq!(fixture.log(), "release latest\n");
 }

@@ -5,8 +5,8 @@ use crate::ingest::{IngestOptions, ingest_if_stale};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease, LeaseAttempt};
 use crate::machine::{
     LOCAL_MACHINE_ID, SearchMode, SearchSpec, SessionActivitySpec, UsageSpec, federated_recent,
-    federated_search, federated_session_activity, federated_usage_activity, machine_by_id,
-    remote_shell_command, session_context, session_records,
+    federated_session_activity, federated_usage_activity, machine_by_id, remote_shell_command,
+    session_context, session_records,
 };
 use crate::resume::{find_in_path, resume_template, shell_quote};
 use crate::types::{Record, SourceFilter, SourceKind};
@@ -5804,49 +5804,56 @@ fn run_search_request(
     index: &SearchIndex,
     request: SearchRequest,
 ) -> SearchRequestResult {
+    if !request.query.is_empty() {
+        let result = crate::search::collect(
+            paths,
+            config,
+            &request.machines,
+            std::slice::from_ref(&request.query),
+            &SearchSpec {
+                query: request.query.clone(),
+                project: (!request.project.is_empty()).then(|| request.project.clone()),
+                role: None,
+                tool: None,
+                session_id: None,
+                session_scope: None,
+                cwd: None,
+                source: request.source.as_filter(),
+                since: request.since,
+                until: None,
+                limit: RESULT_LIMIT,
+                mode: SearchMode::Lexical,
+                recency_weight: crate::search::DEFAULT_RECENCY_WEIGHT,
+                recency_half_life_days: 30.0,
+                min_score: None,
+                project_grouping: Some(request.grouping),
+                text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+            },
+            &crate::search::Selection::conversations(RESULT_LIMIT, request.kind),
+            false,
+        )?;
+        let matchers = crate::cli::build_matchers(&request.query)?;
+        let sessions = result
+            .items
+            .into_iter()
+            .map(|record| {
+                let mut session = HashMap::new();
+                add_located_record_to_session(&mut session, record, &matchers);
+                session.into_values().next().expect("one representative")
+            })
+            .collect();
+        return Ok((sessions, result.failures));
+    }
     let project = (!request.project.is_empty()).then_some(request.project.as_str());
     if !config.machines.is_empty() {
-        let federated = if request.query.is_empty() {
-            federated_recent(
-                paths,
-                config,
-                &request.machines,
-                (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200),
-                Some(request.grouping),
-                false,
-            )?
-        } else {
-            let tantivy_project = if request.grouping == ProjectGrouping::Flat {
-                project.map(str::to_string)
-            } else {
-                None
-            };
-            federated_search(
-                paths,
-                config,
-                &request.machines,
-                &SearchSpec {
-                    query: request.query.clone(),
-                    project: tantivy_project,
-                    role: None,
-                    tool: None,
-                    session_id: None,
-                    session_scope: None,
-                    cwd: None,
-                    source: request.source.as_filter(),
-                    since: request.since,
-                    until: None,
-                    limit: RESULT_LIMIT * 5,
-                    mode: SearchMode::Lexical,
-                    recency_weight: 1.0,
-                    recency_half_life_days: 30.0,
-                    min_score: None,
-                    project_grouping: Some(request.grouping),
-                    text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
-                },
-                false,
-            )?
-        };
+        let federated = federated_recent(
+            paths,
+            config,
+            &request.machines,
+            (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200),
+            Some(request.grouping),
+            false,
+        )?;
         let failures = federated.failures;
         let mut by_session = HashMap::new();
         let matchers = crate::cli::build_matchers(&request.query)?;
@@ -5864,17 +5871,7 @@ fn run_search_request(
             add_located_record_to_session(&mut by_session, located, &matchers);
         }
         let mut sessions: Vec<_> = by_session.into_values().collect();
-        if request.query.is_empty() {
-            sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts));
-        } else {
-            sessions.sort_by(|left, right| {
-                right
-                    .top_score
-                    .partial_cmp(&left.top_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| right.last_ts.cmp(&left.last_ts))
-            });
-        }
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.last_ts));
         if let Some(project) = project {
             sessions.retain(|session| session.project == project);
         }
@@ -5884,61 +5881,28 @@ fn run_search_request(
         sessions.truncate(RESULT_LIMIT);
         return Ok((sessions, failures));
     }
-    if request.query.is_empty() {
-        let mut sessions = sessions_from_analytics_filtered(
-            paths,
-            request.source.as_filter(),
-            request.since,
-            project,
-            request.grouping,
-            Some(request.kind),
-        )
-        .or_else(|_| {
-            let mut sessions =
-                sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
-            sessions.retain(|session| {
-                session_matches_kind(request.kind, session.conversation_kind.as_deref())
-            });
-            if sessions.is_empty() {
-                anyhow::bail!("no analytics sessions");
-            }
-            enrich_session_titles(index, &mut sessions);
-            Ok(sessions)
-        })?;
+    let mut sessions = sessions_from_analytics_filtered(
+        paths,
+        request.source.as_filter(),
+        request.since,
+        project,
+        request.grouping,
+        Some(request.kind),
+    )
+    .or_else(|_| {
+        let mut sessions =
+            sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
         sessions.retain(|session| {
             session_matches_kind(request.kind, session.conversation_kind.as_deref())
         });
-        return Ok((sessions, Vec::new()));
-    }
-
-    let tantivy_project = if request.grouping == ProjectGrouping::Flat {
-        project
-    } else {
-        None
-    };
-    // Over-fetch when an origin filter is active: the kind filter applies
-    // after grouping, so capping the record query at RESULT_LIMIT first
-    // could starve interactive matches in subagent-heavy corpora.
-    let record_limit = if request.kind == crate::analytics::SessionKindFilter::All {
-        RESULT_LIMIT
-    } else {
-        RESULT_LIMIT * 5
-    };
-    let mut sessions = sessions_from_query(
-        index,
-        &request.query,
-        request.source.as_filter(),
-        tantivy_project,
-        request.since,
-        record_limit,
-    )?;
-    enrich_session_projects(paths, &mut sessions, request.grouping);
-    if let Some(project) = project {
-        sessions.retain(|session| session.project == project);
-    }
+        if sessions.is_empty() {
+            anyhow::bail!("no analytics sessions");
+        }
+        enrich_session_titles(index, &mut sessions);
+        Ok(sessions)
+    })?;
     sessions
         .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
-    sessions.truncate(RESULT_LIMIT);
     Ok((sessions, Vec::new()))
 }
 
@@ -7546,6 +7510,60 @@ mod tests {
             tool_output: None,
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
+        }
+    }
+
+    #[test]
+    fn configured_local_search_keeps_relevance_order_instead_of_boosting_recency() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
+        paths.ensure_dirs().unwrap();
+        let index = SearchIndex::open_or_create_for_ingest(&paths.index).unwrap();
+        let mut writer = index.writer().unwrap();
+        let query = "prepare the amber gallery display";
+        for (id, text, ts) in [
+            (1, query.to_string(), 1),
+            (
+                2,
+                format!("{query}. Background instructions for catalog maintenance."),
+                chrono::Utc::now().timestamp_millis() as u64,
+            ),
+        ] {
+            let mut hit = record("user", &text);
+            hit.doc_id = id;
+            hit.ts = ts;
+            hit.session_id = format!("gallery-{id}");
+            index.add_record(&mut writer, &hit).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        index.publish_generation().unwrap();
+        let index = open_tui_index(&paths, false).unwrap();
+        // A disabled peer takes the configured-machine path without remote I/O.
+        let configured: UserConfig = toml::from_str(
+            "auto_index_on_search = false\n[[machines]]\nid = 'unused'\nenabled = false\n",
+        )
+        .unwrap();
+        for config in [UserConfig::default(), configured] {
+            let (sessions, failures) = run_search_request(
+                &paths,
+                &config,
+                &index,
+                SearchRequest {
+                    request_id: 0,
+                    query: query.into(),
+                    project: String::new(),
+                    machines: Vec::new(),
+                    source: SourceChoice::Codex,
+                    since: None,
+                    grouping: ProjectDisplayMode::NestedWorktrees.grouping(),
+                    kind: crate::analytics::SessionKindFilter::All,
+                },
+            )
+            .unwrap();
+            assert!(failures.is_empty());
+            assert_eq!(sessions.len(), 2);
+            assert_eq!(sessions[0].session_id, "gallery-1");
         }
     }
 

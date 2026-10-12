@@ -27,7 +27,34 @@ tool records. Ordinary unquoted multi-word queries also reward conversational
 records that cover the whole query, before the candidate limit is applied. Partial
 matches and tool evidence remain eligible. Explicit role/tool filters bypass these
 preferences; quoted phrases, Boolean operators and field syntax keep their match
-semantics. This applies to shared lexical retrieval used by CLI, TUI and web search.
+semantics. This applies to shared lexical retrieval used by CLI, MCP, native app, TUI and web search.
+
+For plain queries with four or more terms, conversational matches containing the
+whole phrase come first, even when the phrase is inside a long message. Phrase
+matching uses the index tokenizer (including case folding and stemming), not byte
+equality. Four terms is an intent heuristic for remembered passages; shorter
+keyword searches retain BM25 ordering. Other matches keep the existing relevance
+bonuses and remain eligible after phrase matches. This priority is applied before
+the result limit and preserved when local results are grouped into conversations.
+Fallback scores remain on the BM25 scale; phrase scores receive an additive
+bonus based on the strongest fallback match, independent of the result limit.
+The TUI uses relevance ordering with or without configured machines. Explicit CLI
+recency boosts, hybrid search, multi-query fusion and multi-machine rank fusion
+can change the final order; they do not promise global phrase-first ordering.
+
+All five surfaces use the same relevance ranking and conversation selection.
+Metadata filters constrain matches without contributing relevance points; adding
+a redundant project, source, or session filter does not change scores. Conversation
+text receives an explicit scoring preference, while strong tool evidence can still
+outrank weak conversational matches. `min_score` applies to the resulting scores.
+Recency boosting is disabled by default; `--recency-weight` remains an explicit
+option. Equal lexical scores sort by timestamp descending, then document ID
+ascending, before truncation. Federated ties also use machine identity.
+Conversation views keep the first ranked record for each machine/source/session/
+source-path identity and deepen retrieval until enough conversations are found
+or candidates are exhausted. CLI record mode still returns individual records;
+use `--unique-session` to compare it with conversation views. Explicit newest/
+oldest sorts and different corpora, filters, or machine selections can differ.
 
 `debug eval-retrieval` evaluates the actual CLI result pipeline, including query
 fusion, filters, recency, conversation diversity and compact snippets. Evaluation

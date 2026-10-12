@@ -293,6 +293,85 @@ impl SegmentCollector for DocIdSegmentCollector {
     }
 }
 
+/// Filter exact session identities before TopDocs truncation without building
+/// a Boolean query with thousands of session alternatives.
+struct ScopedCollector<'a, C> {
+    inner: C,
+    scopes: &'a [SessionScopeKey],
+}
+
+struct ScopedSegmentCollector<C> {
+    inner: C,
+    columns: Option<(StrColumn, StrColumn, StrColumn)>,
+    allowed: HashSet<(u64, u64, u64)>,
+}
+
+impl<C: Collector> Collector for ScopedCollector<'_, C> {
+    type Fruit = C::Fruit;
+    type Child = ScopedSegmentCollector<C::Child>;
+
+    fn for_segment(&self, id: u32, segment: &SegmentReader) -> tantivy::Result<Self::Child> {
+        let fast = segment.fast_fields();
+        let columns = match (
+            fast.str("source")?,
+            fast.str("session_id")?,
+            fast.str("source_path")?,
+        ) {
+            (Some(source), Some(session), Some(path)) => Some((source, session, path)),
+            _ => None,
+        };
+        let mut allowed = HashSet::new();
+        if let Some((source, session, path)) = &columns {
+            for key in self.scopes {
+                if let (Some(source), Some(session), Some(path)) = (
+                    source.dictionary().term_ord(key.source.storage_label())?,
+                    session.dictionary().term_ord(&key.session_id)?,
+                    path.dictionary().term_ord(&key.source_path)?,
+                ) {
+                    allowed.insert((source, session, path));
+                }
+            }
+        }
+        Ok(ScopedSegmentCollector {
+            inner: self.inner.for_segment(id, segment)?,
+            columns,
+            allowed,
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        self.inner.requires_scoring()
+    }
+
+    fn merge_fruits(
+        &self,
+        fruits: Vec<<C::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<Self::Fruit> {
+        self.inner.merge_fruits(fruits)
+    }
+}
+
+impl<C: SegmentCollector> SegmentCollector for ScopedSegmentCollector<C> {
+    type Fruit = C::Fruit;
+
+    fn collect(&mut self, doc: DocId, score: Score) {
+        if let Some((source, session, path)) = &self.columns
+            && let (Some(source), Some(session), Some(path)) = (
+                source.ords().first(doc),
+                session.ords().first(doc),
+                path.ords().first(doc),
+            )
+            && self.allowed.contains(&(source, session, path))
+        {
+            self.inner.collect(doc, score);
+        }
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        self.inner.harvest()
+    }
+}
+
 struct SessionScopeCollector {
     fields: IndexFields,
     fast_session_identity: bool,
@@ -1243,14 +1322,69 @@ impl SearchIndex {
 
     pub fn search(&self, options: &QueryOptions) -> Result<Vec<(f32, Record)>> {
         crate::profiling::span!("lexical.search");
+        if options.limit == 0 || options.session_scope.as_ref().is_some_and(Vec::is_empty) {
+            return Ok(Vec::new());
+        }
         let reader = self.reader()?;
         let searcher = reader.searcher();
-        let query = build_relevance_query(&self.fields, options, &self.index)?;
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(options.limit))?;
+        let schema = self.index.schema();
+        let mut fast_identity = self.fields.source.is_some_and(|source| {
+            [source, self.fields.session_id, self.fields.source_path]
+                .into_iter()
+                .all(|field| schema.get_field_entry(field).is_fast())
+        });
+        if fast_identity && options.session_scope.is_some() {
+            for segment in searcher.segment_readers() {
+                for field in ["source", "session_id", "source_path"] {
+                    if segment.fast_fields().str(field)?.is_none() {
+                        fast_identity = false;
+                    }
+                }
+            }
+        }
+        let scope = options.session_scope.as_deref().filter(|_| fast_identity);
+        let query_options = QueryOptions {
+            session_scope: if scope.is_some() {
+                None
+            } else {
+                options.session_scope.clone()
+            },
+            ..options.clone()
+        };
+        let queries = build_relevance_queries(&self.fields, &query_options, &self.index)?;
+        let retrieve = |query: &dyn Query, limit| {
+            let collector = TopDocs::with_limit(limit).tweak_score(RelevanceScorerFactory);
+            if let Some(scopes) = scope {
+                searcher.search(
+                    query,
+                    &ScopedCollector {
+                        inner: collector,
+                        scopes,
+                    },
+                )
+            } else {
+                searcher.search(query, &collector)
+            }
+        };
+        let mut top_docs = if let Some(phrase) = queries.phrase {
+            retrieve(phrase.as_ref(), options.limit)?
+        } else {
+            Vec::new()
+        };
+        let remaining = options.limit - top_docs.len();
+        // Even when phrases fill the limit, read the strongest fallback to give
+        // phrase scores the same promotion regardless of the requested limit.
+        let fallback_docs = retrieve(queries.fallback.as_ref(), remaining.max(1))?;
+        if let Some((best_fallback, _)) = fallback_docs.first() {
+            for (score, _) in &mut top_docs {
+                score.0 = (score.0 + best_fallback.0).max(best_fallback.0.next_up());
+            }
+        }
+        top_docs.extend(fallback_docs.into_iter().take(remaining));
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
             let doc = searcher.doc::<TantivyDocument>(addr)?;
-            results.push((score, record_from_doc(&self.fields, &doc)));
+            results.push((score.0, record_from_doc(&self.fields, &doc)));
         }
         Ok(results)
     }
@@ -2025,6 +2159,25 @@ type SessionReverseOrder = (u64, u64, u64);
 type TimestampAscending = std::cmp::Reverse<(u64, u64)>;
 type TimestampDescending = (u64, u64);
 
+// Break lexical ties before truncation, independent of segment/insertion order.
+type RelevanceOrder = (f32, u64, std::cmp::Reverse<u64>);
+struct RelevanceScorerFactory;
+impl tantivy::collector::ScoreTweaker<RelevanceOrder> for RelevanceScorerFactory {
+    type Child = TimestampScorer;
+    fn segment_tweaker(&self, reader: &tantivy::SegmentReader) -> tantivy::Result<Self::Child> {
+        TimestampScorer::for_segment(reader)
+    }
+}
+impl tantivy::collector::ScoreSegmentTweaker<RelevanceOrder> for TimestampScorer {
+    fn score(&mut self, doc: tantivy::DocId, score: f32) -> RelevanceOrder {
+        (
+            score,
+            self.timestamps.get_val(doc),
+            std::cmp::Reverse(self.doc_ids.get_val(doc)),
+        )
+    }
+}
+
 struct SessionOrderScorerFactory;
 struct SessionReverseOrderScorerFactory;
 struct TimestampAscendingScorerFactory;
@@ -2713,17 +2866,25 @@ fn load_fields(schema: Schema) -> Result<IndexFields> {
     })
 }
 
-/// Prefer conversational evidence without removing useful tool results. Full-query
-/// coverage rewards conversational text, rather than echoed tool invocations.
-fn build_relevance_query(
+/// A relevance fallback and optional disjoint phrase query. Long phrases receive
+/// priority; other matches retain the conversational and full-query BM25 bonuses.
+struct RelevanceQueries {
+    fallback: Box<dyn Query>,
+    phrase: Option<Box<dyn Query>>,
+}
+
+fn build_relevance_queries(
     fields: &IndexFields,
     options: &QueryOptions,
     index: &Index,
-) -> Result<Box<dyn Query>> {
+) -> Result<RelevanceQueries> {
     use tantivy::query_grammar::{Delimiter, UserInputAst, UserInputLeaf};
     let base = build_query(fields, options, index)?;
     if options.query.trim().is_empty() || options.role.is_some() || options.tool.is_some() {
-        return Ok(base);
+        return Ok(RelevanceQueries {
+            fallback: base,
+            phrase: None,
+        });
     }
     let conversation_roles = BooleanQuery::new(
         ["user", "assistant"]
@@ -2741,7 +2902,8 @@ fn build_relevance_query(
     );
     let role_filter: Box<dyn Query> =
         Box::new(ConstScoreQuery::new(Box::new(conversation_roles), 0.0));
-    // Add half of the original BM25 score for conversational matches. Role terms
+    // Weight conversational text above tool echoes without imposing a hard tier.
+    // Strong tool evidence remains eligible to outrank weak conversation matches. Role terms
     // contribute no score, so rare roles cannot dominate the text's relevance.
     let conversation_match = BooleanQuery::new(vec![
         (Occur::Must, base.box_clone()),
@@ -2751,12 +2913,15 @@ fn build_relevance_query(
         (Occur::Must, base),
         (
             Occur::Should,
-            Box::new(BoostQuery::new(Box::new(conversation_match), 0.5)),
+            Box::new(BoostQuery::new(Box::new(conversation_match), 1.5)),
         ),
     ];
     let Ok(UserInputAst::Clause(children)) = tantivy::query_grammar::parse_query(&options.query)
     else {
-        return Ok(Box::new(BooleanQuery::new(clauses)));
+        return Ok(RelevanceQueries {
+            fallback: Box::new(BooleanQuery::new(clauses)),
+            phrase: None,
+        });
     };
     let plain_terms = children.len() > 1
         && children.iter().all(|(occur, child)| {
@@ -2775,21 +2940,91 @@ fn build_relevance_query(
                 && !literal.prefix
         });
     if !plain_terms {
-        return Ok(Box::new(BooleanQuery::new(clauses)));
+        return Ok(RelevanceQueries {
+            fallback: Box::new(BooleanQuery::new(clauses)),
+            phrase: None,
+        });
     }
     let mut parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
     parser.set_conjunction_by_default();
-    let all_terms = BooleanQuery::new(vec![
+    let all_terms: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
         (Occur::Must, parser.parse_query(&options.query)?),
+        (Occur::Must, role_filter.box_clone()),
+    ]));
+    clauses.push((Occur::Should, Box::new(BoostQuery::new(all_terms, 2.0))));
+    // Two or three words are commonly topic keywords, where an answer using
+    // different phrasing can be better than a verbatim echo of the question.
+    // Reserve strict phrase priority for longer remembered passages.
+    const MIN_PHRASE_PRIORITY_TERMS: usize = 4;
+    if children.len() < MIN_PHRASE_PRIORITY_TERMS {
+        return Ok(RelevanceQueries {
+            fallback: Box::new(BooleanQuery::new(clauses)),
+            phrase: None,
+        });
+    }
+    let phrase_text = children
+        .iter()
+        .map(|(_, child)| {
+            let UserInputAst::Leaf(leaf) = child else {
+                unreachable!()
+            };
+            let UserInputLeaf::Literal(literal) = leaf.as_ref() else {
+                unreachable!()
+            };
+            literal.phrase.as_str()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let phrase: Box<dyn Query> = Box::new(BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            parser.parse_query(&format!(
+                "\"{}\"",
+                phrase_text.replace('\\', "\\\\").replace('"', "\\\"")
+            ))?,
+        ),
         (Occur::Must, role_filter),
+    ]));
+    let relevance: Box<dyn Query> = Box::new(BooleanQuery::new(clauses));
+    // Retrieve disjoint tiers before applying the candidate limit. A finite BM25
+    // boost cannot keep a phrase in a long prompt ahead of short partial matches.
+    // Tool echoes remain in the fallback tier rather than displacing conversation.
+    let fallback = BooleanQuery::new(vec![
+        (Occur::Must, relevance.box_clone()),
+        (Occur::MustNot, phrase.box_clone()),
     ]);
-    // A full-query match gets its own BM25 contribution in addition to OR retrieval.
-    // This operates before TopDocs truncation, so grouping can see those candidates.
-    clauses.push((
-        Occur::Should,
-        Box::new(BoostQuery::new(Box::new(all_terms), 2.0)),
-    ));
-    Ok(Box::new(BooleanQuery::new(clauses)))
+    let exact = BooleanQuery::new(vec![
+        (Occur::Must, relevance),
+        (Occur::Must, Box::new(ConstScoreQuery::new(phrase, 0.0))),
+    ]);
+    Ok(RelevanceQueries {
+        fallback: Box::new(fallback),
+        phrase: Some(Box::new(exact)),
+    })
+}
+
+/// Tantivy's constant-score wrapper still builds BM25 weights for its children.
+/// Disable that work for metadata filters, especially large session-scope unions.
+#[derive(Debug, Clone)]
+struct UnscoredQuery(Arc<dyn Query>);
+
+impl Query for UnscoredQuery {
+    fn weight(
+        &self,
+        scoring: tantivy::query::EnableScoring<'_>,
+    ) -> tantivy::Result<Box<dyn tantivy::query::Weight>> {
+        let disabled = match scoring {
+            tantivy::query::EnableScoring::Enabled { searcher, .. } => {
+                tantivy::query::EnableScoring::disabled_from_searcher(searcher)
+            }
+            disabled => disabled,
+        };
+        self.0.weight(disabled)
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.0.query_terms(visitor);
+    }
 }
 
 fn build_query(
@@ -2862,37 +3097,57 @@ fn build_query(
         if scope.is_empty() {
             clauses.push((Occur::Must, Box::new(EmptyQuery)));
         } else {
-            let alternatives = scope
-                .iter()
-                .map(|key| {
-                    let mut identity: Vec<(Occur, Box<dyn Query>)> = vec![
-                        (
+            // Factor out source postings: intersecting the same large source
+            // list once per session makes repository scopes unnecessarily costly.
+            let mut by_source = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for key in scope {
+                by_source
+                    .entry(key.source.storage_label())
+                    .or_default()
+                    .push(key);
+            }
+            let alternatives = by_source
+                .into_iter()
+                .map(|(source, keys)| {
+                    let sessions = keys
+                        .into_iter()
+                        .map(|key| {
+                            let identity: Vec<(Occur, Box<dyn Query>)> = vec![
+                                (
+                                    Occur::Must,
+                                    Box::new(TermQuery::new(
+                                        Term::from_field_text(fields.session_id, &key.session_id),
+                                        IndexRecordOption::Basic,
+                                    )),
+                                ),
+                                (
+                                    Occur::Must,
+                                    Box::new(TermQuery::new(
+                                        Term::from_field_text(fields.source_path, &key.source_path),
+                                        IndexRecordOption::Basic,
+                                    )),
+                                ),
+                            ];
+                            (
+                                Occur::Should,
+                                Box::new(BooleanQuery::new(identity)) as Box<dyn Query>,
+                            )
+                        })
+                        .collect();
+                    let mut group: Vec<(Occur, Box<dyn Query>)> =
+                        vec![(Occur::Must, Box::new(BooleanQuery::new(sessions)))];
+                    if let Some(field) = fields.source {
+                        group.push((
                             Occur::Must,
                             Box::new(TermQuery::new(
-                                Term::from_field_text(fields.session_id, &key.session_id),
-                                IndexRecordOption::Basic,
-                            )),
-                        ),
-                        (
-                            Occur::Must,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(fields.source_path, &key.source_path),
-                                IndexRecordOption::Basic,
-                            )),
-                        ),
-                    ];
-                    if let Some(source_field) = fields.source {
-                        identity.push((
-                            Occur::Must,
-                            Box::new(TermQuery::new(
-                                Term::from_field_text(source_field, key.source.storage_label()),
+                                Term::from_field_text(field, source),
                                 IndexRecordOption::Basic,
                             )),
                         ));
                     }
                     (
                         Occur::Should,
-                        Box::new(BooleanQuery::new(identity)) as Box<dyn Query>,
+                        Box::new(BooleanQuery::new(group)) as Box<dyn Query>,
                     )
                 })
                 .collect();
@@ -2911,6 +3166,15 @@ fn build_query(
         clauses.push((Occur::Must, Box::new(range)));
     }
 
+    // Only the parsed query contributes relevance. Metadata scopes must not
+    // reward rare session IDs or change scores when an equivalent project
+    // filter is expressed as a set of session identities.
+    for (_, filter) in clauses.iter_mut().skip(1) {
+        *filter = Box::new(ConstScoreQuery::new(
+            Box::new(UnscoredQuery(Arc::from(filter.box_clone()))),
+            0.0,
+        ));
+    }
     Ok(Box::new(BooleanQuery::new(clauses)))
 }
 
@@ -3592,6 +3856,88 @@ mod tests {
     }
 
     #[test]
+    fn fast_scope_ranking_matches_legacy_boolean_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut outcomes = Vec::new();
+        for fast in [false, true] {
+            let dir = root.path().join(fast.to_string());
+            std::fs::create_dir(&dir).unwrap();
+            drop(
+                Index::create_in_dir(&dir, build_schema_with_options(true, fast).unwrap()).unwrap(),
+            );
+            let index = SearchIndex::open_or_create(&dir).unwrap();
+            let mut writer = index.index.writer_with_num_threads(1, 15_000_000).unwrap();
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            let mut scopes = Vec::new();
+            for id in 1..=6 {
+                let text = if id % 2 == 0 {
+                    "prepare the amber gallery display"
+                } else {
+                    "amber gallery"
+                };
+                let mut record = test_record(id, text);
+                record.source = if id <= 3 {
+                    crate::types::SourceKind::Codex
+                } else {
+                    crate::types::SourceKind::Claude
+                };
+                record.session_id = format!("session-{}", id % 2);
+                record.source_path = format!("/fixture/{}.jsonl", id % 3);
+                if [2, 3, 4].contains(&id) {
+                    scopes.push(SessionScopeKey {
+                        source: record.source,
+                        session_id: record.session_id.clone(),
+                        source_path: record.source_path.clone(),
+                    });
+                }
+                index.add_record(&mut writer, &record).unwrap();
+                if id % 3 == 0 {
+                    writer.commit().unwrap();
+                }
+            }
+            writer.wait_merging_threads().unwrap();
+            scopes.push(SessionScopeKey {
+                source: crate::types::SourceKind::Codex,
+                session_id: "absent".into(),
+                source_path: "/absent".into(),
+            });
+            let mut hits = Vec::new();
+            for query in ["amber", "prepare the amber gallery display"] {
+                for limit in [1, 10] {
+                    let result = index
+                        .search(&QueryOptions {
+                            query: query.into(),
+                            project: None,
+                            role: None,
+                            tool: None,
+                            session_id: None,
+                            session_scope: Some(scopes.clone()),
+                            source: None,
+                            since: None,
+                            until: None,
+                            limit,
+                        })
+                        .unwrap();
+                    assert!(
+                        result
+                            .iter()
+                            .all(|(_, record)| [2, 3, 4].contains(&record.doc_id))
+                    );
+                    assert_eq!(result.len(), limit.min(3));
+                    hits.push(
+                        result
+                            .into_iter()
+                            .map(|(score, record)| (score, record.doc_id))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            outcomes.push(hits);
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+
+    #[test]
     fn session_scope_filters_exact_source_session_and_path() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let index = SearchIndex::open_or_create(tmp.path()).expect("index");
@@ -4232,6 +4578,116 @@ mod tests {
     }
 
     #[test]
+    fn relevance_prefers_a_phrase_in_a_long_message_over_short_partial_matches() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(temp.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        let query = "prepare the amber gallery display and notify the curator";
+        let long_message = format!(
+            "{query}. {}",
+            "Background instructions describe catalog maintenance and conservation procedures. "
+                .repeat(2000)
+        );
+        let mut tool = test_record(4, query);
+        tool.role = "tool_result".into();
+        tool.tool_name = Some("Bash".into());
+        let mut other_project = test_record(5, query);
+        other_project.project = "other".into();
+        for record in [
+            test_record(1, "prepare amber gallery display notify curator"),
+            test_record(
+                2,
+                "notify the curator and prepare the display in the amber gallery",
+            ),
+            test_record(3, &long_message),
+            tool,
+            other_project,
+        ] {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        writer.wait_merging_threads().unwrap();
+        let mut options = QueryOptions {
+            query: query.into(),
+            project: Some("memex".into()),
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 1,
+        };
+        let best = index.search(&options).unwrap().remove(0);
+        assert_eq!(best.1.doc_id, 3);
+        options.limit = 20;
+        let hits = index.search(&options).unwrap();
+        assert_eq!(hits.len(), 4);
+        assert_eq!(hits[0].1.doc_id, 3);
+        assert_eq!(
+            hits[0].0, best.0,
+            "phrase score must not depend on the result limit"
+        );
+        assert_eq!(hits[1].1.doc_id, 2);
+        assert!(hits.windows(2).all(|pair| pair[0].0 >= pair[1].0));
+        assert_eq!(
+            hits.iter()
+                .map(|(_, r)| r.doc_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+
+        let reader = index.reader().unwrap();
+        let searcher = reader.searcher();
+        let queries = build_relevance_queries(&index.fields, &options, &index.index).unwrap();
+        let raw_fallback = searcher
+            .search(&queries.fallback, &TopDocs::with_limit(20))
+            .unwrap();
+        assert_eq!(
+            hits[1].0, raw_fallback[0].0,
+            "fallback scores must retain their original scale"
+        );
+
+        // No phrase matches this order: full coverage must still beat short partials.
+        options.query = "curator conservation amber instructions".into();
+        options.limit = 1;
+        let no_phrase = index.search(&options).unwrap();
+        assert_eq!(no_phrase[0].1.doc_id, 3);
+        let queries = build_relevance_queries(&index.fields, &options, &index.index).unwrap();
+        let raw_fallback = searcher
+            .search(&queries.fallback, &TopDocs::with_limit(1))
+            .unwrap();
+        assert_eq!(
+            no_phrase[0].0, raw_fallback[0].0,
+            "no-phrase queries must keep BM25 scores for recency and min-score"
+        );
+        options.query = query.into();
+        options.role = Some("tool_result".into());
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 4);
+        options.role = None;
+        options.tool = Some("Bash".into());
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 4);
+        options.tool = None;
+        options.until = Some(2);
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 2);
+        options.until = None;
+        options.session_id = Some("missing-session".into());
+        assert!(index.search(&options).unwrap().is_empty());
+        options.session_id = None;
+        // Topic keywords keep BM25 ordering; four-word remembered wording gets
+        // phrase priority. The best short nonphrase answer wins the keyword case.
+        options.query = "prepare the amber".into();
+        options.limit = 1;
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 2);
+        options.query = "prepare the amber gallery".into();
+        assert_eq!(index.search(&options).unwrap()[0].1.doc_id, 3);
+        options.limit = 0;
+        assert!(index.search(&options).unwrap().is_empty());
+    }
+
+    #[test]
     fn relevance_prefers_full_query_coverage_before_the_candidate_limit() {
         let temp = tempfile::tempdir().unwrap();
         let index = SearchIndex::open_or_create(temp.path()).unwrap();
@@ -4270,6 +4726,97 @@ mod tests {
         options.query = "museum".into();
         options.role = Some("assistant".into());
         assert!(index.search(&options).unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_filters_preserve_scores_and_lexical_ties_survive_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(root.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        for id in [3, 2, 1] {
+            let mut record = test_record(id, "amber beacon");
+            record.ts = 42;
+            index.add_record(&mut writer, &record).unwrap();
+            writer.commit().unwrap();
+        }
+        let mut options = QueryOptions {
+            query: "beacon".into(),
+            project: None,
+            role: None,
+            tool: None,
+            session_id: None,
+            session_scope: None,
+            source: None,
+            since: None,
+            until: None,
+            limit: 3,
+        };
+        let expected = index
+            .search(&options)
+            .unwrap()
+            .into_iter()
+            .map(|(score, record)| (score, record.doc_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        options.project = Some("memex".into());
+        options.source = Some(SourceFilter::Codex);
+        options.since = Some(42);
+        options.until = Some(42);
+        options.session_scope = Some(vec![SessionScopeKey {
+            source: crate::types::SourceKind::Codex,
+            session_id: "session".into(),
+            source_path: "session.jsonl".into(),
+        }]);
+        for limit in 1..=3 {
+            options.limit = limit;
+            let filtered = index
+                .search(&options)
+                .unwrap()
+                .into_iter()
+                .map(|(score, record)| (score, record.doc_id))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                filtered,
+                expected[..limit],
+                "redundant filters must not add score"
+            );
+        }
+    }
+
+    #[test]
+    fn strong_tool_evidence_can_outrank_weak_conversational_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let index = SearchIndex::open_or_create(root.path()).unwrap();
+        let mut writer = index.writer().unwrap();
+        let weak = test_record(
+            1,
+            &format!("beacon {}", "unrelated background ".repeat(2000)),
+        );
+        let mut strong = test_record(2, "beacon beacon beacon");
+        strong.role = "tool_result".into();
+        for record in [weak, strong] {
+            index.add_record(&mut writer, &record).unwrap();
+        }
+        writer.commit().unwrap();
+        let results = index
+            .search(&QueryOptions {
+                query: "beacon".into(),
+                project: None,
+                role: None,
+                tool: None,
+                session_id: None,
+                session_scope: None,
+                source: None,
+                since: None,
+                until: None,
+                limit: 2,
+            })
+            .unwrap();
+        assert_eq!(results[0].1.doc_id, 2);
+        assert_eq!(results.len(), 2);
     }
 
     #[test]

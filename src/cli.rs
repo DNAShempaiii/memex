@@ -7,9 +7,9 @@ use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::machine::{
     BoundedRecord, LocatedMemoryHit, LocatedRecord, MAX_HYDRATE_INPUT_BYTES,
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
-    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_search,
-    federated_sessions, federated_usage, read_context, read_memory, read_record,
-    read_session_pages, session_page_context,
+    SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_sessions,
+    federated_usage, read_context, read_memory, read_record, read_session_pages,
+    session_page_context,
 };
 use crate::memory::MemoryStore;
 use crate::memory_search::{
@@ -19,9 +19,7 @@ use crate::memory_search::{
 use crate::read_budget::{ContentPage, DEFAULT_MAX_CHARS, ReadBudget, ReadField};
 use crate::retrieval::canonical_record_id;
 use crate::retrieval::{ContextOptions, ContextSelector};
-use crate::retrieval_eval::{
-    RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace, fuse_ranked_queries,
-};
+use crate::retrieval_eval::{RetrievalTrace, RetrievalTraceMetadata, TraceQuery, append_trace};
 use crate::transfer::{
     TransferMode as CoreTransferMode, TransferOptions, TransferTarget as CoreTransferTarget,
     transfer_session,
@@ -39,7 +37,6 @@ use regex::RegexBuilder;
 use rmcp::schemars::{self, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -367,7 +364,7 @@ OUTPUT FIELDS (--fields):
         #[arg(long, help_heading = "Tuning")]
         min_score: Option<f32>,
         /// Weight for recency boost (0 = no boost, higher = more recent preferred)
-        #[arg(long, default_value_t = 1.0, help_heading = "Tuning")]
+        #[arg(long, default_value_t = crate::search::DEFAULT_RECENCY_WEIGHT, help_heading = "Tuning")]
         recency_weight: f32,
         /// Half-life in days for recency decay (lower = faster decay)
         #[arg(long, default_value_t = 30.0, help_heading = "Tuning")]
@@ -1066,7 +1063,7 @@ fn default_true() -> bool {
 }
 
 fn default_recency_weight() -> f32 {
-    1.0
+    crate::search::DEFAULT_RECENCY_WEIGHT
 }
 
 fn default_recency_half_life_days() -> f32 {
@@ -1333,7 +1330,7 @@ pub fn run() -> Result<()> {
     let check_updates = !cli.no_update_check;
     if cli.command.is_none() && !interactive {
         if check_updates {
-            print_update_notice(available_update().as_deref());
+            print_update_notice(available_update().as_ref());
         }
         warn_if_skill_outdated();
         Cli::command().print_help()?;
@@ -1362,17 +1359,8 @@ pub fn run() -> Result<()> {
             "skill installation requires a destination without interactive selection; use `memex skill install --target shared`, `--target claude`, or `--target all`"
         ));
     }
-    let should_check = !matches!(
-        command,
-        Commands::Tui { .. }
-            | Commands::Update { .. }
-            | Commands::Skill { .. }
-            | Commands::Rpc { .. }
-            | Commands::Mcp { .. }
-            | Commands::Herdr { .. }
-    );
-    if should_check && check_updates {
-        print_update_notice(available_update().as_deref());
+    if check_updates && command_reports_updates(&command) {
+        print_update_notice(available_update().as_ref());
     }
     if matches!(command, Commands::Search { .. }) {
         warn_if_skill_outdated();
@@ -1498,18 +1486,22 @@ pub fn run() -> Result<()> {
                     "TUI requires an interactive human terminal; use `memex search` or `memex sessions` for agent/script output"
                 ));
             }
-            let latest = check_updates.then(available_update).flatten();
-            if let Some(latest) = latest.as_deref() {
-                print_update_notice(Some(latest));
+            let update = check_updates.then(available_update).flatten();
+            if let Some(update) = update.as_ref() {
+                print_update_notice(Some(update));
                 if confirm_update()? {
-                    perform_update(Some(latest))?;
+                    perform_update(Some(&update.latest))?;
                     println!("Update finished. Run `memex` again to start the installed version.");
                     return Ok(());
                 }
             }
-            let update_rx = latest.map(|latest| {
+            let update_rx = update.map(|update| {
                 let (tx, rx) = std::sync::mpsc::channel();
-                let _ = tx.send(format!("update: v{latest} (memex update)"));
+                let _ = tx.send(format!(
+                    "update: v{} ({})",
+                    update.latest,
+                    update.source.upgrade_hint()
+                ));
                 rx
             });
             tui::run(root, update_rx, query, project)?;
@@ -3381,11 +3373,6 @@ fn collect_search_with_memories(
                         matchers: build_matchers(&query)?,
                         format,
                         fields: fields.clone(),
-                        sort,
-                        min_score: None,
-                        top_n_per_session: None,
-                        limit: 1,
-                        kind_filter: crate::analytics::SessionKindFilter::All,
                     },
                 )?;
                 if content == SearchContent::All
@@ -3639,7 +3626,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     origin,
                     mode: SearchMode::Lexical,
                     min_score: None,
-                    recency_weight: 1.0,
+                    recency_weight: crate::search::DEFAULT_RECENCY_WEIGHT,
                     recency_half_life_days: 30.0,
                     since,
                     until: None,
@@ -3814,91 +3801,52 @@ fn collect_search_with_auto_index(
         matchers,
         format,
         fields,
-        sort,
-        min_score,
-        top_n_per_session,
-        limit,
-        kind_filter,
     };
 
-    // Origin filtering applies after retrieval, so a fixed overfetch can
-    // still starve when wanted-kind matches rank below the cap. Re-run with
-    // a wider cap (bounded) until the filtered list is full or retrieval
-    // stops offering more candidates.
-    let origin_filtered = kind_filter != crate::analytics::SessionKindFilter::All;
-    let mut candidate_limit = if queries.len() > 1
-        || top_n_per_session.is_some()
-        || options.source.is_some()
-        || cwd.is_some()
-        || origin_filtered
-    {
-        (limit * 5).max(limit + 10)
-    } else {
-        limit
-    };
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
-    let mut failures = Vec::new();
-    let mut seen_failures = HashSet::new();
-    let mut ranked_queries;
-    let mut query_candidate_counts;
-    let mut results;
-    let mut round = 0;
-    loop {
-        ranked_queries = Vec::with_capacity(queries.len());
-        query_candidate_counts = Vec::with_capacity(queries.len());
-        let mut round_capped = false;
-        for (query_index, query) in queries.iter().enumerate() {
-            let spec = SearchSpec {
-                query: query.clone(),
-                project: options.project.clone(),
-                role: options.role.clone(),
-                tool: options.tool.clone(),
-                session_id: options.session_id.clone(),
-                session_scope: None,
-                cwd: cwd.clone(),
-                source: options.source,
-                since: options.since,
-                until: options.until,
-                limit: candidate_limit,
-                mode,
-                recency_weight,
-                recency_half_life_days,
-                min_score,
-                project_grouping: None,
-                text_limit,
-            };
-            let federated = federated_search(
-                &paths,
-                &config,
-                &selected_machines,
-                &spec,
-                auto_index_local && query_index == 0,
-            )?;
-            round_capped = round_capped || federated.candidate_count > federated.items.len();
-            query_candidate_counts.push(federated.candidate_count);
-            for (machine, error) in federated.failures {
-                let message = format!("{machine}: {error}");
-                if seen_failures.insert(message.clone()) {
-                    failures.push(message);
-                }
-            }
-            ranked_queries.push(federated.items);
-        }
-        let fused = if ranked_queries.len() == 1 {
-            ranked_queries.pop().unwrap_or_default()
-        } else {
-            fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
-        };
-        let stored_kinds = stored_session_kinds(&paths, &fused, origin_filtered);
-        let mut merged_render = render.clone();
-        merged_render.min_score = None;
-        results = apply_post_processing_located(fused, &merged_render, &stored_kinds);
-        round += 1;
-        if !origin_filtered || results.len() >= render.limit || !round_capped || round >= 3 {
-            break;
-        }
-        candidate_limit = candidate_limit.saturating_mul(5);
-    }
+    let collected = crate::search::collect(
+        &paths,
+        &config,
+        &selected_machines,
+        &queries,
+        &SearchSpec {
+            query: options.query.clone(),
+            project: options.project,
+            role: options.role,
+            tool: options.tool,
+            session_id: options.session_id,
+            session_scope: None,
+            cwd: cwd.clone(),
+            source: options.source,
+            since: options.since,
+            until: options.until,
+            limit,
+            mode,
+            recency_weight,
+            recency_half_life_days,
+            min_score,
+            project_grouping: None,
+            text_limit,
+        },
+        &crate::search::Selection {
+            sort: if sort == SortBy::Score {
+                crate::search::Sort::Score
+            } else {
+                crate::search::Sort::Timestamp
+            },
+            top_n_per_session,
+            limit,
+            kind_filter,
+        },
+        auto_index_local,
+    )?;
+    let results = collected.items;
+    let query_candidate_counts = collected.query_candidate_counts;
+    let failures = collected
+        .failures
+        .into_iter()
+        .map(|(machine, error)| format!("{machine}: {error}"))
+        .collect();
     Ok(SearchCollection {
         paths,
         queries,
@@ -3926,11 +3874,6 @@ struct RenderOptions {
     matchers: Vec<regex::Regex>,
     format: SearchFormat,
     fields: Option<HashSet<String>>,
-    sort: SortBy,
-    min_score: Option<f32>,
-    top_n_per_session: Option<usize>,
-    limit: usize,
-    kind_filter: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Serialize)]
@@ -7743,129 +7686,6 @@ fn wants_field(fields: &Option<HashSet<String>>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Stored session kinds for the candidate groups, keyed by
-/// (machine, source label, session id) with prefer-main dominance. Remote
-/// machines and sessions missing from the analytics cache simply have no
-/// entry, and grouping falls back to the matched records. Empty unless an
-/// origin filter is active.
-fn stored_session_kinds(
-    paths: &Paths,
-    results: &[LocatedRecord],
-    origin_filtered: bool,
-) -> HashMap<(String, String, String), Option<String>> {
-    let mut out = HashMap::new();
-    if !origin_filtered {
-        return out;
-    }
-    let Ok(store) = open_analytics_read_only(paths) else {
-        return out;
-    };
-    for result in results {
-        let key = (
-            result.machine.clone(),
-            result.record.source.storage_label().to_string(),
-            result.record.session_id.clone(),
-        );
-        let stored = store.session_conversation_kind(
-            result.record.source.storage_label(),
-            &result.record.session_id,
-            &result.record.source_path,
-        );
-        let dominated = stored.as_deref() == Some("main");
-        out.entry(key)
-            .and_modify(|kind: &mut Option<String>| {
-                if dominated {
-                    *kind = Some("main".to_string());
-                }
-            })
-            .or_insert(stored);
-    }
-    out
-}
-
-fn apply_post_processing_located(
-    mut results: Vec<LocatedRecord>,
-    render: &RenderOptions,
-    stored_kinds: &HashMap<(String, String, String), Option<String>>,
-) -> Vec<LocatedRecord> {
-    if let Some(min_score) = render.min_score {
-        results.retain(|result| result.score >= min_score);
-    }
-
-    // Session-grouped origin filter with prefer-main: a sidechain hit inside
-    // a primary session must not hide the session (mirrors the TUI and the
-    // analytics accumulator). Groups resolve against the stored session kind
-    // first — complete-session truth — and only fall back to the matched
-    // records when the analytics cache has no row (remote machines, stale
-    // caches).
-    if render.kind_filter != crate::analytics::SessionKindFilter::All {
-        let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
-        for result in &results {
-            let key = (
-                result.machine.clone(),
-                result.record.source.storage_label().to_string(),
-                result.record.session_id.clone(),
-            );
-            let dominated = result.record.links.conversation_kind.as_deref() == Some("main");
-            group_kind
-                .entry(key)
-                .and_modify(|kind| {
-                    if dominated {
-                        *kind = Some("main".to_string());
-                    }
-                })
-                .or_insert_with(|| result.record.links.conversation_kind.clone());
-        }
-        results.retain(|result| {
-            let key = (
-                result.machine.clone(),
-                result.record.source.storage_label().to_string(),
-                result.record.session_id.clone(),
-            );
-            let kind = stored_kinds
-                .get(&key)
-                .and_then(|stored| stored.as_deref())
-                .or_else(|| group_kind.get(&key).and_then(|kind| kind.as_deref()));
-            render.kind_filter.matches_kind(kind)
-        });
-    }
-
-    match render.sort {
-        SortBy::Score => {
-            results.sort_by(|left, right| {
-                right
-                    .score
-                    .partial_cmp(&left.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        SortBy::Ts => {
-            results.sort_by_key(|result| std::cmp::Reverse(result.record.ts));
-        }
-    }
-
-    if let Some(k) = render.top_n_per_session {
-        let mut per_session: HashMap<(String, String, String), usize> = HashMap::new();
-        results.retain(|result| {
-            let count = per_session
-                .entry((
-                    result.machine.clone(),
-                    result.record.source.storage_label().to_string(),
-                    result.record.session_id.clone(),
-                ))
-                .or_default();
-            if *count >= k {
-                return false;
-            }
-            *count += 1;
-            true
-        });
-    }
-
-    results.truncate(render.limit);
-    results
-}
-
 fn format_ts(ts: u64) -> String {
     if ts == 0 {
         return "-".to_string();
@@ -8002,6 +7822,28 @@ fn resolve_flag(default: bool, enable: bool, disable: bool, name: &str) -> Resul
 }
 
 const REPO: &str = "nicosuave/memex";
+
+/// Long-running daemons write to service logs nobody reads, so they skip
+/// availability checks; commands with their own update flow skip them too.
+fn command_reports_updates(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::Tui { .. }
+            | Commands::Update { .. }
+            | Commands::Skill { .. }
+            | Commands::Rpc { .. }
+            | Commands::Mcp { .. }
+            | Commands::Herdr { .. }
+            | Commands::IndexService {
+                action: IndexServiceCommand::Run { .. }
+            }
+            | Commands::Index { watch: true, .. }
+            | Commands::Index {
+                watch_mode: Some(_),
+                ..
+            }
+    )
+}
 
 fn interaction_allowed(
     explicitly_disabled: bool,
@@ -8327,15 +8169,121 @@ fn detect_platform() -> Result<(&'static str, &'static str)> {
 struct UpdateCheck {
     checked_at: u64,
     latest: Option<String>,
+    /// Absent in caches written before Homebrew-sourced checks; those came from GitHub.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+const RELEASE_UPDATE_SOURCE: &str = "github";
+
+/// Where release availability comes from, which also decides who installs updates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdateSource {
+    /// GitHub releases, installed by `memex update`.
+    Release,
+    /// The Homebrew formula that owns this executable. Homebrew is the only
+    /// version source and installer; memex never downloads a binary for it.
+    Homebrew { formula: String },
+}
+
+impl UpdateSource {
+    fn cache_key(&self) -> String {
+        match self {
+            Self::Release => RELEASE_UPDATE_SOURCE.to_string(),
+            Self::Homebrew { formula } => format!("homebrew:{formula}"),
+        }
+    }
+
+    fn upgrade_hint(&self) -> String {
+        match self {
+            Self::Release => "memex update".to_string(),
+            Self::Homebrew { formula } => format!("brew upgrade {formula}"),
+        }
+    }
+}
+
+/// Returns None when a Homebrew keg's formula cannot be identified; such an
+/// installation gets no check rather than falling back to GitHub releases.
+fn update_source(current_exe: &Path) -> Option<UpdateSource> {
+    if !homebrew_executable(current_exe) {
+        return Some(UpdateSource::Release);
+    }
+    let formula = homebrew_formula(current_exe).ok()?;
+    Some(UpdateSource::Homebrew { formula })
+}
+
+/// Prefer the brew that owns the keg's Cellar; service and agent PATHs often omit it.
+fn homebrew_brew(current_exe: &Path) -> Option<PathBuf> {
+    let mut prefix = PathBuf::new();
+    for component in current_exe.components() {
+        if component.as_os_str() == "Cellar" {
+            let brew = prefix.join("bin/brew");
+            if brew.is_file() {
+                return Some(brew);
+            }
+            break;
+        }
+        prefix.push(component);
+    }
+    find_in_path("brew")
+}
+
+fn homebrew_stable_version(formula: &Value) -> Result<String> {
+    let version = formula
+        .pointer("/versions/stable")
+        .and_then(Value::as_str)
+        .context("Homebrew formula metadata has no stable version")?;
+    anyhow::ensure!(
+        parse_version_parts(version).is_some(),
+        "Homebrew formula has an unrecognized stable version: {version}"
+    );
+    Ok(version.to_string())
+}
+
+/// Read the version Homebrew will install. homebrew/core formulae come from
+/// Homebrew's formulae API (what `brew upgrade` installs after its auto-update);
+/// third-party taps are read from the local tap through `brew info`.
+fn fetch_homebrew_version(current_exe: &Path, formula: &str) -> Result<String> {
+    if formula == "memex" {
+        let api = std::env::var("HOMEBREW_API_DOMAIN")
+            .ok()
+            .filter(|domain| !domain.is_empty())
+            .unwrap_or_else(|| "https://formulae.brew.sh/api".to_string());
+        let output = std::process::Command::new("curl")
+            .args(["-fsSL", "--connect-timeout", "1", "--max-time", "2"])
+            .arg(format!("{}/formula/memex.json", api.trim_end_matches('/')))
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Failed to fetch Homebrew formula metadata"
+        );
+        return homebrew_stable_version(&serde_json::from_slice(&output.stdout)?);
+    }
+    let brew = homebrew_brew(current_exe).context("brew is not available")?;
+    let output = std::process::Command::new(brew)
+        .args(["info", "--json=v2", "--formula", formula])
+        .env("HOMEBREW_NO_AUTO_UPDATE", "1")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    anyhow::ensure!(output.status.success(), "brew info {formula} failed");
+    let info: Value = serde_json::from_slice(&output.stdout)?;
+    homebrew_stable_version(
+        info.pointer("/formulae/0")
+            .context("brew info returned no formula")?,
+    )
 }
 
 fn latest_version_cached(
     cache_path: &Path,
+    source: &str,
     now: u64,
     fetch: impl FnOnce() -> Result<String>,
 ) -> Option<String> {
     if let Ok(contents) = std::fs::read(cache_path)
         && let Ok(cached) = serde_json::from_slice::<UpdateCheck>(&contents)
+        && cached.source.as_deref().unwrap_or(RELEASE_UPDATE_SOURCE) == source
     {
         // Retry a failed check sooner, without delaying every command while offline.
         let ttl = if cached.latest.is_some() {
@@ -8351,6 +8299,7 @@ fn latest_version_cached(
     let check = UpdateCheck {
         checked_at: now,
         latest: latest.clone(),
+        source: Some(source.to_string()),
     };
     // Cache writes are best effort and atomic; concurrent launches never read a partial file.
     let _ = (|| -> Result<()> {
@@ -8366,26 +8315,47 @@ fn latest_version_cached(
     latest
 }
 
-fn available_update() -> Option<String> {
+struct AvailableUpdate {
+    latest: String,
+    source: UpdateSource,
+}
+
+fn available_update() -> Option<AvailableUpdate> {
     let home = home_dir().ok()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    latest_version_cached(
-        &home.join(".memex/update-check.json"),
-        now,
-        fetch_latest_version,
-    )
-    .filter(|latest| is_newer_version(env!("CARGO_PKG_VERSION"), latest))
+    let current_exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let source = update_source(&current_exe)?;
+    let cache = home.join(".memex/update-check.json");
+    let latest = match &source {
+        UpdateSource::Release => {
+            latest_version_cached(&cache, &source.cache_key(), now, fetch_latest_version)
+        }
+        UpdateSource::Homebrew { formula } => {
+            latest_version_cached(&cache, &source.cache_key(), now, || {
+                fetch_homebrew_version(&current_exe, formula)
+            })
+        }
+    }?;
+    is_newer_version(env!("CARGO_PKG_VERSION"), &latest)
+        .then_some(AvailableUpdate { latest, source })
 }
 
-fn print_update_notice(latest: Option<&str>) {
-    if let Some(latest) = latest {
-        eprintln!(
-            "update: memex v{latest} is available (current v{}). Run `memex update` or `memex update --yes` for a noninteractive update of memex and installed skills.",
-            env!("CARGO_PKG_VERSION")
-        );
+fn print_update_notice(update: Option<&AvailableUpdate>) {
+    let Some(AvailableUpdate { latest, source }) = update else {
+        return;
+    };
+    let current = env!("CARGO_PKG_VERSION");
+    match source {
+        UpdateSource::Release => eprintln!(
+            "update: memex v{latest} is available (current v{current}). Run `memex update` or `memex update --yes` for a noninteractive update of memex and installed skills."
+        ),
+        UpdateSource::Homebrew { .. } => eprintln!(
+            "update: memex v{latest} is available from Homebrew (current v{current}). Run `{}`, then `memex skill update` to refresh installed skills.",
+            source.upgrade_hint()
+        ),
     }
 }
 
@@ -8688,7 +8658,7 @@ mod tests {
         assert!(request.unique_session);
         assert_eq!(request.mode, McpSearchMode::Lexical);
         assert_eq!(request.sort, McpSearchSort::Score);
-        assert_eq!(request.recency_weight, 1.0);
+        assert_eq!(request.recency_weight, 0.0);
         assert_eq!(request.recency_half_life_days, 30.0);
         assert!(request.additional_queries.is_empty());
         assert!(request.machines.is_empty());
@@ -8788,45 +8758,78 @@ mod tests {
     }
 
     #[test]
+    fn long_running_daemons_skip_update_checks() {
+        let reports = |args: &[&str]| {
+            let cli =
+                Cli::try_parse_from(std::iter::once("memex").chain(args.iter().copied())).unwrap();
+            command_reports_updates(&cli.command.unwrap().canonicalize())
+        };
+        for args in [
+            &["daemon", "run"][..],
+            &["service", "run", "--watch-mode", "poll"],
+            &["index", "--watch"],
+            &["index", "--watch-mode", "events"],
+        ] {
+            assert!(!reports(args), "{args:?}");
+        }
+        for args in [&["index"][..], &["search", "needle"], &["daemon", "status"]] {
+            assert!(reports(args), "{args:?}");
+        }
+    }
+
+    #[test]
     fn update_cache_reuses_notices_and_retries_expired_or_failed_checks() {
         let temp = TempDir::new().unwrap();
         let cache = temp.path().join("cache.json");
         assert_eq!(
-            latest_version_cached(&cache, 100, || Ok("99.0.0".into())),
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 100, || Ok("99.0.0".into())),
             Some("99.0.0".into())
         );
         assert_eq!(
-            latest_version_cached(&cache, 200, || panic!("fresh cache must avoid network")),
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 200, || panic!(
+                "fresh cache must avoid network"
+            )),
             Some("99.0.0".into())
         );
         assert_eq!(
-            latest_version_cached(&cache, 100 + 6 * 60 * 60, || Ok("100.0.0".into())),
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 100 + 6 * 60 * 60, || Ok(
+                "100.0.0".into()
+            )),
             Some("100.0.0".into())
         );
         std::fs::write(&cache, "partial invalid cache").unwrap();
         assert_eq!(
-            latest_version_cached(&cache, 30_000, || Err(anyhow!("offline"))),
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 30_000, || Err(anyhow!(
+                "offline"
+            ))),
             None
         );
         assert_eq!(
-            latest_version_cached(&cache, 30_001, || panic!(
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 30_001, || panic!(
                 "failure backoff must avoid network"
             )),
             None
         );
         assert_eq!(
-            latest_version_cached(&cache, 30_300, || Ok("101.0.0".into())),
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 30_300, || Ok(
+                "101.0.0".into()
+            )),
             Some("101.0.0".into())
         );
         // A clock correction must not make a future-dated cache permanent.
         assert_eq!(
-            latest_version_cached(&cache, 20_000, || Ok("102.0.0".into())),
+            latest_version_cached(&cache, RELEASE_UPDATE_SOURCE, 20_000, || Ok(
+                "102.0.0".into()
+            )),
             Some("102.0.0".into())
         );
         assert_eq!(
-            latest_version_cached(&temp.path().join("missing/other.json"), 1, || Ok(
-                "99.0.0".into()
-            )),
+            latest_version_cached(
+                &temp.path().join("missing/other.json"),
+                RELEASE_UPDATE_SOURCE,
+                1,
+                || Ok("99.0.0".into())
+            ),
             Some("99.0.0".into())
         );
     }
@@ -10511,3 +10514,6 @@ mod rebuild_space_tests {
         assert!(available_bytes(temp.path()).unwrap() > 0);
     }
 }
+
+#[cfg(test)]
+mod search_tests;
