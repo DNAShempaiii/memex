@@ -27,6 +27,10 @@ struct WorkspaceCheckpointControls: View {
                                                 to: checkpoint.tree, label: checkpoint.label)
                         }
                         Button("Rewind…") { selected = checkpoint; confirmation = true }
+                        if let skipped = checkpoint.skippedPaths, !skipped.isEmpty {
+                            Divider()
+                            Text("Not captured (nested repositories): " + skipped.joined(separator: ", "))
+                        }
                     }
                 }
             }.disabled(busy)

@@ -191,16 +191,29 @@ used to edit outside the selected workspace.
 **Changes** offers current, branch, and checkpoint comparisons with unified/split
 display and review context capture. Its **Git** menu commits explicitly staged
 changes, pushes the chosen branch, and creates a draft pull request through the
-configured GitHub CLI. It does not automatically stage all files or merge PRs.
+configured GitHub CLI. Commit and push run the repository's hooks (pre-commit,
+commit-msg, pre-push, including Git LFS uploads) and show their output on
+failure; other app Git commands run without hooks. The pull request's base is
+the `upstream` remote when present, otherwise `origin`, and its head is the remote
+the branch was pushed to (`owner:branch` from a fork). Untracked nested
+repositories are listed but cannot be staged. It does not automatically stage
+all files or merge PRs.
 The native pull-request sheet reads metadata, reviews, inline review threads and
 the PR diff, and can capture exact PR/thread context. It does not post reviews or
 comments. Large or paginated results disclose their limits.
 
 Checkpoints capture raw working-file bytes and the index, including before/after
-observed local turns. Conversation rewind and file restore are separate actions.
+observed local turns. Capture rehashes only files whose size, inode or
+timestamps changed since the previous capture of that checkout. Untracked nested
+repositories are skipped and noted on the checkpoint. Each chat keeps its 100
+most recent checkpoints; older records and their `refs/memex/checkpoints` refs
+are deleted, except a checkpoint being restored. Conversation rewind and file
+restore are separate actions.
 File restore requires an owned isolated worktree, no active work, and safe path
-checks; it saves a recovery snapshot before modifying files. It does not run Git
-clean/smudge filters or replace overlapping ignored files.
+checks; it saves a recovery snapshot before modifying files and stages every
+restored file before replacing any. If a later step fails, the error names that
+recovery checkpoint. It does not run Git clean/smudge filters or replace
+overlapping ignored files.
 Explicit workspace snapshots additionally preserve ignored files and independent
 HEAD/index state. Recovery creates another owned checkout and leaves the original
 untouched. Clean, unreferenced pruning saves a recoverable snapshot first; dirty
@@ -225,7 +238,9 @@ Each canonical local workspace has a terminal group. Add independent shells,
 switch or split them, move the same group between drawer and side pane, and save
 scrollback snapshots. Close/restart confirms when a shell is live. Switching chats
 or hiding a pane preserves the processes; restarting the app preserves saved
-snapshots, not the previous shell process. Remote paths cannot spawn local shells.
+snapshots, not the previous shell process. Saved scrollback lives under
+`Application Support/dev.memex.app/TerminalHistory` and is deleted when its
+worktree is removed. Remote paths cannot spawn local shells.
 
 ## Remote clients and schedules
 

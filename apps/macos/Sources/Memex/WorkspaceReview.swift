@@ -33,9 +33,12 @@ extension WorkspaceChangesClient {
         return try await WorkspaceGitCommand.run { command in
             let root = try WorkspaceGitCommand.root(directory, command: command)
             let refs = try Self.diffRefs(scope, root: root, command: command)
-            let data = try WorkspaceGitCommand.data(root, ["diff", "--name-status", "-z", "--find-renames"] + refs + ["--"], command: command)
-            guard data.count <= Self.outputLimit else { throw WorkspaceChangesError(message: "Too many changed paths to display.") }
-            let fields = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+            // Bounded reads stop Git at the display limit instead of buffering
+            // an unbounded name list or patch in memory first.
+            let status = try Self.git(root, ["diff", "--no-ext-diff", "--name-status", "-z", "--find-renames"] + refs + ["--"])
+            try status.requireSuccess()
+            guard !status.truncated else { throw WorkspaceChangesError(message: "Too many changed paths to display (more than 512 KB of names). Narrow the comparison using Git outside Memex.") }
+            let fields = status.text.split(separator: "\0").map(String.init)
             var files: [WorkspaceChange] = []
             var index = 0
             while index < fields.count {
@@ -52,8 +55,10 @@ extension WorkspaceChangesClient {
                 }
             }
             if case .branch = scope {
-                let untracked = try WorkspaceGitCommand.data(root, ["ls-files", "--others", "--exclude-standard", "-z"], command: command)
-                    .split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+                let listing = try Self.git(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+                try listing.requireSuccess()
+                guard !listing.truncated else { throw WorkspaceChangesError(message: "Too many untracked paths to display (more than 512 KB of names).") }
+                let untracked = listing.text.split(separator: "\0").map(String.init)
                 files += untracked.map { .init(path: $0, originalPath: nil, indexStatus: "?", worktreeStatus: "?") }
             }
             return WorkspaceChangesSnapshot(root: root, files: files.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending })
@@ -64,11 +69,11 @@ extension WorkspaceChangesClient {
         if scope == .current || file.isUntracked { return try await diff(file: file, root: root) }
         return try await WorkspaceGitCommand.run { command in
             let refs = try Self.diffRefs(scope, root: root, command: command)
-            let bytes = try WorkspaceGitCommand.data(root,
-                ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames"]
-                + refs + ["--"] + [file.originalPath, file.path].compactMap { $0 }, command: command)
-            return String(decoding: bytes.prefix(Self.outputLimit), as: UTF8.self)
-                + (bytes.count > Self.outputLimit ? "\n\n[Diff truncated at 512 KB.]" : "")
+            let result = try Self.git(root,
+                ["--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", "--submodule=short"]
+                + refs + ["--"] + [file.originalPath, file.path].compactMap { $0 })
+            try result.requireSuccess()
+            return result.displayText
         }
     }
 
