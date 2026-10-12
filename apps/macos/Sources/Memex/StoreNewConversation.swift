@@ -1,12 +1,27 @@
 import Foundation
 
-extension Store {
-    var conversationProjectNames: [String: String] {
-        createdConversations.contexts.mapValues { context in
-            localProjects.projects.first { $0.id == context.projectID }?.name ?? context.projectName
+/// What the reader shows between a Home send and the created conversation.
+struct PendingConversationStart: Identifiable, Equatable {
+    enum Phase: Equatable { case preparingWorkspace, startingProvider, applyingSettings, attaching }
+    let id = UUID()
+    let prompt: String
+    let attachmentNames: [String]
+    let providerName: String
+    let projectName: String?
+    var phase: Phase
+    var error: String?
+
+    var status: String {
+        switch phase {
+        case .preparingWorkspace: "Preparing workspace…"
+        case .startingProvider: "Starting \(providerName)…"
+        case .applyingSettings: "Applying conversation settings…"
+        case .attaching: "Attaching files…"
         }
     }
+}
 
+extension Store {
     func projectName(for session: Session) -> String {
         guard let context = createdConversations.contexts[session.id] else { return session.projectName }
         return localProjects.projects.first { $0.id == context.projectID }?.name ?? context.projectName
@@ -38,6 +53,33 @@ extension Store {
         newConversationError = nil
         defer { startingConversation = false }
         let draft = newConversationDraft.value
+        // Leave Home immediately; the reader shows the prompt while creation runs.
+        var pendingID: UUID?
+        if sendImmediately {
+            let pending = PendingConversationStart(prompt: draft.text,
+                attachmentNames: attachments.map(\.lastPathComponent),
+                providerName: ConversationProviderCatalog.name(for: draft.provider), projectName: project?.name,
+                phase: draft.preparedWorkspace == nil ? .preparingWorkspace : .startingProvider)
+            pendingID = pending.id
+            pendingConversationStart = pending
+            if scope == .home { scope = .all }
+            selectedID = nil
+        }
+        func advance(_ phase: PendingConversationStart.Phase) {
+            if let pendingID, pendingConversationStart?.id == pendingID { pendingConversationStart?.phase = phase }
+        }
+        // Navigate only while the pending page is still what the user is looking at.
+        func reveal(_ session: Session) {
+            guard let pendingID else { return revealCreatedConversation(session) }
+            if pendingConversationStart?.id == pendingID, selectedID == nil, scope != .home {
+                pendingConversationStart = nil
+                revealCreatedConversation(session)
+            } else {
+                if pendingConversationStart?.id == pendingID { pendingConversationStart = nil }
+                sessions.removeAll { $0.id == session.id }
+                sessions.insert(session, at: 0)
+            }
+        }
         do {
             await newConversationDraft.flush()
             if let error = newConversationDraft.error { throw ConversationRuntimeError(message: error) }
@@ -60,6 +102,7 @@ extension Store {
                 await newConversationDraft.flush()
                 if let error = newConversationDraft.error { throw ConversationRuntimeError(message: error) }
             }
+            advance(.startingProvider)
 
             let context = CreatedConversationCatalog.Context(projectID: project?.id, projectName: project?.name ?? "No project", workspace: workspace)
             let conversation = try await createConversation(
@@ -70,23 +113,25 @@ extension Store {
             if let error = createdConversations.error ?? newConversationDraft.error ?? liveConversations.drafts.error {
                 throw ConversationRuntimeError(message: error)
             }
+            advance(.applyingSettings)
             let preferences = preferences ?? ConversationComposerPreferences.selection(provider: draft.provider)
             if !(await conversation.applySettings(modelID: preferences.modelID, configurationValues: preferences.configurations)) {
-                revealCreatedConversation(conversation.session)
+                reveal(conversation.session)
                 throw ConversationRuntimeError(message: conversation.error ?? "Conversation settings could not be confirmed. Review this draft before sending.")
             }
             if !attachments.isEmpty {
+                advance(.attaching)
                 await conversation.attachFiles(attachments)
                 await liveConversations.drafts.flush()
                 if let error = conversation.attachmentError ?? conversation.draftSaveError {
                     // Keep the created identity and open its editable draft. Retrying
                     // attachment capture must never allocate another native session.
-                    revealCreatedConversation(conversation.session)
+                    reveal(conversation.session)
                     throw ConversationRuntimeError(message: error)
                 }
             }
             try await newConversationDraft.finishTransfer()
-            revealCreatedConversation(conversation.session)
+            reveal(conversation.session)
             conversation.focus()
             onPrepared?(conversation)
             if sendImmediately { await conversation.send() }
@@ -96,7 +141,16 @@ extension Store {
                 await newConversationDraft.flush()
             }
             newConversationError = error.localizedDescription
+            if let pendingID, pendingConversationStart?.id == pendingID {
+                pendingConversationStart?.error = error.localizedDescription
+            }
         }
+    }
+
+    /// Leave a failed pending start for Home, where the retained draft can be edited or retried.
+    func returnToHomeDraft() {
+        pendingConversationStart = nil
+        scope = .home
     }
 
     /// Recover the already-created chat after a save failure or app exit. This

@@ -120,6 +120,8 @@ actor RemoteConversationRuntime: ConversationRuntime {
                 }
             }
             try await publish()
+        } catch let failure as HostFailure where failure.code == "settings_rejected" {
+            throw ConversationRuntimeError(message: failure.message, kind: .settingsRejected)
         } catch { throw ConversationRuntimeError(message: error.localizedDescription) }
     }
 

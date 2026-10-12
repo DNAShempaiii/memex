@@ -165,9 +165,14 @@ public final class NativeExecutionProvider: ExecutionProvider {
         let content: [AcpPromptContentBlock]? = try command.promptContent.map {
             try JSONDecoder().decode([AcpPromptContentBlock].self, from: JSONEncoder().encode($0))
         }
-        return try decode(service.perform(action, sessionID: command.conversationID, commandID: command.id,
-            issuedAt: command.issuedAt, text: command.text, optionID: command.optionID, requestID: command.requestID,
-            promptContent: content))
+        do {
+            return try decode(service.perform(action, sessionID: command.conversationID, commandID: command.id,
+                issuedAt: command.issuedAt, text: command.text, optionID: command.optionID, requestID: command.requestID,
+                promptContent: content))
+        } catch AgentConversationServiceError.settingsRejected(let detail) {
+            // Viewers keep the conversation usable when only a setting was refused.
+            throw HostFailure("settings_rejected", detail)
+        }
     }
 
     public func readChild(_ conversation: HostedConversation, childID: String) throws -> HostValue {

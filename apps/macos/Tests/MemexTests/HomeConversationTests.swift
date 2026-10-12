@@ -31,6 +31,15 @@ private actor HomeConversationRuntime: ConversationRuntime {
     func disconnect() {}
 }
 
+/// Records what the reader shows while the provider is still creating the chat.
+@MainActor private final class PendingStartProbe {
+    weak var store: Store?
+    var seen: (scope: Store.Scope, prompt: String?, selected: String?)?
+    func capture() {
+        seen = store.map { ($0.scope, $0.pendingConversationStart?.prompt, $0.selectedID) }
+    }
+}
+
 @Suite(.serialized) @MainActor struct HomeConversationTests {
     private func directory() throws -> URL {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -77,6 +86,51 @@ private actor HomeConversationRuntime: ConversationRuntime {
         #expect(store.projectName(for: session) == "My project")
         #expect(store.createdConversations.contexts[session.id]?.workspace.workingDirectory == root.resolvingSymlinksInPath())
         await store.liveConversations.disconnectAll()
+    }
+
+    @Test func homeSendShowsThePendingChatBeforeTheProviderStarts() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = NewConversationDraft(directory: root.appendingPathComponent("home"))
+        home.value.text = "Start right away"
+        let runtime = HomeConversationRuntime()
+        let probe = PendingStartProbe()
+        let store = Store(draftStore: ConversationDraftStore(directory: root.appendingPathComponent("drafts")),
+            createdConversations: CreatedConversationCatalog(directory: root.appendingPathComponent("catalog")),
+            newConversationDraft: home, makeConversation: { request in
+                await probe.capture()
+                return try await runtime.create(request)
+            })
+        store.scope = .home
+        probe.store = store
+        await store.startConversationFromHome()
+        let seen = try #require(probe.seen)
+        #expect(seen.scope == .all)
+        #expect(seen.prompt == "Start right away")
+        #expect(seen.selected == nil)
+        #expect(store.pendingConversationStart == nil)
+        #expect(store.selected != nil)
+        await store.liveConversations.disconnectAll()
+    }
+
+    @Test func failedHomeSendStaysOnThePendingChatAndCanReturnToTheDraft() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let home = NewConversationDraft(directory: root.appendingPathComponent("home"))
+        home.value.text = "Keep this"
+        let runtime = HomeConversationRuntime()
+        await runtime.failNextCreation()
+        let store = Store(draftStore: ConversationDraftStore(directory: root.appendingPathComponent("drafts")),
+            createdConversations: CreatedConversationCatalog(directory: root.appendingPathComponent("catalog")),
+            newConversationDraft: home, makeConversation: { try await runtime.create($0) })
+        store.scope = .home
+        await store.startConversationFromHome()
+        #expect(store.scope == .all)
+        #expect(store.pendingConversationStart?.error != nil)
+        #expect(home.value.text == "Keep this")
+        store.returnToHomeDraft()
+        #expect(store.scope == .home)
+        #expect(store.pendingConversationStart == nil)
     }
 
     @Test func openBlankDraftCreatesOnceWithoutSendingAndCanBeConfiguredBeforeFirstPrompt() async throws {

@@ -51,6 +51,8 @@ final class Store {
     }
     var startingConversation = false
     var newConversationError: String?
+    /// A Home send shown in the reader while its workspace and native session start.
+    var pendingConversationStart: PendingConversationStart?
     var showingWorkspaceChanges = false
     private var workspacePanelNavigation: [String: WorkspacePanelNavigation] = [:]
     var workspacePanel: WorkspacePanel {

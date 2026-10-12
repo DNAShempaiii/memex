@@ -55,6 +55,8 @@ struct ReaderView: View {
                             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { footerHeight = $0 }
                     }
                 }
+            } else if let pending = store.pendingConversationStart {
+                PendingConversationStartView(store: store, pending: pending)
             } else {
                 ContentUnavailableView("Your conversations, together", systemImage: "bubble.left.and.bubble.right",
                     description: Text("Select a conversation or search your history."))
