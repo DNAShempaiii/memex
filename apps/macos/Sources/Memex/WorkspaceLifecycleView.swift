@@ -70,7 +70,13 @@ struct WorkspaceLifecycleView: View {
             Button("Remove clean checkout", role: .destructive) {
                 guard let workspace = cleanup else { return }
                 cleanup = nil
-                run { try await client.removeCleanCheckout(workspace, otherWorkspaceDirectories: referencedDirectories(), isBusy: isWorkspaceBusy(workspace)) }
+                // Canonicalize before removal; the terminal group keyed its
+                // saved scrollback by the resolved worktree root.
+                let terminalRoot = (workspace.worktreeRoot ?? workspace.workingDirectory).resolvingSymlinksInPath().standardizedFileURL
+                run {
+                    try await client.removeCleanCheckout(workspace, otherWorkspaceDirectories: referencedDirectories(), isBusy: isWorkspaceBusy(workspace))
+                    WorkspaceTerminalGroup.discardHistory(directory: terminalRoot)
+                }
             }
             Button("Cancel", role: .cancel) { cleanup = nil }
         } message: {

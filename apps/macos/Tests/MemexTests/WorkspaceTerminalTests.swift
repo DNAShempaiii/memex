@@ -182,3 +182,29 @@ struct WorkspaceTerminalTests {
         guard predicate() else { throw WorkspaceChangesError(message: "Terminal test timed out.") }
     }
 }
+
+@MainActor @Test func terminalHistoryMigratesLegacyFolderAndPrunesRemovedWorkspaces() throws {
+    let temp = FileManager.default.temporaryDirectory.appendingPathComponent("memex-terminal-history-" + UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: temp) }
+    let history = temp.appendingPathComponent("dev.memex.app/TerminalHistory")
+    let legacy = temp.appendingPathComponent("Memex/TerminalHistory")
+    try FileManager.default.createDirectory(at: legacy, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: legacy.appendingPathComponent("legacy.json"))
+    WorkspaceTerminalGroup.migrateHistory(historyDirectory: history, legacyDirectory: legacy)
+    #expect(FileManager.default.fileExists(atPath: history.appendingPathComponent("legacy.json").path))
+    #expect(!FileManager.default.fileExists(atPath: legacy.path))
+    let kept = temp.appendingPathComponent("kept")
+    let removed = temp.appendingPathComponent("removed")
+    for directory in [kept, removed] {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        WorkspaceTerminalGroup(directory: directory, initial: WorkspaceTerminalSession(directory: directory), historyDirectory: history)
+            .saveAllHistory()
+    }
+    func saved() throws -> Int { try FileManager.default.contentsOfDirectory(atPath: history.path).count }
+    #expect(try saved() == 3)
+    try FileManager.default.removeItem(at: removed)
+    WorkspaceTerminalGroup.pruneHistory(historyDirectory: history)
+    #expect(try saved() == 2)
+    WorkspaceTerminalGroup.discardHistory(directory: kept, historyDirectory: history)
+    #expect(try saved() == 1)
+}
