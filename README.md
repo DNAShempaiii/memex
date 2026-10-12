@@ -13,7 +13,7 @@ over SSH, and track token usage from local logs.
 ## Install
 
 ```bash
-brew install nicosuave/tap/memex
+brew install memex
 ```
 
 Or use the installer:
