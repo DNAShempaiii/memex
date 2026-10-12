@@ -209,7 +209,7 @@ fn handle_request(
         let mut body = Vec::new();
         std::io::Read::take(
             request.as_reader(),
-            (crate::execution_host::MAX_REQUEST_BYTES + 1) as u64,
+            (crate::execution_host::MAX_HANDOFF_REQUEST_BYTES + 1) as u64,
         )
         .read_to_end(&mut body)?;
         let command = match crate::execution_host::decode_request(&body) {
