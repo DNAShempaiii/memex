@@ -6,7 +6,27 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::time::Duration;
 
 pub const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+/// Handoff install and destination abort carry a whole handoff package (at most
+/// 30 MiB encoded) plus its certificate. Matches the Swift host socket limit.
+pub const MAX_HANDOFF_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Only methods that transfer a handoff package may use the larger bound.
+pub fn request_limit(method: &str) -> usize {
+    match method {
+        "conversation.handoff.install" | "conversation.handoff.abort" => MAX_HANDOFF_REQUEST_BYTES,
+        _ => MAX_REQUEST_BYTES,
+    }
+}
+
+fn require_request_size(body_len: usize, method: &str) -> Result<()> {
+    ensure!(
+        body_len <= request_limit(method),
+        "execution request exceeds {} MiB",
+        request_limit(method) / (1024 * 1024)
+    );
+    Ok(())
+}
 
 /// A reverse proxy may terminate TLS while the upstream Host remains loopback.
 /// Only an explicitly configured HTTPS origin is accepted, never arbitrary
@@ -89,10 +109,7 @@ pub fn request(paths: &Paths, request: &Value) -> Result<Value> {
         "execution request requires params"
     );
     let mut body = serde_json::to_vec(request)?;
-    ensure!(
-        body.len() <= MAX_REQUEST_BYTES,
-        "execution request exceeds 4 MiB"
-    );
+    require_request_size(body.len(), request["method"].as_str().unwrap_or_default())?;
     body.push(b'\n');
     let directory = paths.state.join("execution");
     let metadata =
@@ -137,13 +154,15 @@ pub fn request(_paths: &Paths, _request: &Value) -> Result<Value> {
 
 pub fn decode_request(body: &[u8]) -> Result<Value> {
     ensure!(
-        body.len() <= MAX_REQUEST_BYTES,
-        "execution request exceeds 4 MiB"
+        body.len() <= MAX_HANDOFF_REQUEST_BYTES,
+        "execution request exceeds {} MiB",
+        MAX_HANDOFF_REQUEST_BYTES / (1024 * 1024)
     );
     let value: Value = serde_json::from_slice(body)?;
     if !value.is_object() || !value["method"].is_string() || !value["params"].is_object() {
         bail!("execution request must contain method and params");
     }
+    require_request_size(body.len(), value["method"].as_str().unwrap_or_default())?;
     Ok(value)
 }
 
@@ -185,6 +204,24 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         (temp, paths)
+    }
+
+    #[test]
+    fn only_handoff_package_methods_accept_large_requests() {
+        let padding = "a".repeat(MAX_REQUEST_BYTES);
+        let large = |method: &str| {
+            serde_json::to_vec(
+                &serde_json::json!({"method": method, "params": {"package": padding}}),
+            )
+            .unwrap()
+        };
+        assert!(decode_request(&large("conversation.handoff.install")).is_ok());
+        assert!(decode_request(&large("conversation.handoff.abort")).is_ok());
+        assert!(decode_request(&large("conversation.send")).is_err());
+        let oversized = "a".repeat(MAX_HANDOFF_REQUEST_BYTES);
+        let body = serde_json::to_vec(&serde_json::json!({"method": "conversation.handoff.install", "params": {"package": oversized}}))
+            .unwrap();
+        assert!(decode_request(&body).is_err());
     }
 
     #[test]

@@ -7,7 +7,8 @@ struct ExecutionHostSSHConfiguration: Codable, Equatable, Sendable {
     var user: String
     var port: Int = 22
     var identityFile: String = ""
-    var localPort: Int = 56363
+    /// Randomized per new configuration so a well-known port is not a squatting target.
+    var localPort: Int = Int.random(in: 49152...65000)
     var remotePort: Int = 6363
     var endpoint: URL { URL(string: "http://127.0.0.1:\(localPort)")! }
 
@@ -19,7 +20,10 @@ struct ExecutionHostSSHConfiguration: Codable, Equatable, Sendable {
               identityFile.isEmpty || (identityFile.hasPrefix("/") && !identityFile.contains("\0")) else {
             throw HostFailure("ssh_configuration", "Enter an exact SSH hostname, valid ports, and an absolute identity-file path")
         }
+        // No connection sharing: the forward must be bound by this ssh process so
+        // its ownership of the local listener can be verified.
         var result = ["-N", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ControlMaster=no", "-o", "ControlPath=none",
             "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3", "-p", String(port),
             "-L", "127.0.0.1:\(localPort):127.0.0.1:\(remotePort)"]
@@ -51,6 +55,33 @@ final class ExecutionHostSSHTunnels {
     func isRunning(_ configuration: ExecutionHostSSHConfiguration) -> Bool {
         guard let current = processes[configuration.localPort], current.0 == configuration else { return false }
         return current.1.isRunning
+    }
+
+    /// Waits (bounded) until the ssh process Memex spawned owns the listening
+    /// socket on 127.0.0.1:localPort. Any other owner, including a process that
+    /// bound the port first, means the credential is never sent.
+    func requireOwnedListener(_ configuration: ExecutionHostSSHConfiguration, timeout: Duration = .seconds(10),
+                              owns: (pid_t, Int) -> Bool = ProcessSockets.listensOnLoopback) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while true {
+            guard let current = processes[configuration.localPort], current.0 == configuration, current.1.isRunning else {
+                throw HostFailure("ssh_connection", "SSH could not establish the tunnel. Check authentication, trusted host key, and ports with your SSH client.")
+            }
+            if owns(current.1.processIdentifier, configuration.localPort) { return }
+            guard ContinuousClock.now < deadline else {
+                throw HostFailure("ssh_tunnel", "Local port \(configuration.localPort) is not held by Memex's SSH tunnel. The execution credential was not sent.")
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    /// Restarts a stopped tunnel, then verifies listener ownership before each request.
+    nonisolated static func transportCheck(for connection: ExecutionHostConnection) -> ExecutionTransportCheck? {
+        guard let ssh = connection.ssh else { return nil }
+        return {
+            try await MainActor.run { _ = try ExecutionHostSSHTunnels.shared.start(ssh) }
+            try await ExecutionHostSSHTunnels.shared.requireOwnedListener(ssh)
+        }
     }
     func stop(_ configuration: ExecutionHostSSHConfiguration) {
         guard let current = processes[configuration.localPort], current.0 == configuration else { return }

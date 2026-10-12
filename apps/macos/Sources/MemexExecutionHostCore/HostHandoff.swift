@@ -70,9 +70,12 @@ final class HostHandoffSigner {
             throw HostFailure("handoff_identity", "Handoff receipt does not match the pinned peer, operation, and snapshot")
         }
     }
+    /// Encoded package bound. Transport limits for handoff install and abort
+    /// (`HostSocketServer.handoffRequestLimit`, Rust `MAX_HANDOFF_REQUEST_BYTES`) exceed it.
+    static let packageLimit = 30 * 1024 * 1024
     static func digest(_ package: HostHandoffPackage) throws -> String {
         let data = try encoded(package)
-        guard data.count <= 30 * 1024 * 1024 else { throw HostFailure("handoff_limit", "Combined native and workspace transfer exceeds 30 MiB") }
+        guard data.count <= packageLimit else { throw HostFailure("handoff_limit", "Combined native and workspace transfer exceeds 30 MiB") }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
     static func encoded<T: Encodable>(_ value: T) throws -> Data {

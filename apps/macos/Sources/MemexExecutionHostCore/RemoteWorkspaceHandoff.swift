@@ -23,6 +23,7 @@ public struct WorkspaceTransfer: Codable, Sendable {
 
 public final class RemoteWorkspaceHandoff {
     public static let byteLimit = 16 * 1024 * 1024
+    public static let entryLimit = 10_000
     private let directory: URL
     public init(directory: URL) { self.directory = directory }
     public func requireCleanDestination(_ root: URL) throws {
@@ -238,7 +239,7 @@ public final class RemoteWorkspaceHandoff {
     }
     private func validate(_ transfer: WorkspaceTransfer) throws {
         let count = transfer.bundle.count + transfer.index.count + transfer.indexObjects.values.reduce(0) { $0 + $1.count } + transfer.entries.reduce(0) { $0 + $1.data.count }
-        guard count <= Self.byteLimit, transfer.entries.count <= 10000,
+        guard count <= Self.byteLimit, transfer.entries.count <= Self.entryLimit,
               [40, 64].contains(transfer.head.count), transfer.head.allSatisfy(\.isHexDigit) else {
             throw HostFailure("handoff_limit", "Workspace transfer exceeds the 16 MiB or 10,000 entry bound, or has invalid Git identity")
         }
@@ -285,8 +286,9 @@ public final class RemoteWorkspaceHandoff {
                 kind = "file"; data = try RemoteWorkspaceAccess.captureFile(root: root, path: path, limit: Self.byteLimit)
             }
             bytes += data.count
-            guard bytes <= Self.byteLimit, entries.count < 10000 else { throw HostFailure("handoff_limit", "Working files exceed the transfer bound; no files were omitted") }
             entries.append(.init(path: path, kind: kind, mode: ((attributes[.posixPermissions] as? NSNumber)?.intValue ?? 0o644) & 0o777, data: data))
+            // Same inclusive bounds as validate(): at most entryLimit entries and byteLimit bytes.
+            guard bytes <= Self.byteLimit, entries.count <= Self.entryLimit else { throw HostFailure("handoff_limit", "Working files exceed the transfer bound; no files were omitted") }
         }
         return entries.sorted { $0.path < $1.path }
     }

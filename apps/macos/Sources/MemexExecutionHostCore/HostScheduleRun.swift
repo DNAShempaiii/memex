@@ -20,9 +20,13 @@ struct HostScheduleRun: Codable, Equatable {
     var nativeTurnID: String?
     var read = false
 
+    /// Statuses that no longer change. A skipped run never created a conversation turn.
+    static let finalStatuses: Set<String> = ["completed", "failed", "interrupted", "cancelled", "skipped"]
+    static let attentionStatuses: Set<String> = ["failed", "uncertain", "needs_input", "held", "skipped"]
+
     var needsAttention: Bool {
         guard !read, notificationPolicy != "never" else { return false }
-        if ["failed", "uncertain", "needs_input", "held"].contains(status) { return true }
+        if Self.attentionStatuses.contains(status) { return true }
         return notificationPolicy == "all" && ["completed", "interrupted"].contains(status)
     }
 

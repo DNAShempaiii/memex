@@ -3,10 +3,15 @@ import Darwin
 
 /// This endpoint never binds a network address. The Rust web gateway owns remote
 /// bearer authentication; same-user clients use the owner-only socket directly.
+/// The desktop endpoint additionally serves only the process that owns this
+/// root's control endpoint: the execution host. An agent shell running as the
+/// same user cannot read a secret that the host could not also expose, so the
+/// binding is to the host process itself rather than to a token file.
 public final class HostSocketServer: @unchecked Sendable {
     private let listener: Int32
     private let ownerLock: Int32
     private let socketURL: URL
+    private let requiredPeerListener: String?
     private let capacity = DispatchSemaphore(value: 8)
     private let stateLock = NSLock()
     private var stopped = false
@@ -26,6 +31,7 @@ public final class HostSocketServer: @unchecked Sendable {
         }
         ownerLock = lock
         socketURL = directory.appendingPathComponent(endpointName + ".sock")
+        requiredPeerListener = endpointName == "desktop" ? directory.appendingPathComponent("control.sock").path : nil
         listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard listener >= 0 else {
             Darwin.close(lock)
@@ -109,6 +115,12 @@ public final class HostSocketServer: @unchecked Sendable {
                 var noPipe: Int32 = 1
                 _ = setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noPipe, socklen_t(MemoryLayout<Int32>.size))
                 do {
+                    if let required = requiredPeerListener {
+                        guard let peer = ProcessSockets.peerProcess(of: client),
+                              ProcessSockets.listensOnUnixSocket(pid: peer, path: required) else {
+                            throw HostFailure("desktop_peer", "Only this root's execution host may use the desktop bridge")
+                        }
+                    }
                     let request = try Self.readRequest(client)
                     let response = handler(request)
                     var data = try JSONEncoder().encode(response)
@@ -116,28 +128,40 @@ public final class HostSocketServer: @unchecked Sendable {
                     data.append(10)
                     try Self.write(data, to: client)
                 } catch {
-                    let response = HostResponse(id: .null, error: HostFailure("transport", error.localizedDescription))
+                    let response = HostResponse(id: .null, error: (error as? HostFailure).flatMap { $0.code == "desktop_peer" ? $0 : nil }
+                        ?? HostFailure("transport", error.localizedDescription))
                     if var data = try? JSONEncoder().encode(response) { data.append(10); try? Self.write(data, to: client) }
                 }
             }
         }
     }
 
-    private static func readRequest(_ fd: Int32) throws -> HostRequest {
+    public static let requestLimit = 4 * 1024 * 1024
+    /// Handoff install and destination abort carry a whole package
+    /// (`HostHandoffSigner.packageLimit`) plus its certificate and envelope.
+    public static let handoffRequestLimit = 32 * 1024 * 1024
+    public static let largeRequestMethods: Set<String> = ["conversation.handoff.install", "conversation.handoff.abort"]
+    public static func requestLimit(for method: String) -> Int {
+        largeRequestMethods.contains(method) ? handoffRequestLimit : requestLimit
+    }
+
+    static func readRequest(_ fd: Int32) throws -> HostRequest {
         var data = Data()
-        var chunk = [UInt8](repeating: 0, count: 8192)
-        while data.count <= 4 * 1024 * 1024 {
+        var chunk = [UInt8](repeating: 0, count: 65536)
+        while data.count <= handoffRequestLimit {
             let count = Darwin.read(fd, &chunk, chunk.count)
             if count < 0 && errno == EINTR { continue }
             guard count > 0 else { throw HostFailure("transport", "Incomplete execution request") }
             if let end = chunk.prefix(count).firstIndex(of: 10) {
                 data.append(contentsOf: chunk[..<end])
-                guard data.count <= 4 * 1024 * 1024 else { break }
-                return try JSONDecoder().decode(HostRequest.self, from: data)
+                guard data.count <= handoffRequestLimit else { break }
+                let request = try JSONDecoder().decode(HostRequest.self, from: data)
+                guard data.count <= requestLimit(for: request.method) else { break }
+                return request
             }
             data.append(contentsOf: chunk.prefix(count))
         }
-        throw HostFailure("request_limit", "Execution request exceeds 4 MiB")
+        throw HostFailure("request_limit", "Execution request exceeds 4 MiB (32 MiB for handoff install and abort)")
     }
 
     private static func write(_ data: Data, to fd: Int32) throws {

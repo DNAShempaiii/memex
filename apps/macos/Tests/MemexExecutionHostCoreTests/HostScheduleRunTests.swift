@@ -7,6 +7,7 @@ final class HostScheduleRunTests: XCTestCase {
         var created: [HostedConversation] = []
         var commands: [HostedCommand] = []
         var failCreation = false
+        var failDeliveries = false
         func create(id: String, provider: String, workspaceID: String, cwd: String, title: String) throws -> HostedConversation {
             let value = HostedConversation(id: id, nativeSessionID: "native-" + id, provider: provider,
                 providerInstanceID: "test", workspaceID: workspaceID, cwd: cwd, title: title, createdAt: "2026-10-05T12:00:00Z")
@@ -15,7 +16,11 @@ final class HostScheduleRunTests: XCTestCase {
             return value
         }
         func resume(_ conversation: HostedConversation) throws {}
-        func read(_ conversation: HostedConversation) throws -> HostValue { .object(["ready": .bool(true), "running": .bool(false)]) }
+        func read(_ conversation: HostedConversation) throws -> HostValue {
+            .object(["ready": .bool(true), "running": .bool(false), "deliveries": .array(failDeliveries ? commands.map {
+                .object(["commandId": .string($0.id), "status": .string("failed"), "error": .string("provider rejected")])
+            } : [])])
+        }
         func perform(_ command: HostedCommand) throws -> HostValue { commands.append(command); return .bool(true) }
         func isConnected(_ id: String) -> Bool { true }
     }
@@ -109,5 +114,31 @@ final class HostScheduleRunTests: XCTestCase {
         XCTAssertTrue(run.needsAttention)
         run.notificationPolicy = "never"
         XCTAssertFalse(run.needsAttention)
+    }
+
+    func testRunsListIsBoundedNewestFirstAndFinishedReadRunsExpire() throws {
+        try fixture { directory, workspace, provider in
+            var current = Date(timeIntervalSince1970: 1_800_000_000)
+            let host = try ExecutionHost(directory: directory, workspaceRoots: [workspace], providerFactory: { _ in provider }, now: { current })
+            provider.failDeliveries = true
+            _ = try call(host, "schedule.upsert", ["scheduleId": .string("event"), "text": .string("Inspect"), "eventName": .string("build"),
+                "newConversation": .object(["workspaceId": .string(workspace.path), "provider": .string("codex")])])
+            for event in ["one", "two", "three"] {
+                _ = try call(host, "schedule.event", ["eventName": .string("build"), "eventId": .string(event)])
+            }
+            try host.tick(); try host.tick()
+            let runs = try call(host, "schedule.runs").array
+            XCTAssertEqual(runs.map { $0["status"].string }, ["failed", "failed", "failed"])
+            XCTAssertTrue(runs.first?["id"].string?.hasSuffix("three") == true)
+            XCTAssertEqual(try call(host, "schedule.runs", ["limit": .number(2)]).array.map(\.["id"]), Array(runs.prefix(2)).map(\.["id"]))
+            XCTAssertEqual(try call(host, "schedule.runs", ["since": .string(current.addingTimeInterval(-1).ISO8601Format())]).array.count, 3)
+            XCTAssertTrue(try call(host, "schedule.runs", ["since": .string(current.addingTimeInterval(1).ISO8601Format())]).array.isEmpty)
+            XCTAssertThrowsError(try call(host, "schedule.runs", ["limit": .number(0)]))
+            for run in runs.dropFirst() { _ = try call(host, "schedule.run.read", ["runId": run["id"]]) }
+            current = current.addingTimeInterval(31 * 24 * 60 * 60)
+            _ = try call(host, "schedule.pause", ["scheduleId": .string("event")])
+            // Read, finished runs age out; the unread failure stays in the inbox.
+            XCTAssertEqual(try call(host, "schedule.runs").array.map(\.["id"]), [runs[0]["id"]])
+        }
     }
 }

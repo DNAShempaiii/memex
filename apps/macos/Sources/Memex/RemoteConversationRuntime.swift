@@ -16,7 +16,8 @@ actor RemoteConversationRuntime: ConversationRuntime {
 
     init(connection: ExecutionHostConnection, token: String, conversationID: String? = nil, outbox: URL? = nil) throws {
         self.connection = connection
-        client = try ExecutionHostHTTPClient(endpoint: connection.endpoint, token: token, hostID: connection.id, outbox: outbox)
+        client = try ExecutionHostHTTPClient(endpoint: connection.endpoint, token: token, hostID: connection.id, outbox: outbox,
+            transportCheck: ExecutionHostSSHTunnels.transportCheck(for: connection))
         self.conversationID = conversationID
     }
 

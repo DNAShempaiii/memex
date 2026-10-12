@@ -96,4 +96,23 @@ import MemexExecutionHostCore
             request: { _, _ in Issue.record("Inactive app must not poll"); return .null }, isActive: { false })
         await inactive.pollOnce()
     }
+
+    @Test func seenVersionsAreBoundedToTheHostsCurrentRunWindow() async throws {
+        let suite = "schedule-notifications-window-" + UUID().uuidString
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let notifications = ConversationNotifications()
+        notifications.preferences.mode = .notifications
+        var events: [HostScheduleNotificationEvent] = []
+        notifications.deliverSchedule = { event, _ in events.append(event) }
+        let observer = HostScheduleObserver(notifications: notifications, defaults: defaults, isActive: { true })
+        await observer.observe(hostID: "host", hostName: "Host", runs: [run("old")])
+        await observer.observe(hostID: "host", hostName: "Host", runs: [run("new", version: "two")])
+        let saved = try #require(defaults.data(forKey: "memex.schedule-run-notification-seen.v1"))
+        let seen = try JSONDecoder().decode([String: [String: String]].self, from: saved)
+        #expect(seen["host"].map { Array($0.keys) } == ["new"])
+        #expect(events.map(\.runID) == ["new"])
+        await observer.observe(hostID: "host", hostName: "Host", runs: [run("skipped", status: "skipped")])
+        #expect(events.last?.status == "skipped")
+    }
 }
