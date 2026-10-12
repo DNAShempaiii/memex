@@ -12,6 +12,14 @@ struct ConversationPendingView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let notice = conversation.notice {
+                HStack(alignment: .top) {
+                    Text(notice).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    Spacer()
+                    Button { conversation.clearNotice() } label: { Image(systemName: "xmark") }
+                        .buttonStyle(.plain).accessibilityLabel("Dismiss")
+                }
+            }
             if let pending = conversation.pendingPrompt {
                 HStack {
                     Spacer(minLength: 30)

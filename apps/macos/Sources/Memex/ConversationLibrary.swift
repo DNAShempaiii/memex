@@ -60,7 +60,7 @@ final class ConversationLibrary {
     func reload() {
         guard let directory else { return }
         do {
-            let saved = try read(directory)
+            let saved = try Self.read(directory)
             entries = saved.entries
             sections = saved.sections ?? []
             error = nil
@@ -77,6 +77,29 @@ final class ConversationLibrary {
     @discardableResult
     func markRead(_ sessions: [Session], read: Bool) -> Bool {
         update(sessions) { $0.unread = !read }
+    }
+
+    /// Opening a conversation clears only an explicit unread mark. It never
+    /// creates metadata for a browsed conversation, writes on the main actor,
+    /// or reports a contended lock: the mark is retried in the background and,
+    /// if it still cannot be saved, simply returns on the next reload.
+    func markOpened(_ session: Session) {
+        guard entries[session.id]?.unread == true else { return }
+        entries[session.id]?.unread = false
+        guard let directory else { return }
+        let id = session.id
+        Task.detached(priority: .utility) {
+            for attempt in 1...5 {
+                do {
+                    _ = try Self.write(directory, lockAttempts: 10) { saved in
+                        if saved.entries[id]?.unread == true { saved.entries[id]?.unread = false }
+                    }
+                    return
+                } catch {
+                    try? await Task.sleep(for: .milliseconds(200 * attempt))
+                }
+            }
+        }
     }
 
     @discardableResult
@@ -236,7 +259,31 @@ final class ConversationLibrary {
         else { saved.entries[session.id]?.session = session }
     }
 
-    private func read(_ directory: URL) throws -> Saved {
+    private nonisolated static func write(_ directory: URL, lockAttempts: Int,
+                                          body: (inout Saved) -> Void) throws -> Saved {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        let descriptor = Darwin.open(directory.appendingPathComponent("organization.lock").path,
+                                     O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else { throw POSIXError(.EIO) }
+        defer { Darwin.close(descriptor) }
+        var attempt = 1
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            guard attempt < lockAttempts else { throw POSIXError(.EAGAIN) }
+            attempt += 1
+            usleep(2_000)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+        var saved = try read(directory)
+        body(&saved)
+        saved.version = 2
+        let file = directory.appendingPathComponent("organization.json")
+        try JSONEncoder().encode(saved).write(to: file, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        return saved
+    }
+
+    private nonisolated static func read(_ directory: URL) throws -> Saved {
         let file = directory.appendingPathComponent("organization.json")
         do {
             let saved = try JSONDecoder().decode(Saved.self, from: Data(contentsOf: file))
@@ -252,20 +299,8 @@ final class ConversationLibrary {
     private func mutate(_ body: (inout Saved) -> Void) -> Bool {
         do {
             if let directory {
-                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                        attributes: [.posixPermissions: 0o700])
-                let descriptor = Darwin.open(directory.appendingPathComponent("organization.lock").path,
-                                             O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
-                guard descriptor >= 0 else { throw POSIXError(.EIO) }
-                defer { Darwin.close(descriptor) }
-                guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else { throw POSIXError(.EAGAIN) }
-                defer { _ = flock(descriptor, LOCK_UN) }
-                var saved = try read(directory)
-                body(&saved)
-                saved.version = 2
-                let file = directory.appendingPathComponent("organization.json")
-                try JSONEncoder().encode(saved).write(to: file, options: [.atomic])
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                // A background read mark may hold the lock briefly; wait a few milliseconds.
+                let saved = try Self.write(directory, lockAttempts: 5, body: body)
                 entries = saved.entries
                 sections = saved.sections ?? []
             } else {

@@ -28,7 +28,33 @@ public enum NativeConversationOwnership {
         throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
     }
 
+    /// The same check for UI callers. It never blocks the caller's executor:
+    /// `lsof` runs on a detached task with a deadline, and cancelling the
+    /// caller terminates the inspection.
+    public static func isOpenElsewhere(provider: String, nativeSessionID: String, sourceURL: URL,
+                                       providerHome: URL, timeout: Duration) async throws -> Bool {
+        if provider == "claude" { return try await hasExternalWriter(at: sourceURL, timeout: timeout) }
+        return try await Task.detached {
+            try isOpenElsewhere(provider: provider, nativeSessionID: nativeSessionID,
+                                sourceURL: sourceURL, providerHome: providerHome)
+        }.value
+    }
+
     public static func hasExternalWriter(at file: URL) throws -> Bool {
+        try hasExternalWriter(at: file, timeout: nil, inspection: nil)
+    }
+
+    public static func hasExternalWriter(at file: URL, timeout: Duration) async throws -> Bool {
+        let inspection = WriterInspection()
+        return try await withTaskCancellationHandler {
+            try await Task.detached {
+                try hasExternalWriter(at: file, timeout: timeout, inspection: inspection)
+            }.value
+        } onCancel: { inspection.stop(.cancelled) }
+    }
+
+    private static func hasExternalWriter(at file: URL, timeout: Duration?,
+                                          inspection: WriterInspection?) throws -> Bool {
         guard FileManager.default.fileExists(atPath: file.path) else { return false }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
@@ -36,9 +62,19 @@ public enum NativeConversationOwnership {
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
-        try process.run()
+        if let inspection { try inspection.start(process) } else { try process.run() }
+        if let inspection, let timeout {
+            let (seconds, attoseconds) = timeout.components
+            let delay = Double(seconds) + Double(attoseconds) / 1e18
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) { inspection.stop(.expired) }
+        }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        switch inspection?.outcome {
+        case .cancelled: throw CancellationError()
+        case .expired: throw NativeConversationOwnershipError.timedOut
+        case nil: break
+        }
         guard process.terminationReason == .exit, [0, 1].contains(process.terminationStatus) else {
             throw NativeConversationOwnershipError.inspectionFailed
         }
@@ -56,9 +92,38 @@ public enum NativeConversationOwnership {
 
 }
 
+/// Owns one `lsof` run so its deadline or the caller's cancellation can end it.
+private final class WriterInspection: @unchecked Sendable {
+    enum Outcome { case cancelled, expired }
+    private let lock = NSLock()
+    private var process: Process?
+    private var stoppedBy: Outcome?
+
+    var outcome: Outcome? { lock.withLock { stoppedBy } }
+
+    func start(_ process: Process) throws {
+        try lock.withLock {
+            if stoppedBy != nil { throw CancellationError() }
+            try process.run()
+            self.process = process
+        }
+    }
+
+    func stop(_ reason: Outcome) {
+        lock.withLock {
+            guard stoppedBy == nil else { return }
+            stoppedBy = reason
+            if let process, process.isRunning { process.terminate() }
+        }
+    }
+}
+
 private enum NativeConversationOwnershipError: LocalizedError {
-    case inspectionFailed
+    case inspectionFailed, timedOut
     var errorDescription: String? {
-        "The system could not inspect the native transcript's active writers."
+        switch self {
+        case .inspectionFailed: "The system could not inspect the native transcript's active writers."
+        case .timedOut: "Inspecting the native transcript's active writers took too long."
+        }
     }
 }

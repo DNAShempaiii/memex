@@ -23,9 +23,12 @@ final class ConversationDictation {
     init(directory: URL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/dev.memex.app/Dictation")) {
         self.directory = directory
-        recordingURL = (try? FileManager.default.contentsOfDirectory(at: directory,
-            includingPropertiesForKeys: nil))?.filter { $0.pathExtension == "m4a" }
-            .sorted { $0.lastPathComponent > $1.lastPathComponent }.first
+        let recordings = ((try? FileManager.default.contentsOfDirectory(at: directory,
+            includingPropertiesForKeys: nil)) ?? []).filter { $0.pathExtension == "m4a" }
+            .sorted { $0.lastPathComponent > $1.lastPathComponent }
+        // Only the newest recording is recoverable from this view; older ones are orphans.
+        recordingURL = recordings.first
+        for orphan in recordings.dropFirst() { try? FileManager.default.removeItem(at: orphan) }
     }
 
     func start() async {
@@ -41,7 +44,7 @@ final class ConversationDictation {
         defer { if phase == .authorizing { phase = .idle } }
         let microphone = await AVCaptureDevice.requestAccess(for: .audio)
         let speech = await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0 == .authorized) }
+            SFSpeechRecognizer.requestAuthorization(Self.authorizationHandler(continuation))
         }
         guard generation == token else { return }
         guard microphone && speech else {
@@ -61,6 +64,8 @@ final class ConversationDictation {
             guard recorder.record(forDuration: 120) else { throw ConversationRuntimeError(message: "The microphone could not start recording.") }
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             self.recorder = recorder
+            // The new recording supersedes the previous one; keep only the current one.
+            if let previous = recordingURL, previous != url { try? FileManager.default.removeItem(at: previous) }
             recordingURL = url
             transcript = ""
             error = nil
@@ -97,28 +102,52 @@ final class ConversationDictation {
         generation = token
         phase = .transcribing
         error = nil
-        recognition = recognizer.recognitionTask(with: request) { [weak self] result, failure in
-            let text = result?.bestTranscription.formattedString
-            let finished = result?.isFinal == true
-            let message = failure?.localizedDescription
-            Task { @MainActor in
-                guard let self, self.generation == token else { return }
-                if let text { self.transcript = text }
-                if finished || message != nil {
-                    self.phase = .idle
-                    self.error = message.map { "Transcription failed: \($0). Your recording is retained; retry or export it." }
-                    self.recognition = nil
-                    self.recognitionLimit?.cancel()
-                    self.recognitionLimit = nil
-                }
-            }
-        }
+        recognition = recognizer.recognitionTask(with: request, resultHandler: Self.recognitionHandler(self, token: token))
         recognitionLimit = Task { [weak self] in
             do { try await Task.sleep(for: .seconds(90)) } catch { return }
             guard let self, self.generation == token, self.phase == .transcribing else { return }
             self.cancel()
             self.error = "Transcription timed out. Your recording is retained; retry or export it."
         }
+    }
+
+    private func receiveRecognition(text: String?, finished: Bool, message: String?, token: UUID) {
+        guard generation == token else { return }
+        if let text { transcript = text }
+        if finished || message != nil {
+            phase = .idle
+            error = message.map { "Transcription failed: \($0). Your recording is retained; retry or export it." }
+            recognition = nil
+            recognitionLimit?.cancel()
+            recognitionLimit = nil
+        }
+    }
+
+    // Speech calls these handlers on its own queues. Forming them outside the
+    // main actor keeps them nonisolated whatever the SDK annotations infer;
+    // state changes hop back to the main actor.
+    private nonisolated static func authorizationHandler(_ continuation: CheckedContinuation<Bool, Never>)
+        -> @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void {
+        { continuation.resume(returning: $0 == .authorized) }
+    }
+
+    private nonisolated static func recognitionHandler(_ owner: ConversationDictation, token: UUID)
+        -> @Sendable (SFSpeechRecognitionResult?, (any Error)?) -> Void {
+        { [weak owner] result, failure in
+            let text = result?.bestTranscription.formattedString
+            let finished = result?.isFinal == true
+            let message = failure?.localizedDescription
+            Task { @MainActor in
+                owner?.receiveRecognition(text: text, finished: finished, message: message, token: token)
+            }
+        }
+    }
+
+    /// The transcript reached the draft, so its recording is no longer needed.
+    func discardInsertedRecording() {
+        guard phase == .idle, let recordingURL else { return }
+        try? FileManager.default.removeItem(at: recordingURL)
+        self.recordingURL = nil
     }
 
     func cancel() {
@@ -182,7 +211,7 @@ struct ConversationDictationView: View {
                 }.disabled(dictation.recordingURL == nil || dictation.phase != .idle)
                 Spacer()
                 Button("Close") { dictation.cancel(); dismiss() }
-                Button("Insert into draft") { insert(dictation.transcript); dismiss() }
+                Button("Insert into draft") { insert(dictation.transcript); dictation.discardInsertedRecording(); dismiss() }
                     .disabled(dictation.phase != .idle || dictation.transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }.padding(20).frame(width: 580)

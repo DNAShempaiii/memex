@@ -190,6 +190,9 @@ final class Store {
             guard let self else { throw ConversationRuntimeError(message: "The workspace closed before the draft could be saved.") }
             try await self.transferQueuedPrompt(source: source, entry: entry)
         }
+        self.liveConversations.onResolveQueuedTransfer = { [weak self] source, entry, resolution in
+            try self?.resolveQueuedTransfer(source: source, entry: entry, resolution: resolution)
+        }
     }
 
     enum Scope: Hashable {
@@ -403,7 +406,7 @@ final class Store {
     var readerRequestID: String { readerPositionKey }
 
     func openConversation(_ session: Session) {
-        conversationLibrary.markRead([nativeLibrarySession(session)], read: true)
+        conversationLibrary.markOpened(session)
         if scope == .home { scope = homeProject.map(Scope.project) ?? .all }
         selectedID = session.id
     }

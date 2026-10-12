@@ -3,7 +3,9 @@ import Foundation
 import Observation
 
 struct ConversationRuntimeError: LocalizedError, Sendable {
-    enum Kind: Sendable { case other, openElsewhere, settingsRejected }
+    /// `notStarted`: failed before any provider request, so nothing was created.
+    /// `transferUnresolved`: a side-chat creation outcome needs user inspection.
+    enum Kind: Sendable { case other, openElsewhere, settingsRejected, notStarted, transferUnresolved }
     let message: String
     var kind: Kind = .other
     var errorDescription: String? { message }
@@ -106,7 +108,9 @@ final class LiveConversation {
     private(set) var attachmentError: String?
     private(set) var loadingAttachments = false
     private(set) var pendingPrompt: ConversationPendingPrompt?
-    private(set) var queue: [ConversationQueuedPrompt] = []
+    /// An empty queue has nothing to hold. Dropping the hold here keeps an
+    /// interruption from silently pausing follow-ups queued later.
+    private(set) var queue: [ConversationQueuedPrompt] = [] { didSet { if queue.isEmpty { queueHeld = false } } }
     private(set) var queueHeld = false
     private(set) var snapshot = ConversationSnapshot()
     private(set) var hasSnapshot = false
@@ -123,6 +127,7 @@ final class LiveConversation {
     private var applyingSettings = false
     private(set) var error: String?
     private(set) var settingsError: String?
+    private(set) var notice: String?
     private(set) var ownership: Ownership = .available
     private(set) var revision = 0
     private(set) var focusRequest = 0
@@ -132,6 +137,9 @@ final class LiveConversation {
     private var stopping = false
     private var restartRequested = false
     private(set) var transferringQueue = false
+    /// Queued entries whose side-chat creation could not be confirmed.
+    private(set) var unresolvedTransferIDs: Set<String> = []
+    @ObservationIgnored private var transferFailure: String?
     private var adoptingCreatedSession: Bool
     @ObservationIgnored private let drafts: ConversationDraftStore?
     @ObservationIgnored private var runtime: (any ConversationRuntime)?
@@ -139,9 +147,14 @@ final class LiveConversation {
     @ObservationIgnored private var connectionWaiter: CheckedContinuation<Bool, Never>?
     @ObservationIgnored private let makeRuntime: @Sendable () -> any ConversationRuntime
     @ObservationIgnored private let resolveTarget: @Sendable (Session) throws -> InAppResumeTarget
-    @ObservationIgnored private let checkOwnership: (Session) throws -> Bool
+    @ObservationIgnored private let checkOwnership: @MainActor (Session) async throws -> Bool
+    @ObservationIgnored private var ownershipProbe: Task<Result<Bool, Error>, Never>?
+    @ObservationIgnored private var ownershipProbeID = 0
+    /// Set while an outgoing prompt is being saved, before it reaches the runtime.
+    @ObservationIgnored private var savingPromptID: String?
     @ObservationIgnored var onNotificationState: ((Session, ConversationNotificationState) -> Void)?
     @ObservationIgnored var onTransferQueuedPrompt: ((Session, ConversationQueuedPrompt) async throws -> Void)?
+    @ObservationIgnored var onResolveQueuedTransfer: ((Session, ConversationQueuedPrompt, QueuedTransferResolution) throws -> Void)?
     @ObservationIgnored var beforePrompt: ((Session, ConversationCommand) async -> Void)?
     @ObservationIgnored var afterTurn: ((Session, ConversationSnapshot) async -> Void)?
     @ObservationIgnored private var stopTimeout: Task<Void, Never>?
@@ -151,7 +164,7 @@ final class LiveConversation {
 
     init(session: Session, makeRuntime: @escaping @Sendable () -> any ConversationRuntime = { InAppAgentRuntime.make() },
          resolveTarget: @escaping @Sendable (Session) throws -> InAppResumeTarget = { try InAppResumeTarget.resolve($0) },
-         checkOwnership: @escaping (Session) throws -> Bool = ConversationOwnership.isOpenElsewhere,
+         checkOwnership: @escaping @MainActor (Session) async throws -> Bool = { try await ConversationOwnership.probe($0) },
          drafts: ConversationDraftStore? = nil, adoptingCreatedSession: Bool = false, isServerOwned: Bool = false,
          stopTimeoutDuration: Duration = .seconds(15)) {
         self.session = session
@@ -179,12 +192,35 @@ final class LiveConversation {
             // viewer opened without further edits cannot erase saved intent.
             draft = saved.text
         }
-        refreshOwnership()
+        // Ownership is probed asynchronously by the viewer and before any
+        // connect or send; constructing a viewer never runs a probe.
     }
 
     private func persistDraft() {
         drafts?.set(.init(text: draft, deliveryUncertain: deliveryUncertain, attachments: attachments,
-                         pendingPrompt: pendingPrompt, queue: queue, queueHeld: queueHeld), for: session.id)
+                         pendingPrompt: pendingPrompt, queue: queue, queueHeld: queueHeld && !queue.isEmpty),
+                    for: session.id)
+    }
+
+    /// Interruptions pause only work that is already queued.
+    private func holdQueueIfNeeded() {
+        if !queue.isEmpty { queueHeld = true }
+    }
+
+    /// An interruption cannot learn whether an in-flight prompt reached the
+    /// provider. A prompt still being saved locally is known unsent; anything
+    /// later needs review. Neither is ever resent automatically.
+    private func settleInterruptedPrompt() {
+        guard let pending = pendingPrompt, pending.phase == .awaitingConfirmation else { return }
+        if pending.commandID == savingPromptID {
+            pendingPrompt?.phase = .notSent
+            deliveryUncertain = false
+        } else {
+            pendingPrompt?.phase = .uncertain
+            deliveryUncertain = true
+        }
+        snapshot.pendingPrompt = false
+        persistDraft()
     }
 
     var draftSaveError: String? { drafts?.error }
@@ -208,14 +244,52 @@ final class LiveConversation {
         return nil
     }
 
-    func refreshOwnership() {
-        // Once our provider is loading or connected, its own writer lock is
-        // expected. Only inspect ownership before opening a native session.
-        guard !adoptingCreatedSession, !connecting, !snapshot.connected else { return }
-        do {
-            ownership = try checkOwnership(session) ? .openElsewhere : .available
-        } catch {
+    /// Once our provider is loading or connected, its own writer lock is
+    /// expected. Only inspect ownership before opening a native session.
+    private var canProbeOwnership: Bool { !adoptingCreatedSession && !connecting && !snapshot.connected }
+    var isProbingOwnership: Bool { ownershipProbe != nil }
+
+    /// The probe runs off the main actor. Probes never overlap: a newer one
+    /// waits for the previous inspection, and only the newest result applies.
+    func refreshOwnership() async {
+        guard canProbeOwnership else { return }
+        ownershipProbeID &+= 1
+        let id = ownershipProbeID
+        let previous = ownershipProbe
+        let session = session
+        let check = checkOwnership
+        let probe = Task { @MainActor () -> Result<Bool, Error> in
+            _ = await previous?.value
+            do { return .success(try await check(session)) } catch { return .failure(error) }
+        }
+        ownershipProbe = probe
+        let result = await withTaskCancellationHandler { await probe.value } onCancel: { probe.cancel() }
+        guard ownershipProbeID == id else { return }
+        ownershipProbe = nil
+        guard canProbeOwnership, !Task.isCancelled else { return }
+        switch result {
+        case .success(let elsewhere): ownership = elsewhere ? .openElsewhere : .available
+        case .failure(is CancellationError): break
+        case .failure(let error):
             ownership = .unavailable("Could not check whether this conversation is open elsewhere: \(error.localizedDescription)")
+        }
+    }
+
+    /// Viewer polling: skipped while our provider is loading or connected, while
+    /// the app is inactive, or while a probe is already running. Unchanged
+    /// results back off so an idle transcript is not inspected every few seconds.
+    func monitorOwnership(isActive: @MainActor () -> Bool = { true }) async {
+        let minimum = Duration.seconds(2)
+        var interval = minimum
+        while !Task.isCancelled {
+            if !canProbeOwnership {
+                interval = minimum
+            } else if isActive(), !isProbingOwnership {
+                let before = ownership
+                await refreshOwnership()
+                interval = ownership == before ? min(interval * 2, .seconds(16)) : minimum
+            }
+            do { try await Task.sleep(for: interval) } catch { return }
         }
     }
 
@@ -261,6 +335,7 @@ final class LiveConversation {
     var canMutateHistory: Bool { canSend && !preparingPrompt && snapshot.canMutateHistory && pendingPrompt == nil && queue.isEmpty }
     var canStop: Bool {
         !stopping && (connecting || (preparingPrompt && pendingPrompt?.phase == .preparing)
+            || (preparingPrompt && pendingPrompt?.phase == .awaitingConfirmation && pendingPrompt?.commandID == savingPromptID)
             || (snapshot.connected && snapshot.canCancel && (snapshot.running || snapshot.pendingPrompt) && !submittingControl))
     }
     private var visibleStart: Int {
@@ -329,7 +404,7 @@ final class LiveConversation {
         changingHistory = true
         let token = generation
         defer { if generation == token { changingHistory = false } }
-        queueHeld = true
+        holdQueueIfNeeded()
         persistDraft()
         await drafts?.flush()
         guard generation == token else { throw ConversationRuntimeError(message: "The connection changed before history could be updated.") }
@@ -355,11 +430,15 @@ final class LiveConversation {
     }
 
     @discardableResult
-    func connect() async -> Bool {
-        refreshOwnership()
+    func connect() async -> Bool { await connect(ownershipChecked: false) }
+
+    private func connect(ownershipChecked: Bool) async -> Bool {
+        if !ownershipChecked { await refreshOwnership() }
         guard ownership == .available, !connecting else { return false }
         adoptingCreatedSession = false
         finishConnecting(false)
+        finishSettings(false)
+        settleInterruptedPrompt()
         let token = UUID()
         generation = token
         checkpointCaptures.removeAll()
@@ -473,7 +552,7 @@ final class LiveConversation {
     }
 
     private func connectionFailed(_ failure: ConversationRuntimeError) async {
-        queueHeld = true
+        holdQueueIfNeeded()
         settleStop()
         finishSettings(false)
         generation = UUID()
@@ -489,11 +568,7 @@ final class LiveConversation {
         snapshot.running = false
         snapshot.pendingPrompt = false
         snapshot.controls = nil
-        if pendingPrompt?.phase == .awaitingConfirmation {
-            pendingPrompt?.phase = .uncertain
-            deliveryUncertain = true
-            persistDraft()
-        }
+        settleInterruptedPrompt()
         if failure.kind == .openElsewhere {
             ownership = .openElsewhere
             // Resume was rejected before a prompt could be delivered. Unlocking
@@ -519,8 +594,9 @@ final class LiveConversation {
     }
 
     func send() async {
-        refreshOwnership()
+        await refreshOwnership()
         guard canSubmit, hasPrompt else { return }
+        notice = nil
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = attachments
         let command = ConversationCommand(.prompt, text: text, attachments: attachments)
@@ -536,7 +612,7 @@ final class LiveConversation {
         }
         // Browsing history does not launch a provider. The first explicit send
         // loads its original session, then sends exactly once when it is ready.
-        if !connectionAttempted, !(await connect()) { return }
+        if !connectionAttempted, !(await connect(ownershipChecked: true)) { return }
         guard canSend else { return }
         completion = nil
         stopping = false
@@ -645,12 +721,13 @@ final class LiveConversation {
     private func waitForSettings(_ predicate: @escaping (ConversationControls) -> Bool) async -> Bool {
         if settingsError != nil { return false }
         if let controls = snapshot.controls, !controls.pendingChanges, predicate(controls) { return true }
+        let token = generation
         return await withCheckedContinuation { continuation in
             finishSettings(false)
             settingsWaiter = (predicate, continuation)
             settingsTimeout = Task { [weak self] in
                 do { try await Task.sleep(for: .seconds(15)) } catch { return }
-                guard let self, self.settingsWaiter != nil else { return }
+                guard let self, self.generation == token, self.settingsWaiter != nil else { return }
                 self.error = "The agent did not confirm the selected settings. Your draft has been retained."
                 self.finishSettings(false)
                 self.notifyState()
@@ -673,6 +750,7 @@ final class LiveConversation {
     }
 
     func clearSettingsError() { settingsError = nil }
+    func clearNotice() { notice = nil }
 
     /// Explicit fallback: stop first, then submit this retained draft only after
     /// the provider reports idle. A failure, timeout, reconnect or edit cancels it.
@@ -687,8 +765,12 @@ final class LiveConversation {
             do { try await Task.sleep(for: .milliseconds(50)) } catch { restartRequested = false; return }
         }
         guard restartRequested, generation == token, error == nil,
-              draft == text, attachments == captured, canSend else { restartRequested = false; return }
+              draft == text, attachments == captured else { restartRequested = false; return }
         restartRequested = false
+        guard canSend else {
+            notice = "The agent stopped, but it is not ready for a new turn yet. Your draft was not sent; send it when the conversation is ready."
+            return
+        }
         await send()
     }
 
@@ -702,6 +784,7 @@ final class LiveConversation {
         guard draftSaveError == nil else { return }
         do {
             try await transfer(session, entry)
+            unresolvedTransferIDs.remove(entry.id)
             guard let index = queue.firstIndex(where: { $0 == entry }) else {
                 error = "The side-chat draft was saved, but the original queued message changed. Review both drafts before sending."
                 return
@@ -709,6 +792,25 @@ final class LiveConversation {
             queue.remove(at: index)
             persistDraft()
             await drafts?.flush()
+            // Only after the queue durably dropped the entry can no retry repeat it.
+            if draftSaveError == nil { try? onResolveQueuedTransfer?(session, entry, .delivered) }
+        } catch {
+            if (error as? ConversationRuntimeError)?.kind == .transferUnresolved { unresolvedTransferIDs.insert(entry.id) }
+            transferFailure = error.localizedDescription
+            self.error = error.localizedDescription
+        }
+    }
+
+    /// Explicit recovery after the user inspected the provider's conversations.
+    /// It releases the unconfirmed reservation; it never creates or sends.
+    func markQueuedTransferInspected(id: String) {
+        guard unresolvedTransferIDs.contains(id), let resolve = onResolveQueuedTransfer,
+              let entry = queue.first(where: { $0.id == id }) else { return }
+        do {
+            try resolve(session, entry, .inspected)
+            unresolvedTransferIDs.remove(id)
+            if let transferFailure, error == transferFailure { error = nil }
+            transferFailure = nil
         } catch { self.error = error.localizedDescription }
     }
 
@@ -845,7 +947,7 @@ final class LiveConversation {
 
     func stop(preservingRestart: Bool = false) async {
         if !preservingRestart { restartRequested = false }
-        queueHeld = true
+        holdQueueIfNeeded()
         persistDraft()
         if connecting {
             await disconnect()
@@ -859,14 +961,23 @@ final class LiveConversation {
             }
             return
         }
-        if preparingPrompt, pendingPrompt?.phase == .preparing {
-            // The checkpoint callback has not crossed the provider boundary.
-            // Let it finish its file work, but invalidate this local dispatch.
+        if preparingPrompt, let pending = pendingPrompt,
+           pending.phase == .preparing || pending.commandID == savingPromptID {
+            // The checkpoint callback or the pre-dispatch save has not crossed
+            // the provider boundary. Let it finish its file work, but invalidate
+            // this local dispatch so the prompt returns to the draft unsent.
             pendingPrompt?.phase = .notSent
-            completion = .stopped
+            if pending.phase == .awaitingConfirmation {
+                deliveryUncertain = false
+                snapshot.pendingPrompt = false
+            }
             persistDraft()
-            notifyState()
-            return
+            // A cancelled steer leaves its running turn; continue to stop that turn.
+            if pending.isSteer != true || !canStop {
+                completion = .stopped
+                notifyState()
+                return
+            }
         }
         guard canStop else { return }
         stopping = true
@@ -924,9 +1035,15 @@ final class LiveConversation {
             // awaiting acknowledgement must restore a draft that requires review.
             deliveryUncertain = true
             pendingPrompt?.phase = .awaitingConfirmation
+            savingPromptID = command.id
             persistDraft()
             await drafts?.flush()
+            if savingPromptID == command.id { savingPromptID = nil }
             guard generation == token else { return false }
+            // Stop during the save cancels this prompt before the provider boundary.
+            guard pendingPrompt?.commandID == command.id, pendingPrompt?.phase == .awaitingConfirmation else {
+                return false
+            }
             guard draftSaveError == nil else {
                 deliveryUncertain = false
                 pendingPrompt?.phase = .notSent
@@ -966,7 +1083,7 @@ final class LiveConversation {
 
     func disconnect() async {
         restartRequested = false
-        queueHeld = true
+        holdQueueIfNeeded()
         settleStop()
         finishSettings(false)
         generation = UUID()
@@ -986,6 +1103,7 @@ final class LiveConversation {
         snapshot.controls = nil
         snapshot.approvals = []
         snapshot.questions = []
+        settleInterruptedPrompt()
         let previous = runtime
         runtime = nil
         persistDraft()
@@ -1020,6 +1138,9 @@ final class LiveConversations {
     @ObservationIgnored var onTransferQueuedPrompt: ((Session, ConversationQueuedPrompt) async throws -> Void)? {
         didSet { for conversation in sessions.values { conversation.onTransferQueuedPrompt = onTransferQueuedPrompt } }
     }
+    @ObservationIgnored var onResolveQueuedTransfer: ((Session, ConversationQueuedPrompt, QueuedTransferResolution) throws -> Void)? {
+        didSet { for conversation in sessions.values { conversation.onResolveQueuedTransfer = onResolveQueuedTransfer } }
+    }
     @ObservationIgnored var beforePrompt: ((Session, ConversationCommand) async -> Void)? {
         didSet { for conversation in sessions.values { conversation.beforePrompt = beforePrompt } }
     }
@@ -1050,6 +1171,7 @@ final class LiveConversations {
         let conversation = makeConversation(session, drafts)
         conversation.onNotificationState = onNotificationState
         conversation.onTransferQueuedPrompt = onTransferQueuedPrompt
+        conversation.onResolveQueuedTransfer = onResolveQueuedTransfer
         conversation.beforePrompt = beforePrompt
         conversation.afterTurn = afterTurn
         sessions[session.id] = conversation
@@ -1068,6 +1190,7 @@ final class LiveConversations {
             checkOwnership: { _ in false }, drafts: drafts, isServerOwned: true)
         conversation.onNotificationState = onNotificationState
         conversation.onTransferQueuedPrompt = onTransferQueuedPrompt
+        conversation.onResolveQueuedTransfer = onResolveQueuedTransfer
         conversation.beforePrompt = beforePrompt
         conversation.afterTurn = afterTurn
         sessions[session.id] = conversation
@@ -1104,6 +1227,7 @@ final class LiveConversations {
         sessions[created.session.id] = conversation
         conversation.onNotificationState = onNotificationState
         conversation.onTransferQueuedPrompt = onTransferQueuedPrompt
+        conversation.onResolveQueuedTransfer = onResolveQueuedTransfer
         conversation.beforePrompt = beforePrompt
         conversation.afterTurn = afterTurn
         _ = await conversation.connect()

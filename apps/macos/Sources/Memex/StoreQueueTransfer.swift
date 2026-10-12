@@ -37,17 +37,32 @@ extension Store {
             session = result
         } else {
             guard isNew else {
-                throw ConversationRuntimeError(message: "The previous side-chat creation could not be confirmed. Inspect the provider's native conversations before retrying; another conversation has not been created. The queued message is retained.")
+                throw ConversationRuntimeError(message: "The previous side-chat creation could not be confirmed. Inspect the provider's native conversations, then choose Mark transfer inspected to move it again; another conversation has not been created. The queued message is retained.",
+                    kind: .transferUnresolved)
             }
-            let result = try await makeConversation(.init(provider: source.source,
-                workingDirectory: context.workspace.workingDirectory, providerHome: home))
+            let result: CreatedConversation
+            do {
+                result = try await makeConversation(.init(provider: source.source,
+                    workingDirectory: context.workspace.workingDirectory, providerHome: home))
+            } catch let failure as ConversationRuntimeError where failure.kind == .notStarted {
+                // Nothing reached the provider, so nothing can have been created.
+                do { try conversationRelationships.releaseQueueTransfer(id: transfer.id) } catch {
+                    throw ConversationRuntimeError(message: "\(failure.message) Its transfer reservation could not be cleared: \(error.localizedDescription)",
+                        kind: .transferUnresolved)
+                }
+                throw failure
+            } catch {
+                throw ConversationRuntimeError(message: "\(error.localizedDescription) The side chat may have been created. Inspect the provider's native conversations, then choose Mark transfer inspected to move it again. The queued message is retained.",
+                    kind: .transferUnresolved)
+            }
             session = result.session
             created = result
             // Record identity before any adoption or draft-writing suspension.
             do { try conversationRelationships.recordQueueTransferResult(session, transferID: transfer.id) }
             catch {
                 createdConversations.save(session, context: context)
-                throw ConversationRuntimeError(message: "Side chat \(session.sessionID) was created, but its transfer identity could not be saved. Inspect that conversation before retrying. The original queued message is retained.")
+                throw ConversationRuntimeError(message: "Side chat \(session.sessionID) was created, but its transfer identity could not be saved. Inspect that conversation before retrying. The original queued message is retained.",
+                    kind: .transferUnresolved)
             }
         }
         createdConversations.save(session, context: context)
@@ -70,4 +85,18 @@ extension Store {
         revealCreatedConversation(session)
         liveConversations.sessions[session.id]?.focus()
     }
+
+    /// Follow-up for a reserved transfer. `delivered` prunes a completed record
+    /// after the source queue durably dropped the entry; `inspected` releases an
+    /// unconfirmed reservation after the user checked the provider.
+    func resolveQueuedTransfer(source: Session, entry: ConversationQueuedPrompt,
+                               resolution: QueuedTransferResolution) throws {
+        let id = source.id + ":" + entry.id
+        switch resolution {
+        case .delivered: try conversationRelationships.pruneQueueTransfer(id: id)
+        case .inspected: try conversationRelationships.releaseQueueTransfer(id: id)
+        }
+    }
 }
+
+enum QueuedTransferResolution: Sendable { case delivered, inspected }

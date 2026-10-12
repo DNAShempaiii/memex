@@ -129,6 +129,27 @@ final class ConversationRelationships {
         }
     }
 
+    /// Clears a reservation that never recorded a native identity: creation
+    /// failed before any provider request, or the user inspected the provider's
+    /// conversations and marked the outcome resolved. A recorded side chat is
+    /// never released, so its transfer cannot create a second one.
+    func releaseQueueTransfer(id: String) throws {
+        try mutate { saved in
+            guard let transfer = saved.queueTransfers?.first(where: { $0.id == id }) else { return }
+            guard transfer.result == nil else {
+                throw ConversationRuntimeError(message: "This transfer already created side chat \(transfer.result?.sessionID ?? ""). Open that chat instead.")
+            }
+            saved.queueTransfers?.removeAll { $0.id == id }
+        }
+    }
+
+    /// A completed transfer is kept only while its source queue may still hold
+    /// the entry. Once that queue durably dropped it, the record is pruned.
+    func pruneQueueTransfer(id: String) throws {
+        guard queueTransfers.contains(where: { $0.id == id && $0.completed }) else { return }
+        try mutate { saved in saved.queueTransfers?.removeAll { $0.id == id && $0.completed } }
+    }
+
     private func read(_ directory: URL) throws -> Saved {
         let file = directory.appendingPathComponent("relationships.json")
         do {

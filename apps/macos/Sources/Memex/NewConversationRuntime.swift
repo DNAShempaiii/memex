@@ -60,12 +60,23 @@ enum NewConversationRuntime {
         do {
             return try await createNative(request, environment: environment,
                 applicationSupport: applicationSupport, helperURL: helperURL)
+        } catch let error as ConversationRuntimeError where error.kind == .notStarted {
+            throw error
         } catch {
             throw conversationProviderError(error)
         }
         #else
-        throw ConversationRuntimeError(message: "This build does not include the local agent runtime.")
+        throw ConversationRuntimeError(message: "This build does not include the local agent runtime.", kind: .notStarted)
         #endif
+    }
+
+    /// Validation before any provider process or request starts. Its failure is
+    /// definite: no native conversation can exist, so a reservation may be released.
+    static func beforeProviderRequest<T>(_ body: () throws -> T) throws -> T {
+        do { return try body() } catch {
+            let message = (error as? ConversationRuntimeError)?.message ?? error.localizedDescription
+            throw ConversationRuntimeError(message: message, kind: .notStarted)
+        }
     }
 
     #if canImport(SQACPHost)
@@ -75,30 +86,40 @@ enum NewConversationRuntime {
             if request.provider.hasPrefix("acp:") {
                 return try createConfigured(request, applicationSupport: applicationSupport)
             }
-            guard ["codex", "claude"].contains(request.provider) else {
-                throw ConversationRuntimeError(message: "Choose an installed conversation provider.")
+            let (config, cwd, resolvedEnvironment) = try beforeProviderRequest {
+                guard ["codex", "claude"].contains(request.provider) else {
+                    throw ConversationRuntimeError(message: "Choose an installed conversation provider.")
+                }
+                let manager = FileManager.default
+                let key = request.provider == "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"
+                var environment = environment
+                let userHome = environment["HOME"]?.nilIfBlank.map { URL(fileURLWithPath: $0) }
+                    ?? manager.homeDirectoryForCurrentUser
+                let providerHome = request.providerHome
+                    ?? environment[key]?.nilIfBlank.map { URL(fileURLWithPath: $0) }
+                    ?? userHome.appendingPathComponent(request.provider == "codex" ? ".codex" : ".claude")
+                if request.provider == "claude" {
+                    environment.merge(ClaudeNativeConfiguration.resolve(providerHome: providerHome,
+                        environment: environment).environment) { _, selected in selected }
+                } else if let home = request.providerHome { environment[key] = home.path }
+                let cwd = request.workingDirectory.standardizedFileURL.resolvingSymlinksInPath()
+                var isDirectory: ObjCBool = false
+                guard manager.fileExists(atPath: cwd.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                    throw ConversationRuntimeError(message: "The conversation's working directory is unavailable.")
+                }
+                // Resolve configuration before starting a process. This is only a
+                // location for validation; no transcript is written at this path.
+                let validationPath = providerHome.appendingPathComponent(request.provider == "codex"
+                    ? "sessions/new.jsonl" : "projects/new/new.jsonl")
+                let session = Session(source: request.provider, sessionID: "new", sourcePath: validationPath.path,
+                    project: cwd.lastPathComponent, cwd: cwd.path)
+                let config = try InAppResumeTarget.resolve(session, environment: environment,
+                    applicationSupport: applicationSupport, helperURL: helperURL, requiresTranscript: false)
+                if request.provider == "claude", config.helperURL == nil {
+                    throw ConversationRuntimeError(message: "The Claude session helper is missing from this build.")
+                }
+                return (config, cwd, environment)
             }
-            let manager = FileManager.default
-            let key = request.provider == "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"
-            var environment = environment
-            let userHome = environment["HOME"]?.nilIfBlank.map { URL(fileURLWithPath: $0) }
-                ?? manager.homeDirectoryForCurrentUser
-            let providerHome = request.providerHome
-                ?? environment[key]?.nilIfBlank.map { URL(fileURLWithPath: $0) }
-                ?? userHome.appendingPathComponent(request.provider == "codex" ? ".codex" : ".claude")
-            if request.provider == "claude" {
-                environment.merge(ClaudeNativeConfiguration.resolve(providerHome: providerHome,
-                    environment: environment).environment) { _, selected in selected }
-            } else if let home = request.providerHome { environment[key] = home.path }
-            let cwd = request.workingDirectory.standardizedFileURL.resolvingSymlinksInPath()
-            // Resolve configuration before starting a process. This is only a
-            // location for validation; no transcript is written at this path.
-            let validationPath = providerHome.appendingPathComponent(request.provider == "codex"
-                ? "sessions/new.jsonl" : "projects/new/new.jsonl")
-            var session = Session(source: request.provider, sessionID: "new", sourcePath: validationPath.path,
-                project: cwd.lastPathComponent, cwd: cwd.path)
-            let config = try InAppResumeTarget.resolve(session, environment: environment,
-                applicationSupport: applicationSupport, helperURL: helperURL, requiresTranscript: false)
             let creation: AgentConversationCreation
             if request.provider == "codex" {
                 creation = try .codex(executablePath: config.executableURL.path, cwd: cwd.path, environment: config.environment)
@@ -122,23 +143,26 @@ enum NewConversationRuntime {
                     .appendingPathComponent(claudeProjectDirectory(cwd.path))
                     .appendingPathComponent(creation.nativeSessionID + ".jsonl").path
             }
-            session = Session(source: request.provider, sessionID: creation.nativeSessionID, sourcePath: sourcePath,
+            let session = Session(source: request.provider, sessionID: creation.nativeSessionID, sourcePath: sourcePath,
                 project: cwd.lastPathComponent, lastAt: Date().ISO8601Format(), cwd: cwd.path,
                 machine: "local", messageCount: 0, conversationKind: "main")
-            let target = try InAppResumeTarget.resolve(session, environment: environment,
+            let target = try InAppResumeTarget.resolve(session, environment: resolvedEnvironment,
                 applicationSupport: applicationSupport, helperURL: helperURL, requiresTranscript: false)
             return CreatedConversation(session: session, runtime: NativeConversationRuntime(creation: creation), target: target)
         }.value
     }
     private static func createConfigured(_ request: NewConversationRequest, applicationSupport: URL?) throws -> CreatedConversation {
-        guard let profile = try ConversationProviderCatalog.load().configured.first(where: { $0.id == request.provider }) else {
-            throw ConversationRuntimeError(message: "This provider configuration is missing. Add it in Conversation providers.")
-        }
-        try profile.validate()
-        let cwd = request.workingDirectory.standardizedFileURL.resolvingSymlinksInPath()
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: cwd.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw ConversationRuntimeError(message: "The conversation's working directory is unavailable.")
+        let (profile, cwd) = try beforeProviderRequest {
+            guard let profile = try ConversationProviderCatalog.load().configured.first(where: { $0.id == request.provider }) else {
+                throw ConversationRuntimeError(message: "This provider configuration is missing. Add it in Conversation providers.")
+            }
+            try profile.validate()
+            let cwd = request.workingDirectory.standardizedFileURL.resolvingSymlinksInPath()
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: cwd.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw ConversationRuntimeError(message: "The conversation's working directory is unavailable.")
+            }
+            return (profile, cwd)
         }
         let creation = try AgentConversationCreation.acp(provider: profile.id, configuration: profile.acpConfiguration, cwd: cwd.path)
         let support = try applicationSupport ?? FileManager.default.url(for: .applicationSupportDirectory,
