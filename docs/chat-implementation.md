@@ -1,14 +1,16 @@
-# Implementation follow-through
+# Native chat implementation
 
-This follows the 24 actionable Memex rows in [findings.json](findings.json).
-The original inventory remains a record of the inspected baseline. Its comparator
-defects, unknown cloud/performance comparisons, and excluded sidebar snooze are
-not silently reclassified as implemented features.
+This records the 24 actionable rows from an October 2026 chat-parity comparison
+of Memex against Codex and T3 Code, and how each was implemented. The comparison
+inventory itself is not kept in this repository. Its comparator defects, unknown
+cloud/performance comparisons, and the excluded sidebar snooze are not
+reclassified as implemented features.
 
 The code is in the native Memex app, its execution host and web client, and the
-pinned SQACP runtime. Features depend on the runtime-enabled build and advertised
-provider/host capabilities where stated below. Component acceptance has passed;
-the final immutable package and installed-app checks are recorded below.
+optional pinned agent runtime described in
+[apps/macos/RUNTIME.md](../apps/macos/RUNTIME.md). Features depend on the
+runtime-enabled build and advertised provider/host capabilities where stated
+below. Public Homebrew releases are history-only and do not include the runtime.
 
 | Finding | Implemented behavior and boundary | Regression evidence |
 | --- | --- | --- |
@@ -38,6 +40,9 @@ the final immutable package and installed-app checks are recorded below.
 | `codex-conversation-05` | Reviewed queue-to-side-chat transfer preserves captured bytes and command identity, creates an unsent child draft, and never duplicates uncertain creation or dispatch. | `StoreQueueTransferTests`, queue tests, durable viewer-restore regressions. |
 
 ## Acceptance status
+
+These results were recorded in October 2026, before the runtime pin moved to its
+current revision. Runtime-dependent results below apply to the older lock.
 
 - October 6 transcript correction removes the outline and viewport quote button.
   Selecting transcript text now offers Add to chat for the exact highlighted text,
@@ -76,17 +81,19 @@ the final immutable package and installed-app checks are recorded below.
   now prevents equivalent system fonts from triggering a full reload, while real
   font-size changes still invalidate layout. Both streaming cases, including a
   recreated font, and the font-size regression passed locally.
-- The final runtime lock is `1671045ec81e37a133b4e829e3d04fdf572cf11a`.
-  Locked preparation, native packaging, strict code-signature verification and a
-  packaged execution-host/control-MCP round trip passed. The installed
-  `/Applications/Memex.app` executable matches the packaged executable and
-  launched successfully; Home and the inline attachment/dictation menu were
-  inspected. Appearance and keyboard settings were also inspected during this
-  delivery. Providers & Tools live inspection was limited by a native UI-tool
-  pipe failure; the app remained alive, and its component tests passed.
-- Private runtime CI at the locked revision is blocked before execution by the
-  GitHub account billing/spending limit. This is separate from the passing local
-  runtime validation above.
+- Packaging evidence applies to an older runtime lock, not the current one.
+  At runtime lock `1671045ec81e37a133b4e829e3d04fdf572cf11a`, locked
+  preparation, native packaging, strict code-signature verification and a
+  packaged execution-host/control-MCP round trip passed, and an installed build
+  launched with Home and the inline attachment/dictation menu inspected.
+  Providers & Tools live inspection was limited by a native UI-tool pipe
+  failure; its component tests passed.
+- The current pin in [runtime-source.json](../apps/macos/runtime-source.json) is
+  `a4f5a18796c8fa661b8369541462a937a1e7338f`. The packaged and installed-app
+  checks above have not been recorded for that revision. Private runtime CI was
+  blocked before execution at the older lock, and no CI result is recorded for
+  the current pin. Treat runtime-enabled packaging at the current pin
+  as unverified until it is repeated.
 
 Prior baseline UI or embedding-test failures are not attributed to these changes
 without reproduction. Source-based boundaries and fixture tests are not claims
