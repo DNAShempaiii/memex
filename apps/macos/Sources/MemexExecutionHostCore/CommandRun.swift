@@ -59,6 +59,10 @@ public final class CommandRun: @unchecked Sendable {
         let input = try inputFile.map { try FileHandle(forReadingFrom: $0) }
         defer { try? input?.close() }
         child.standardInput = input ?? FileHandle.nullDevice
+        // Waiting on the termination callback returns as soon as the child exits;
+        // polling isRunning and waitUntilExit add tens of milliseconds per command.
+        let exited = DispatchSemaphore(value: 0)
+        child.terminationHandler = { _ in exited.signal() }
         lock.lock()
         if cancelled { lock.unlock(); throw CancellationError() }
         do { try child.run() } catch { lock.unlock(); throw error }
@@ -105,7 +109,7 @@ public final class CommandRun: @unchecked Sendable {
             let stderrBytes = mergeStandardError ? 0 : (try? FileManager.default.attributesOfItem(atPath: errorURL.path)[.size] as? NSNumber)?.int64Value ?? 0
             return stdoutBytes > Int64(limit) || stderrBytes > Int64(limit) - stdoutBytes
         }
-        while child.isRunning {
+        while exited.wait(timeout: .now() + .milliseconds(25)) == .timedOut {
             consumeProgress()
             lock.lock()
             let shouldCancel = cancelled
@@ -120,7 +124,6 @@ public final class CommandRun: @unchecked Sendable {
                 // A CLI that ignores SIGTERM must not outlive cancellation forever.
                 stop(SIGKILL)
             }
-            Thread.sleep(forTimeInterval: 0.025)
         }
         child.waitUntilExit()
         consumeProgress()

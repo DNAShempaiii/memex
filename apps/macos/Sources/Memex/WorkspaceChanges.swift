@@ -160,11 +160,14 @@ struct WorkspaceChangesClient: Sendable {
         child.standardInput = FileHandle.nullDevice
         child.standardOutput = output
         child.standardError = errors
+        // Return on the termination callback; isRunning lags the exit by tens of milliseconds.
+        let exited = DispatchSemaphore(value: 0)
+        child.terminationHandler = { _ in exited.signal() }
         try child.run()
         let deadline = Date().addingTimeInterval(15)
         var truncated = false
         var timedOut = false
-        while child.isRunning {
+        while exited.wait(timeout: .now() + .milliseconds(10)) == .timedOut {
             let size = (try? outputURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             let errorSize = (try? errorURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             if size > outputLimit || errorSize > outputLimit || Date() >= deadline {
@@ -173,7 +176,6 @@ struct WorkspaceChangesClient: Sendable {
                 kill(child.processIdentifier, SIGKILL)
                 break
             }
-            Thread.sleep(forTimeInterval: 0.01)
         }
         child.waitUntilExit()
         if timedOut { throw WorkspaceChangesError(message: "Git took too long to read workspace changes. Try refreshing.") }
