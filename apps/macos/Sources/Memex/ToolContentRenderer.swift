@@ -96,10 +96,19 @@ import AppKit
         let result = NSMutableAttributedString(string: "")
         for record in records {
             let message = record.record
-            if records.count > 1 { label(message.role == "tool_use" ? "Input" : "Output", to: result) }
             var parts: [String] = []
             for value in [message.toolInput, message.toolOutput, message.text] {
                 if let value, value.nilIfBlank != nil, !parts.contains(value) { parts.append(value) }
+            }
+            if records.count > 1 {
+                // A call without arguments needs no heading. A result that
+                // produced nothing says so rather than leaving a bare heading.
+                if parts.isEmpty && message.role == "tool_use" { continue }
+                label(message.role == "tool_use" ? "Input" : "Output", to: result)
+                if parts.isEmpty && SourceContent.blocks(message).isEmpty && !raw {
+                    placeholder("No output", to: result)
+                    continue
+                }
             }
             var sourceOffset = 0
             for (index, original) in parts.enumerated() {
@@ -262,6 +271,12 @@ import AppKit
 
     private static func opaque(_ text: String, to result: NSMutableAttributedString) {
         append("Encoded payload · \(text.utf8.count) bytes · Show raw content to reveal", to: result)
+    }
+
+    private static func placeholder(_ text: String, to result: NSMutableAttributedString) {
+        result.append(NSAttributedString(string: text + "\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 13), .foregroundColor: NSColor.tertiaryLabelColor
+        ]))
     }
 
     private static func label(_ text: String, to result: NSMutableAttributedString) {

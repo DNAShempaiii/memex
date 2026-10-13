@@ -152,6 +152,16 @@ struct ToolContentTests {
         }
     }
 
+    @Test func emptyCallAndResultPartsDoNotLeaveBareHeadings() {
+        let call = TranscriptRecord(recordID: "call", record: Message(role: "tool_use", text: "", toolName: "exec",
+            toolInput: nil, toolOutput: nil))
+        let empty = entry("empty", output: " \n")
+        #expect(ToolContentRenderer.render([call, entry("ok", output: "done")]).string == "Output\ndone")
+        #expect(ToolContentRenderer.render([entry("in", input: "{\"cmd\":\"true\"}"), empty]).string.hasSuffix("Output\nNo output\n"))
+        // Raw content stays verbatim and never invents placeholder text.
+        #expect(!ToolContentRenderer.render([entry("in", input: "true"), empty], raw: true).string.contains("No output"))
+    }
+
     private func entry(_ id: String, input: String? = nil, output: String? = nil) -> TranscriptRecord {
         TranscriptRecord(recordID: id, record: Message(role: input == nil ? "tool_result" : "tool_use", text: "",
             toolName: "exec", toolInput: input, toolOutput: output))

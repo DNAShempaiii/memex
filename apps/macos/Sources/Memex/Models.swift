@@ -283,23 +283,49 @@ struct TranscriptItem: Identifiable, Sendable {
     var isActivity: Bool { isCompletedWork || records[0].record.isActivity }
     var isInstructions: Bool { records[0].record.isInstruction }
     var activitySummary: String {
-        if isCompletedWork { return "Completed work" }
         if isInstructions { return title }
         let entries = activities
+        if isCompletedWork {
+            let work = Self.workSentence(entries)
+            return work.map { "Worked · " + $0.prefix(1).lowercased() + $0.dropFirst() } ?? "Worked"
+        }
         guard entries.count > 1 else { return entries.first?.presentation.title ?? title }
-        if entries.allSatisfy({ $0.presentation.category == nil && $0.records[0].record.role != "reasoning" }) {
-            return "\(entries.count) tool calls"
+        return Self.workSentence(entries) ?? "Thought"
+    }
+
+    /// Describes operations, not records: reasoning and commentary are context
+    /// for the work and are not counted. Nil when nothing but those remains.
+    private static func workSentence(_ entries: [TranscriptActivity]) -> String? {
+        var counts: [(kind: String, count: Int)] = []
+        var otherTools: Set<String> = []
+        for entry in entries where !["reasoning", "assistant"].contains(entry.records[0].record.role) {
+            let presentation = entry.presentation
+            let kind = presentation.category ?? "Tool"
+            // Name a single kind of tool; unnamed results only count as generic tools.
+            let message = entry.records[0].record
+            if kind == "Tool" { otherTools.insert(message.toolName?.nilIfBlank == nil ? "" : message.activityTitle) }
+            if let index = counts.firstIndex(where: { $0.kind == kind }) { counts[index].count += 1 }
+            else { counts.append((kind, 1)) }
         }
-        var categories: [(String, Int)] = []
-        for entry in entries {
-            let category = entry.presentation.category?.lowercased() ?? (entry.records[0].record.role == "reasoning" ? "reasoning" : "tool")
-            if let index = categories.firstIndex(where: { $0.0 == category }) { categories[index].1 += 1 }
-            else { categories.append((category, 1)) }
+        func plural(_ count: Int, _ noun: String) -> String { count == 1 ? "a \(noun)" : "\(count) \(noun)s" }
+        let phrases = counts.map { kind, count -> String in
+            switch kind {
+            case "Command": "ran " + plural(count, "command")
+            case "Read": "read " + plural(count, "file")
+            case "Search": count == 1 ? "searched once" : "searched \(count) times"
+            case "Edit": count == 1 ? "made an edit" : "made \(count) edits"
+            case "Write": "wrote " + plural(count, "file")
+            case "Image": "viewed " + plural(count, "image")
+            default:
+                if otherTools.count == 1, let name = otherTools.first, !name.isEmpty {
+                    count == 1 ? "called \(name)" : "called \(name) \(count) times"
+                } else { "called " + plural(count, "tool") }
+            }
         }
-        let details = categories.prefix(3).map { name, count in
-            name == "reasoning" ? "reasoning" : "\(count) \(name)\(count == 1 ? "" : name == "search" ? "es" : "s")"
-        }.joined(separator: ", ")
-        return "\(entries.count) activities · \(details)" + (categories.count > 3 ? ", …" : "")
+        guard !phrases.isEmpty else { return nil }
+        let sentence = phrases.count == 1 ? phrases[0]
+            : phrases.dropLast().joined(separator: ", ") + " and " + phrases[phrases.count - 1]
+        return sentence.prefix(1).uppercased() + sentence.dropFirst()
     }
     var title: String {
         if isInstructions { return "Session context" }

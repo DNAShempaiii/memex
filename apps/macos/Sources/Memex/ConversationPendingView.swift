@@ -67,7 +67,8 @@ struct ConversationPendingView: View {
     }
 
     private var activityLabel: String {
-        conversation.status == "Working…" ? "Thinking..." : conversation.status
+        guard conversation.status == "Working…" else { return conversation.status }
+        return TranscriptPresentation.liveStatus(conversation.snapshot.records) ?? "Thinking…"
     }
 
     private func recoveryLabel(_ phase: ConversationPendingPrompt.Phase) -> String? {

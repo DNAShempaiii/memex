@@ -175,6 +175,8 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         @MainActor var richContent: RichContentView? { richLayout?.view() }
         var findRange: NSRange?
         var isLocalHost = false
+        // A disclosure with nothing behind it is a plain status line.
+        var canExpand = true
         var hasBody: Bool { !body.isEmpty || richLayout != nil }
     }
 
@@ -798,6 +800,13 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         selectionActions.dismiss()
     }
 
+    /// Whether expanding a record would show anything beyond its header.
+    private static func hasDetail(_ entry: TranscriptRecord) -> Bool {
+        let message = entry.record
+        return [message.text, message.toolInput, message.toolOutput].contains { $0?.nilIfBlank != nil }
+            || message.mcpAppJSON != nil || !SourceContent.blocks(message).isEmpty
+    }
+
     func measurement(at index: Int) -> Measurement {
         let row = rows[index]
         let width = max(200, table.bounds.width)
@@ -816,6 +825,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         var symbolName: String?
         var hasFailure = false
         var isConversationMessage = false
+        var canExpand = true
         switch row {
         case .group(let item):
             title = item.activitySummary
@@ -830,6 +840,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
             isTool = entry.records[0].record.isActivity && entry.records[0].record.role != "reasoning"
             indent = nested ? 20 : 0
             if isExpanded { fullText = entry.body }
+            canExpand = entry.records.contains(where: Self.hasDetail)
         case .message(let entry):
             isConversationMessage = ["user", "assistant"].contains(entry.record.role)
             isUser = !rawTranscript && entry.record.role == "user"
@@ -853,6 +864,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
                 symbolName = isDisclosure ? "doc.text" : nil
             }
             if !isDisclosure || isExpanded { fullText = entry.record.text }
+            if isDisclosure { canExpand = Self.hasDetail(entry) }
         }
         let rawMessage: Bool
         if case .activity = row { rawMessage = rawTranscript || (rawTools.contains(row.id) && !isTool) }
@@ -954,6 +966,7 @@ final class TranscriptController: NSViewController, NSTableViewDataSource, NSTab
         result.richLayout = richLayout
         result.findRange = findRange
         result.isLocalHost = isLocalHost
+        result.canExpand = canExpand
         measurements[row.id] = result
         return result
     }
@@ -1087,11 +1100,13 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate, Transcr
         detailPanel.isHidden = !value.isDisclosure || !value.hasBody
         disclosure.isHidden = !value.isDisclosure
         disclosure.title = value.title
-        disclosure.image = NSImage(systemSymbolName: value.isExpanded ? "chevron.down" : "chevron.right",
-                                   accessibilityDescription: nil)?.withSymbolConfiguration(
-                                    NSImage.SymbolConfiguration(pointSize: 10, weight: .light))
+        disclosure.image = value.canExpand
+            ? NSImage(systemSymbolName: value.isExpanded ? "chevron.down" : "chevron.right",
+                      accessibilityDescription: nil)?.withSymbolConfiguration(
+                        NSImage.SymbolConfiguration(pointSize: 10, weight: .light))
+            : nil
         disclosure.setAccessibilityLabel(value.title)
-        disclosure.setAccessibilityValue(value.isExpanded ? "Expanded" : "Collapsed")
+        disclosure.setAccessibilityValue(value.canExpand ? (value.isExpanded ? "Expanded" : "Collapsed") : nil)
         if displayedText !== value.attributedBody {
             let rendered = NSMutableAttributedString(attributedString: value.attributedBody)
             rendered.enumerateAttribute(RichTextRenderer.sourceLocationAttribute, in: NSRange(location: 0, length: rendered.length)) { source, range, _ in
@@ -1167,7 +1182,10 @@ private final class TranscriptCell: NSTableCellView, NSTextViewDelegate, Transcr
         message.scrollToVisible(rect.insetBy(dx: 0, dy: -30))
     }
 
-    @objc private func toggle() { onToggle?() }
+    @objc private func toggle() {
+        guard measurement?.canExpand != false else { return }
+        onToggle?()
+    }
     @objc private func toggleRaw() { onToggleRaw?() }
     @objc private func toggleFull() { onToggleFull?() }
     @objc private func copyBody() {

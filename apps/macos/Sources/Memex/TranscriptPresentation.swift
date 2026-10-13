@@ -182,6 +182,38 @@ enum TranscriptPresentation {
         return nil
     }
 
+    /// A reasoning summary commonly opens with a one-line bold or Markdown
+    /// heading. Plain reasoning prose has no heading and returns nil.
+    static func reasoningHeading(_ text: String) -> String? {
+        guard let line = text.split(whereSeparator: \.isNewline)
+            .first(where: { String($0).nilIfBlank != nil })?.trimmingCharacters(in: .whitespaces) else { return nil }
+        var heading: Substring
+        if line.hasPrefix("**"), line.hasSuffix("**"), line.count > 4 {
+            heading = line.dropFirst(2).dropLast(2)
+            guard !heading.contains("**") else { return nil }
+        } else if line.hasPrefix("#") {
+            heading = line.drop(while: { $0 == "#" })
+            guard heading.first == " " else { return nil }
+        } else { return nil }
+        return String(heading).nilIfBlank?.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// What a running conversation is doing now, from its current turn: the
+    /// call still awaiting a result, else the latest reasoning heading.
+    static func liveStatus(_ records: [TranscriptRecord]) -> String? {
+        var latestRecord = true
+        for entry in records.reversed() where !entry.isRawOnly && !entry.record.isRoutineTurnBoundary {
+            let message = entry.record
+            if message.role == "user" && !message.isInstruction { return nil }
+            // Results arrive after their call, so only the latest record can still be pending.
+            if latestRecord, message.role == "tool_use",
+               let active = TranscriptActivity(records: [entry]).presentation.activeTitle { return active }
+            latestRecord = false
+            if message.role == "reasoning", let heading = reasoningHeading(message.text) { return heading }
+        }
+        return nil
+    }
+
     static func group(_ source: [TranscriptRecord]) -> [TranscriptItem] {
         let records = project(source)
         // Require both a recorded final answer and task completion for this exact source
