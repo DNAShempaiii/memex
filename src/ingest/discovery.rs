@@ -78,6 +78,9 @@ pub(super) fn discover_transcripts(
     if options.include_kiro && full_scan {
         files.extend(crate::sources::kiro::discover());
     }
+    if options.include_kimi && full_scan {
+        files.extend(crate::sources::kimi::discover());
+    }
 
     // A watcher hint names the file that changed, not necessarily the projection
     // that owns its conversation. Resolve ownership here for both scan modes.
@@ -496,6 +499,9 @@ pub(super) fn prepare_file_task(
     if source == SourceKind::Kiro {
         identity.source_metadata_sha256 = Some(crate::sources::kiro::metadata_fingerprint(&path));
     }
+    if source == SourceKind::Kimi {
+        identity.source_metadata_sha256 = Some(crate::sources::kimi::metadata_fingerprint(&path));
+    }
     let mut change = plan::classify_file(source, size, mtime, &identity, parser_version, previous);
     if source == SourceKind::Hermes
         && let Ok(checkpoint) =
@@ -535,7 +541,12 @@ pub(super) fn prepare_file_task(
         _ => (0, 0, HashMap::new()),
     };
     let claude = resolve_claude_background(&path, source, size, previous, change);
-    if claude.reparse {
+    // A Kimi undo retracts lines earlier passes indexed; only a full parse drops them.
+    // If the tail cannot be inspected, fail safe by reparsing.
+    let kimi_undo = source == SourceKind::Kimi
+        && change == FileChange::Append
+        && crate::sources::kimi::has_undo_since(&path, offset, size).unwrap_or(true);
+    if claude.reparse || kimi_undo {
         change = FileChange::Replaced;
         offset = 0;
         turn_id = 0;
