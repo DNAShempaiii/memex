@@ -231,6 +231,68 @@ fn expire(query: &UsageQuery) {
         .checked_at = Instant::now() - Duration::from_secs(120);
 }
 
+#[test]
+fn retaining_queries_distinguish_claude_roots_in_partitions_and_merged_views() {
+    use super::snapshot::{USAGE_SCAN_LOCK, lock_merged};
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _env = crate::test_support::pin_source_roots(temp.path());
+    let work = temp.path().join("work/projects");
+    let personal = temp.path().join("personal/projects");
+    for (root, message, tokens) in [(&work, "work", 10), (&personal, "personal", 20)] {
+        fs::create_dir_all(root.join("-repo")).unwrap();
+        fs::write(
+            root.join("-repo/session.jsonl"),
+            claude_line(message, tokens),
+        )
+        .unwrap();
+    }
+    for source in [Some(SourceFilter::Claude), None] {
+        for disk_cache in [false, true] {
+            lock_partitions().clear();
+            lock_merged().clear();
+            let mut query = UsageQuery {
+                source,
+                memo_ttl_ms: 60_000,
+                cache_path: disk_cache.then(|| temp.path().join(format!("{source:?}.sqlite3"))),
+                claude_sources: Some(vec![work.clone()]),
+                ..UsageQuery::default()
+            };
+            // Populate facts without retention first, then exercise cold snapshot publication.
+            assert_eq!(
+                scan_usage(&UsageQuery {
+                    memo_ttl_ms: 0,
+                    ..query.clone()
+                })
+                .unwrap()
+                .total_tokens,
+                10
+            );
+            assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+            query.claude_sources = Some(vec![personal.clone()]);
+            assert_eq!(scan_usage(&query).unwrap().total_tokens, 20);
+            query.claude_sources = Some(vec![work.clone()]);
+            assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
+
+            // A refresh in progress may serve stale data only from the requested corpus.
+            let refresh = USAGE_SCAN_LOCK.lock().unwrap();
+            query.claude_sources = Some(vec![personal.clone()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let join = std::thread::spawn(move || {
+                tx.send(scan_usage(&query).unwrap().total_tokens).unwrap()
+            });
+            let premature = rx.recv_timeout(Duration::from_millis(50)).ok();
+            drop(refresh);
+            join.join().unwrap();
+            assert_eq!(premature, None);
+            assert_eq!(rx.recv().unwrap(), 20);
+        }
+    }
+    lock_partitions().clear();
+    lock_merged().clear();
+}
+
 fn assert_report_matches(actual: &UsageReport, expected: &UsageReport) {
     assert_eq!(
         serde_json::to_value(actual).unwrap(),
@@ -274,12 +336,23 @@ fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 10);
     lock_partitions().remove(&key);
     fs::write(&transcript, claude_line("changed", 20)).unwrap();
-    let observed = validate_partition(SourceFilter::Claude, Some(path), None).unwrap();
+    let observed = validate_partition(
+        SourceFilter::Claude,
+        Some(path),
+        None,
+        &crate::config::default_claude_sources(),
+    )
+    .unwrap();
     assert!(!observed.valid);
     // The supplied checkpoint predates this second mutation. The rebuilt
     // assembly can answer, but its disk facts must not be marked synchronized.
     fs::write(&transcript, claude_line("later", 300)).unwrap();
-    populate_after_failed_validation(SourceFilter::Claude, path, observed.fingerprint);
+    populate_after_failed_validation(
+        SourceFilter::Claude,
+        path,
+        observed.fingerprint,
+        &crate::config::default_claude_sources(),
+    );
     assert!(lock_partitions().contains_key(&key));
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 300);
     assert!(
@@ -292,9 +365,14 @@ fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
     expire(&query);
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 300);
     assert!(
-        validate_partition(SourceFilter::Claude, Some(path), None)
-            .unwrap()
-            .valid
+        validate_partition(
+            SourceFilter::Claude,
+            Some(path),
+            None,
+            &crate::config::default_claude_sources()
+        )
+        .unwrap()
+        .valid
     );
 
     // Exercise the actual cold query entry point with a stable changed source.
@@ -302,9 +380,14 @@ fn failed_cold_validation_rebuilds_without_blessing_a_later_mutation() {
     fs::write(&transcript, claude_line("final", 400)).unwrap();
     assert_eq!(scan_usage(&query).unwrap().total_tokens, 400);
     assert!(
-        validate_partition(SourceFilter::Claude, Some(path), None)
-            .unwrap()
-            .valid
+        validate_partition(
+            SourceFilter::Claude,
+            Some(path),
+            None,
+            &crate::config::default_claude_sources()
+        )
+        .unwrap()
+        .valid
     );
 }
 
@@ -330,7 +413,11 @@ fn failed_cold_validation_does_not_replace_a_snapshot_or_wait_for_refresh() {
     populate_after_failed_validation(
         SourceFilter::Claude,
         path,
-        discovery_fingerprint(SourceFilter::Claude),
+        discovery_fingerprint(
+            SourceFilter::Claude,
+            &crate::config::default_claude_sources(),
+        ),
+        &crate::config::default_claude_sources(),
     );
     assert!(std::sync::Arc::ptr_eq(
         &original,
@@ -341,7 +428,11 @@ fn failed_cold_validation_does_not_replace_a_snapshot_or_wait_for_refresh() {
     populate_after_failed_validation(
         SourceFilter::Claude,
         path,
-        discovery_fingerprint(SourceFilter::Claude),
+        discovery_fingerprint(
+            SourceFilter::Claude,
+            &crate::config::default_claude_sources(),
+        ),
+        &crate::config::default_claude_sources(),
     );
     assert!(!lock_partitions().contains_key(&key));
 }
@@ -408,6 +499,7 @@ fn interrupted_blob_only_refresh_cannot_validate_old_facts() {
         scan_claude,
         &mut warnings,
         Some(&mut cache),
+        &crate::config::default_claude_sources(),
     );
     assert!(warnings.is_empty());
     assert_eq!(

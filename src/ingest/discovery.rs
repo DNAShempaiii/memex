@@ -112,6 +112,61 @@ pub(super) fn discover_transcripts(
             }
         }
     }
+    // Claude workflow runs store each agent transcript twice, and the copies diverge. Index
+    // their chronological union under one path and retire the other projections. Watcher hints
+    // name one copy, and reused directory listings hold indexed files only, so find the sibling
+    // copies on disk in both scan modes.
+    let agents = files
+        .iter()
+        .filter(|file| file.source == SourceKind::Claude)
+        .filter_map(|file| crate::sources::claude::agent_copy_key(&file.path))
+        .collect::<HashSet<_>>();
+    let mut workflow_runs = HashMap::new();
+    let mut candidates = Vec::new();
+    for (subagents, name) in agents {
+        let runs = workflow_runs
+            .entry(subagents.clone())
+            .or_insert_with(|| crate::sources::claude::workflow_runs(&subagents));
+        candidates.extend(crate::sources::claude::agent_copies(
+            &subagents, runs, &name,
+        ));
+    }
+    let owners = crate::sources::claude::agent_copy_owners(
+        candidates
+            .into_iter()
+            .filter(|path| !excluder.is_excluded(path)),
+    );
+    let mut agent_copies = HashMap::<PathBuf, Vec<crate::sources::claude::AgentCopy>>::new();
+    for (copy, owner) in &owners {
+        let metadata = discovered_metadata(copy)?.ok_or_else(|| {
+            anyhow!(
+                "Claude agent copy {} disappeared during discovery; retry the refresh",
+                copy.display()
+            )
+        })?;
+        agent_copies
+            .entry(owner.clone())
+            .or_default()
+            .push(crate::sources::claude::AgentCopy {
+                path: copy.clone(),
+                size: metadata.len(),
+                metadata_sha256: format!(
+                    "{:x}",
+                    Sha256::digest(serde_json::to_vec(&file_identity(copy, &metadata, 0))?)
+                ),
+            });
+        if copy != owner {
+            superseded_projections.insert(copy.to_string_lossy().into_owned());
+        }
+    }
+    for copies in agent_copies.values_mut() {
+        copies.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    for file in &mut files {
+        if let Some(owner) = owners.get(&file.path) {
+            file.path = owner.clone();
+        }
+    }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     files.dedup();
 
@@ -166,16 +221,51 @@ pub(super) fn discover_transcripts(
                     return Ok(Observed::Missing { session_id });
                 };
                 let key = path.to_string_lossy().into_owned();
-                let (task, skip) = prepare_file_task(
+                let previous = loaded
+                    .get(&key)
+                    .expect("checkpoint path must be preloaded")
+                    .as_ref();
+                let (mut task, mut skip) = prepare_file_task(
                     path,
                     file.source,
                     options.include_reasoning,
                     &metadata,
-                    loaded
-                        .get(&key)
-                        .expect("checkpoint path must be preloaded")
-                        .as_ref(),
+                    previous,
                 );
+                if file.source == SourceKind::Claude {
+                    if let Some(copies) = agent_copies.get(&task.path) {
+                        task.claude_agent_copies = copies.clone();
+                    }
+                    let fingerprint = (!task.claude_agent_copies.is_empty()).then(|| {
+                        let mut hash = Sha256::new();
+                        for copy in &task.claude_agent_copies {
+                            let path = copy.path.as_os_str().as_encoded_bytes();
+                            hash.update((path.len() as u64).to_le_bytes());
+                            hash.update(path);
+                            hash.update(copy.size.to_le_bytes());
+                            hash.update(copy.metadata_sha256.as_bytes());
+                        }
+                        format!("{:x}", hash.finalize())
+                    });
+                    task.identity.source_metadata_sha256 = fingerprint.clone();
+                    if previous.and_then(|state| state.identity.source_metadata_sha256.as_ref())
+                        != fingerprint.as_ref()
+                    {
+                        // Either copy changed or the group gained/lost a member. A byte offset
+                        // into one physical file cannot incrementally update the merged union.
+                        task.change = if previous.is_some() {
+                            FileChange::Replaced
+                        } else {
+                            FileChange::New
+                        };
+                        task.offset = 0;
+                        task.turn_id = 0;
+                        task.legacy_turn_id = Some(0);
+                        task.pending_tool_calls.clear();
+                        task.claude_background = None;
+                        skip = false;
+                    }
+                }
                 Ok(Observed::File {
                     task: Box::new(task),
                     skip,
@@ -577,6 +667,7 @@ pub(super) fn prepare_file_task(
                 .filter(|_| source == SourceKind::Codex && offset > 0 && !change.replaces_records())
                 .and_then(|state| state.codex_metadata_offsets.clone()),
             claude_background,
+            claude_agent_copies: Vec::new(),
         },
         change == FileChange::Unchanged,
     )
@@ -840,6 +931,7 @@ pub(super) fn discover_bob(
                 parser_version,
                 codex_metadata_offsets: None,
                 claude_background: None,
+                claude_agent_copies: Vec::new(),
             });
         }
         readable.push(database);
@@ -968,6 +1060,7 @@ pub(super) fn discover_zcode(
                 parser_version,
                 codex_metadata_offsets: None,
                 claude_background: None,
+                claude_agent_copies: Vec::new(),
             });
         }
         // Reconcile only after a successful inventory (or confirmed removal).
@@ -1135,6 +1228,7 @@ pub(super) fn discover_kilocode(
                 parser_version,
                 codex_metadata_offsets: None,
                 claude_background: None,
+                claude_agent_copies: Vec::new(),
             });
         }
         // Reconcile only after a successful inventory (or confirmed removal).
@@ -1924,14 +2018,29 @@ pub(super) fn prepare_refresh(
     // unavailable, so absence from discovery never removes state on its own. A direct
     // NotFound confirms removal only while the file's immediate container is still
     // readable: otherwise one unavailable ancestor looks like every transcript under it
-    // was deleted individually.
+    // was deleted individually. A Claude transcript found at the same relative path under
+    // another readable root also confirms a move, even when its old config directory is gone.
     let mut missing_state_paths = Vec::new();
     if full_scan {
+        let claude_roots = options
+            .claude_sources
+            .iter()
+            .filter(|root| root.is_dir() && std::fs::read_dir(root).is_ok())
+            .collect::<Vec<_>>();
         for path in state.file_keys()? {
             let confirmed_missing = match Path::new(&path).metadata() {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Path::new(&path)
-                    .parent()
-                    .is_some_and(|parent| parent.metadata().is_ok_and(|meta| meta.is_dir())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let path = Path::new(&path);
+                    path.parent()
+                        .is_some_and(|parent| parent.metadata().is_ok_and(|meta| meta.is_dir()))
+                        || crate::sources::claude::project_relative_path(path).is_some_and(
+                            |relative| {
+                                claude_roots.iter().any(|root| {
+                                    !path.starts_with(root) && root.join(&relative).is_file()
+                                })
+                            },
+                        )
+                }
                 _ => false,
             };
             if confirmed_missing {

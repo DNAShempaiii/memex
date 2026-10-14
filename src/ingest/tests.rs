@@ -796,6 +796,7 @@ fn incremental_task(
         turn_id,
         legacy_turn_id: Some(turn_id),
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: metadata.len(),
         mtime: metadata
             .modified()
@@ -4305,6 +4306,7 @@ fn ingest_pi_incremental_records_keep_header_project() {
         turn_id: 1,
         legacy_turn_id: None,
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: (existing.len() + appended.len()) as u64,
         mtime: 0,
         change: FileChange::Append,
@@ -4386,6 +4388,7 @@ fn parse_copilot_session_extracts_messages_tools_and_workspace() {
         turn_id: 0,
         legacy_turn_id: None,
         claude_background: None,
+        claude_agent_copies: Vec::new(),
         size: meta.len(),
         mtime: 0,
         change: FileChange::Append,
@@ -7108,6 +7111,149 @@ fn kilocode_migrates_database_checkpoint_and_honors_session_exclusions() {
     options.exclude_patterns = vec![database.to_string_lossy().into_owned()];
     run(&options);
     assert!(indexed_texts(&paths).is_empty());
+}
+
+fn write_claude_messages(path: &Path, texts: &[&str]) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for text in texts {
+        append_claude_message(path, text);
+    }
+}
+
+fn indexed_source_paths(paths: &Paths) -> Vec<PathBuf> {
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut source_paths = Vec::new();
+    index
+        .for_each_record(|record| {
+            source_paths.push(PathBuf::from(record.source_path));
+            Ok(())
+        })
+        .unwrap();
+    source_paths.sort();
+    source_paths.dedup();
+    source_paths
+}
+
+#[test]
+fn workflow_agent_copies_index_once_and_follow_the_more_complete_copy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("claude-projects");
+    let subagents = root.join("-tmp-project/session/subagents");
+    let direct = subagents.join("agent-a1.jsonl");
+    let workflow = subagents.join("workflows/wf_run/agent-a1.jsonl");
+    write_claude_messages(&direct, &["first", "second"]);
+    write_claude_messages(&workflow, &["first", "second", "third"]);
+    let paths = Paths::new(Some(temporary.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![root];
+    let lease = ingest_lease(&paths);
+    let open = || SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_texts(&paths), ["first", "second", "third"]);
+    assert_eq!(
+        indexed_source_paths(&paths),
+        std::slice::from_ref(&workflow)
+    );
+
+    // The direct copy is rewritten as a tail and then resumed. A watcher hint for it alone
+    // must preserve the workflow copy's earlier messages under the new projection owner.
+    fs::write(&direct, "").unwrap();
+    append_claude_message(&direct, "second");
+    append_claude_message(&direct, "third");
+    append_claude_message(&direct, "fourth");
+    let dirty = HashSet::from([direct.clone()]);
+    let result = ingest_dirty(&paths, &open(), &options, &lease, &dirty).unwrap();
+    assert!(!result.full_scan);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["first", "fourth", "second", "third"]
+    );
+    assert_eq!(indexed_source_paths(&paths), std::slice::from_ref(&direct));
+
+    // A full scan keeps the same choice.
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_source_paths(&paths), std::slice::from_ref(&direct));
+
+    // Without a watcher hint, a full scan still notices that the retired copy grew: listings of
+    // unchanged directories hold only indexed files, so the copies are looked up on disk.
+    append_claude_message(&workflow, "fourth");
+    append_claude_message(&workflow, "fifth");
+    ingest_all(&paths, &open(), &options, &lease).unwrap();
+    assert_eq!(indexed_source_paths(&paths), [workflow]);
+    assert_eq!(
+        indexed_texts(&paths),
+        ["fifth", "first", "fourth", "second", "third"]
+    );
+    let analytics = AnalyticsStore::open(analytics_path(&paths.state)).unwrap();
+    assert_eq!(analytics.session_count().unwrap(), 1);
+}
+
+#[test]
+fn several_claude_roots_index_together() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path();
+    let legacy = home.join(".claude/projects");
+    let work = home.join(".claude-profiles/work/projects");
+    write_claude_messages(
+        &legacy.join("-tmp-project/legacy.jsonl"),
+        &["legacy question"],
+    );
+    write_claude_messages(&work.join("-tmp-project/work.jsonl"), &["work question"]);
+    let paths = Paths::new(Some(home.join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![
+        legacy,
+        work,
+        home.join(".claude-profiles/not-yet-used/projects"),
+    ];
+
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    assert_eq!(indexed_texts(&paths), ["legacy question", "work question"]);
+}
+
+#[test]
+fn moved_claude_config_directory_retires_old_rows_but_keeps_lost_ones() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path();
+    let legacy = home.join(".claude/projects");
+    let profile = home.join(".claude-profiles/personal/projects");
+    write_claude_messages(
+        &legacy.join("-tmp-moved/session.jsonl"),
+        &["moved conversation"],
+    );
+    write_claude_messages(
+        &legacy.join("-tmp-lost/session.jsonl"),
+        &["lost conversation"],
+    );
+    let paths = Paths::new(Some(home.join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let index = SearchIndex::open_or_create(&paths.index).unwrap();
+    let mut options = ingest_options(false, ModelChoice::bge_small());
+    options.claude_sources = vec![legacy.clone(), profile.clone()];
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    // The whole config directory moves into a profile; one conversation does not survive.
+    fs::create_dir_all(home.join(".claude-profiles")).unwrap();
+    fs::rename(home.join(".claude"), home.join(".claude-profiles/personal")).unwrap();
+    fs::remove_dir_all(profile.join("-tmp-lost")).unwrap();
+    ingest_all(&paths, &index, &options, &ingest_lease(&paths)).unwrap();
+
+    assert_eq!(
+        indexed_source_paths(&paths),
+        [
+            legacy.join("-tmp-lost/session.jsonl"),
+            profile.join("-tmp-moved/session.jsonl"),
+        ]
+    );
+    assert_eq!(
+        indexed_texts(&paths),
+        ["lost conversation", "moved conversation"]
+    );
 }
 
 #[test]

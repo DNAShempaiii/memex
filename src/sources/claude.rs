@@ -20,7 +20,8 @@ pub const VERSIONS: ParserVersions = ParserVersions {
     // Preserve pre-reader fallback IDs independently of attachment-only messages,
     // and classify background transcripts consistently across every record.
     index: 8,
-    usage: 4,
+    // Reconcile content blocks and divergent workflow copies as one logical agent.
+    usage: 6,
 };
 
 /// Return the human-facing title Claude stores alongside a conversation.
@@ -138,8 +139,17 @@ pub fn discover(
     Ok(files)
 }
 
-pub fn usage_files() -> Vec<PathBuf> {
-    super::common::jsonl_files(crate::config::default_claude_sources())
+pub fn usage_files(roots: &[PathBuf]) -> Vec<PathBuf> {
+    // Copies can contain unique history. Read them all and reconcile shared responses.
+    super::common::jsonl_files(roots.iter().cloned())
+}
+
+/// A discovered agent copy and the byte boundary captured for this refresh.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentCopy {
+    pub path: PathBuf,
+    pub size: u64,
+    pub metadata_sha256: String,
 }
 
 pub fn session_id_from_path(path: &Path) -> String {
@@ -215,6 +225,158 @@ fn decode_project_name(folder_name: &str) -> String {
     } else {
         meaningful.join("-")
     }
+}
+
+/// Index of the `projects` component that roots a Claude transcript path. Encoded cwd
+/// directories start with `-`, so the last component named `projects` is the root's.
+fn projects_component(path: &Path) -> Option<usize> {
+    path.components()
+        .enumerate()
+        .filter(|(_, component)| component.as_os_str() == "projects")
+        .last()
+        .map(|(index, _)| index)
+}
+
+/// The transcript's path below its `projects` directory: `<encoded cwd>/<session>.jsonl`,
+/// or deeper for agent transcripts. It names the same conversation under any config root.
+pub(crate) fn project_relative_path(path: &Path) -> Option<PathBuf> {
+    let projects = projects_component(path)?;
+    let relative: PathBuf = path.components().skip(projects + 1).collect();
+    (relative.components().count() >= 2).then_some(relative)
+}
+
+/// Name of the Claude config directory a transcript was read from, such as `work` for
+/// `~/.claude-profiles/work/projects/...` or `.claude` for `~/.claude/projects/...`.
+pub fn profile_from_path(path: &Path) -> Option<String> {
+    let projects = projects_component(path)?;
+    let config_dir = path.components().nth(projects.checked_sub(1)?)?;
+    match config_dir {
+        std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// The `subagents` directory and file name shared by every copy of an agent transcript.
+/// Workflow runs store each agent twice, as `subagents/agent-<id>.jsonl` and as
+/// `subagents/workflows/<run>/agent-<id>.jsonl`.
+pub(crate) fn agent_copy_key(path: &Path) -> Option<(PathBuf, std::ffi::OsString)> {
+    let name = path.file_name()?;
+    if !name.to_str()?.starts_with("agent-") {
+        return None;
+    }
+    let parent = path.parent()?;
+    let subagents = if parent.file_name()? == "subagents" {
+        parent
+    } else {
+        let workflows = parent.parent()?;
+        let subagents = workflows.parent()?;
+        (workflows.file_name()? == "workflows" && subagents.file_name()? == "subagents")
+            .then_some(subagents)?
+    };
+    Some((subagents.to_path_buf(), name.to_os_string()))
+}
+
+/// The workflow run directories under a `subagents` directory.
+pub(crate) fn workflow_runs(subagents: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(subagents.join("workflows"))
+        .map(|runs| runs.flatten().map(|run| run.path()).collect())
+        .unwrap_or_default()
+}
+
+/// Every copy of one agent transcript that exists on disk.
+pub(crate) fn agent_copies(
+    subagents: &Path,
+    runs: &[PathBuf],
+    name: &std::ffi::OsStr,
+) -> Vec<PathBuf> {
+    let mut copies = vec![subagents.join(name)];
+    copies.extend(runs.iter().map(|run| run.join(name)));
+    copies.retain(|path| path.is_file());
+    copies
+}
+
+/// Map each duplicate to the path that owns its merged index projection. Usage retains the
+/// physical copies so its file cache observes changes to every part of the logical agent.
+pub(crate) fn agent_copy_owners(
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> std::collections::HashMap<PathBuf, PathBuf> {
+    let mut groups = std::collections::HashMap::<_, Vec<PathBuf>>::new();
+    for path in paths {
+        if let Some(key) = agent_copy_key(&path) {
+            groups.entry(key).or_default().push(path);
+        }
+    }
+    let mut owners = std::collections::HashMap::new();
+    for mut copies in groups.into_values() {
+        copies.sort();
+        copies.dedup();
+        if copies.len() < 2 {
+            continue;
+        }
+        let owner = preferred_agent_copy(&copies)
+            .expect("a duplicated agent has copies")
+            .clone();
+        owners.extend(copies.into_iter().map(|copy| (copy, owner.clone())));
+    }
+    owners
+}
+
+/// The path that owns an agent's merged index projection. The workflow copy is written as
+/// the agent runs; the direct copy appears later, may hold only the tail, and gains resumed
+/// records. Prefer the newest last record, then file size, then the direct `subagents/` copy.
+/// Timestamps count only when every copy's last record is readable. This selects a source
+/// path, never a reason to discard unique events from another copy.
+pub(crate) fn preferred_agent_copy(copies: &[PathBuf]) -> Option<&PathBuf> {
+    let timestamps = copies
+        .iter()
+        .map(|path| last_record_timestamp(path))
+        .collect::<Option<Vec<_>>>();
+    copies
+        .iter()
+        .enumerate()
+        .max_by_key(|(index, path)| {
+            let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+            (
+                timestamps
+                    .as_ref()
+                    .map(|timestamps| timestamps[*index].clone()),
+                size,
+                std::cmp::Reverse(path.components().count()),
+            )
+        })
+        .map(|(_, path)| path)
+}
+
+/// The `timestamp` of the last record in a transcript's final 256 KiB. Most last lines are a
+/// few KiB, so a short tail is tried first.
+fn last_record_timestamp(path: &Path) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Stamped {
+        timestamp: Option<String>,
+    }
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    for tail_bytes in [16 * 1024, 256 * 1024] {
+        let start = len.saturating_sub(tail_bytes);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).ok()?;
+        // Unless the tail is the whole file, its first line began before it.
+        let complete = match tail.iter().position(|byte| *byte == b'\n') {
+            Some(newline) if start > 0 => &tail[newline + 1..],
+            None if start > 0 => &[],
+            _ => &tail[..],
+        };
+        let timestamp = complete.rsplit(|byte| *byte == b'\n').find_map(|line| {
+            serde_json::from_slice::<Stamped>(line)
+                .ok()
+                .and_then(|record| record.timestamp)
+        });
+        if timestamp.is_some() || start == 0 {
+            return timestamp;
+        }
+    }
+    None
 }
 
 pub fn is_subagent_path(path: &Path) -> bool {
@@ -352,6 +514,137 @@ pub(crate) fn parse_index_records_with_background(
     known_background: Option<bool>,
     byte_boundary: u64,
     next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
+    let file = File::open(path)?;
+    let mmap = super::common::map_sequential(&file)?;
+    parse_index_bytes(
+        path,
+        bounded_transcript_bytes(&mmap, byte_boundary),
+        state,
+        include_reasoning,
+        known_background,
+        next_doc_id,
+        emit,
+    )
+}
+
+/// A growing file's captured boundary may end inside a line. Leave that line for the next
+/// refresh, even if its prefix happens to be valid JSON before the writer finishes it.
+fn bounded_transcript_bytes(bytes: &[u8], byte_boundary: u64) -> &[u8] {
+    let end = byte_boundary.min(bytes.len() as u64) as usize;
+    let captured = &bytes[..end];
+    if end < bytes.len() && !captured.ends_with(b"\n") {
+        &captured[..captured
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1)]
+    } else {
+        captured
+    }
+}
+
+/// Read every copy at its discovered boundary, deduplicate shared events, and parse the
+/// chronological union under one source path. The source transcripts are never rewritten.
+pub(crate) fn parse_agent_records(
+    owner: &Path,
+    copies: &[AgentCopy],
+    include_reasoning: bool,
+    next_doc_id: &AtomicU64,
+    emit: impl FnMut(Record) -> Result<()>,
+) -> Result<(IndexParseOutput, bool)> {
+    use std::collections::{HashMap, HashSet};
+
+    let mut lines = Vec::new();
+    let mut seen = HashSet::new();
+    // Keep the owner's representation when copies differ in metadata for the same event.
+    let mut copies = copies.iter().collect::<Vec<_>>();
+    copies.sort_by_key(|copy| (copy.path != owner, &copy.path));
+    for copy in copies {
+        let file = File::open(&copy.path)?;
+        let mmap = super::common::map_sequential(&file)?;
+        let bytes = bounded_transcript_bytes(&mmap, copy.size);
+        let mut occurrences = HashMap::new();
+        for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let value = match serde_json::from_slice::<Value>(line) {
+                Ok(value) => Some(value),
+                Err(error) if !line.ends_with(b"\n") && error.is_eof() => continue,
+                Err(_) => None,
+            };
+            let key = value.as_ref().map(|value| {
+                if let Some(uuid) = value
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .filter(|uuid| !uuid.is_empty())
+                {
+                    // Content blocks can share an event UUID. Match the block as well so a
+                    // tail-only copy cannot hide a different block from the same response.
+                    serde_json::json!([
+                        value.get("type"),
+                        uuid,
+                        value
+                            .get("message")
+                            .and_then(|message| message.get("content"))
+                    ])
+                    .to_string()
+                } else if let Some(message) = value.get("message") {
+                    serde_json::json!([
+                        value.get("type"),
+                        value.get("timestamp"),
+                        message.get("id"),
+                        message.get("role"),
+                        message.get("content")
+                    ])
+                    .to_string()
+                } else {
+                    value.to_string()
+                }
+            });
+            if let Some(key) = key {
+                // Repeated identical events within one file remain distinct. Only matching
+                // occurrences in another physical copy are suppressed.
+                let occurrence = occurrences.entry(key.clone()).or_insert(0usize);
+                let unique = seen.insert((key, *occurrence));
+                *occurrence += 1;
+                if !unique {
+                    continue;
+                }
+            }
+            let timestamp = value
+                .as_ref()
+                .and_then(|value| value.get("timestamp"))
+                .and_then(Value::as_str)
+                .and_then(super::common::parse_iso_millis)
+                .unwrap_or(0);
+            lines.push((timestamp, line.to_vec()));
+        }
+    }
+    lines.sort_by_key(|(timestamp, _)| *timestamp);
+    let mut merged = Vec::new();
+    for (_, line) in lines {
+        merged.extend_from_slice(&line);
+        if !line.ends_with(b"\n") {
+            merged.push(b'\n');
+        }
+    }
+    parse_index_bytes(
+        owner,
+        &merged,
+        IndexParseState::default(),
+        include_reasoning,
+        None,
+        next_doc_id,
+        emit,
+    )
+}
+
+fn parse_index_bytes(
+    path: &Path,
+    mmap: &[u8],
+    state: IndexParseState,
+    include_reasoning: bool,
+    known_background: Option<bool>,
+    next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<(IndexParseOutput, bool)> {
     let mut legacy_turn_id = state.legacy_ordinal()?;
@@ -365,13 +658,6 @@ pub(crate) fn parse_index_records_with_background(
     use memchr::memchr;
     use simd_json::prelude::*;
 
-    let file = File::open(path)?;
-    let mmap = super::common::map_sequential(&file)?;
-    // Discovery captured this boundary before parsing began. Never consume
-    // bytes appended after it: they need a fresh metadata probe so a late
-    // `sessionKind: "bg"` marker can reclassify the whole transcript.
-    let defer_unterminated_tail = byte_boundary < mmap.len() as u64;
-    let mmap = &mmap[..byte_boundary.min(mmap.len() as u64) as usize];
     // `sessionKind` is not repeated on every event. Establish this file-level
     // origin before emitting any records so a later `bg` marker cannot leave
     // the transcript split between interactive and background classifications.
@@ -400,9 +686,6 @@ pub(crate) fn parse_index_records_with_background(
         // start offset so the next ingest reads the complete record. A final
         // non-newline record is still valid when this mmap is exactly the task
         // boundary.
-        if !has_newline && defer_unterminated_tail {
-            break;
-        }
         let line = &slice[..relative];
         start += relative + usize::from(has_newline);
         if line.is_empty() {
@@ -870,18 +1153,41 @@ fn usage_timestamp_millis(timestamp: &simd_json::BorrowedValue<'_>) -> u64 {
 pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
     use std::collections::HashMap;
 
-    let mut best_exact: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut best_exact: HashMap<(&str, &str, &str), usize> = HashMap::new();
+    let mut best_agent = HashMap::new();
     let mut keep = vec![true; events.len()];
     for (index, event) in events.iter().enumerate() {
         if event.source != "claude" {
             continue;
         }
-        let (Some(message), Some(request)) =
-            (event.message_id.as_deref(), event.request_id.as_deref())
-        else {
+        if let Some(message) = event.message_id.as_deref()
+            && let Some(agent) = agent_copy_key(Path::new(&*event.source_path))
+        {
+            // The direct copy can omit requestId or hold only the resumed tail. Message IDs
+            // still name responses within the same logical agent across all its copies.
+            if let Some(previous) = best_agent.get(&(agent.clone(), message)).copied() {
+                if choose_usage(&events[previous], event) {
+                    keep[index] = false;
+                } else {
+                    keep[previous] = false;
+                    best_agent.insert((agent, message), index);
+                }
+            } else {
+                best_agent.insert((agent, message), index);
+            }
+        }
+    }
+    for (index, event) in events.iter().enumerate() {
+        if !keep[index] || event.source != "claude" {
             continue;
+        }
+        // Claude Code writes one line per content block, each repeating the response's usage.
+        // Without a `requestId`, the message ID still names the response within its file.
+        let key = match (event.message_id.as_deref(), event.request_id.as_deref()) {
+            (Some(message), Some(request)) => (message, request, ""),
+            (Some(message), None) => (message, "", &*event.source_path),
+            (None, _) => continue,
         };
-        let key = (message, request);
         if let Some(previous) = best_exact.get(&key).copied() {
             if choose_usage(&events[previous], event) {
                 keep[index] = false;
@@ -903,11 +1209,14 @@ pub(crate) fn reconcile_usage(events: &mut Vec<UsageEvent>) {
         }
     }
     for indices in by_message.into_values() {
-        if indices.len() < 2 || !indices.iter().any(|index| !events[*index].sidechain) {
+        let is_agent = |event: &UsageEvent| {
+            event.sidechain || is_subagent_path(Path::new(&*event.source_path))
+        };
+        if indices.len() < 2 || !indices.iter().any(|index| !is_agent(&events[*index])) {
             continue;
         }
         for index in indices {
-            if events[index].sidechain {
+            if is_agent(&events[index]) {
                 keep[index] = false;
             }
         }
@@ -1142,6 +1451,268 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session_title(&path, "s").as_deref(), Some("Escaped type"));
+    }
+
+    #[test]
+    fn transcript_paths_name_their_profile_and_conversation() {
+        let main = Path::new("/home/u/.claude-profiles/work/projects/-home-u-repo/s.jsonl");
+        let agent = Path::new(
+            "/home/u/.claude/projects/-home-u-projects/s/subagents/workflows/wf_1/agent-a.jsonl",
+        );
+        assert_eq!(profile_from_path(main).as_deref(), Some("work"));
+        assert_eq!(profile_from_path(agent).as_deref(), Some(".claude"));
+        assert_eq!(profile_from_path(Path::new("/data/claude/s.jsonl")), None);
+        assert_eq!(
+            project_relative_path(main),
+            Some(PathBuf::from("-home-u-repo/s.jsonl"))
+        );
+        assert_eq!(
+            project_relative_path(agent),
+            Some(PathBuf::from(
+                "-home-u-projects/s/subagents/workflows/wf_1/agent-a.jsonl"
+            ))
+        );
+        assert_eq!(
+            project_relative_path(Path::new("/x/projects/s.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn agent_copies_share_a_key_and_equal_sizes_keep_the_direct_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        fs::write(&direct, "{}\n").unwrap();
+        fs::write(&workflow, "{}\n").unwrap();
+        fs::write(subagents.join("workflows/wf_1/journal.jsonl"), "{}\n").unwrap();
+
+        assert_eq!(agent_copy_key(&direct), agent_copy_key(&workflow));
+        assert_eq!(
+            agent_copy_key(&subagents.join("workflows/wf_1/journal.jsonl")),
+            None
+        );
+        assert_eq!(
+            agent_copy_key(&temp.path().join("projects/-p/agent-a.jsonl")),
+            None
+        );
+        let (directory, name) = agent_copy_key(&workflow).unwrap();
+        let mut copies = agent_copies(&directory, &workflow_runs(&directory), &name);
+        copies.sort();
+        assert_eq!(copies, [direct.clone(), workflow.clone()]);
+        assert_eq!(preferred_agent_copy(&copies), Some(&direct));
+        fs::write(&workflow, "{}\n{}\n").unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+    }
+
+    #[test]
+    fn the_agent_copy_with_the_newest_record_wins_over_a_larger_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let record = |uuid: &str, minute: u32, extra: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"{uuid}\",{extra}\"timestamp\":\"2026-10-11T10:{minute:02}:00.000Z\",\"message\":{{\"content\":\"x\"}}}}\n"
+            )
+        };
+        // The workflow copy repeats extra fields on every line.
+        let extra = format!("\"version\":\"{}\",", "2".repeat(200));
+        fs::write(
+            &workflow,
+            record("u1", 1, &extra) + &record("u2", 2, &extra),
+        )
+        .unwrap();
+        // A resumed agent adds one short record to the direct copy only.
+        fs::write(
+            &direct,
+            record("u1", 1, "") + &record("u2", 2, "") + &record("u3", 3, ""),
+        )
+        .unwrap();
+        assert!(fs::metadata(&direct).unwrap().len() < fs::metadata(&workflow).unwrap().len());
+        let copies = [direct.clone(), workflow.clone()];
+        assert_eq!(preferred_agent_copy(&copies), Some(&direct));
+
+        // A direct copy rewritten with only the tail ends on the same record and loses to the
+        // complete workflow copy.
+        fs::write(&direct, record("u2", 2, "")).unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+
+        // A last line longer than the tail hides the workflow copy's newest record; an older
+        // direct copy must not win by default, so sizes decide.
+        let huge = format!("\"content\":\"{}\",", "x".repeat(300 * 1024));
+        fs::write(
+            &workflow,
+            record("u1", 1, &extra) + &record("u2", 2, &extra) + &record("u3", 3, &huge),
+        )
+        .unwrap();
+        fs::write(&direct, record("u1", 1, "") + &record("u2", 2, "")).unwrap();
+        assert_eq!(preferred_agent_copy(&copies), Some(&workflow));
+    }
+
+    #[test]
+    fn usage_reads_all_copies_and_counts_a_workflow_response_once() {
+        let _guard = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let _env = crate::test_support::EnvVarGuard::set_os(&[(
+            "CLAUDE_CONFIG_DIR",
+            Some(temp.path().as_os_str()),
+        )]);
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        // Claude Code omits `requestId` from the direct copy only, so reconciliation alone
+        // cannot tell that both copies record the same response.
+        let line = r#"{"type":"assistant","isSidechain":true,"message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        fs::write(&direct, format!("{line}\n")).unwrap();
+        fs::write(
+            &workflow,
+            format!(
+                "{}\n",
+                line.replacen('{', r#"{"requestId":"req_1","version":"2.1","#, 1)
+            ),
+        )
+        .unwrap();
+        let mut both = parse_usage_file(&direct).unwrap();
+        both.extend(parse_usage_file(&workflow).unwrap());
+        reconcile_usage(&mut both);
+        assert_eq!(both.len(), 1);
+
+        assert_eq!(
+            usage_files(&crate::config::default_claude_sources()),
+            [direct, workflow]
+        );
+    }
+
+    #[test]
+    fn usage_still_prefers_a_parent_response_when_agent_copies_omit_sidechain_flags() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("projects/-p");
+        let parent = project.join("s.jsonl");
+        let direct = project.join("s/subagents/agent-a.jsonl");
+        let workflow = project.join("s/subagents/workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let requested = line.replacen('{', r#"{"requestId":"req_1","#, 1);
+        fs::write(&parent, format!("{requested}\n")).unwrap();
+        fs::write(&direct, format!("{line}\n")).unwrap();
+        fs::write(&workflow, format!("{requested}\n")).unwrap();
+        let mut events = parse_usage_file(&direct).unwrap();
+        events.extend(parse_usage_file(&workflow).unwrap());
+        events.extend(parse_usage_file(&parent).unwrap());
+
+        reconcile_usage(&mut events);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(&*events[0].source_path, parent.to_str().unwrap());
+        assert_eq!(events[0].tokens.total(), 15);
+    }
+
+    #[test]
+    fn merged_agent_blocks_keep_unique_content_and_reconstruct_tool_pairs_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let subagents = temp.path().join("projects/-p/s/subagents");
+        let direct = subagents.join("agent-a.jsonl");
+        let workflow = subagents.join("workflows/wf_1/agent-a.jsonl");
+        fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+        let line = |uuid: &str, minute: u32, kind: &str, content: Value| {
+            serde_json::json!({
+                "type": kind, "uuid": uuid,
+                "timestamp": format!("2026-10-11T10:{minute:02}:00.000Z"),
+                "message": {"content": content}
+            })
+            .to_string()
+                + "\n"
+        };
+        let first = line(
+            "shared",
+            1,
+            "assistant",
+            serde_json::json!([{"type":"text","text":"first block"}]),
+        );
+        let second = line(
+            "shared",
+            2,
+            "assistant",
+            serde_json::json!([{"type":"text","text":"second block"}]),
+        );
+        let tool = line(
+            "call",
+            3,
+            "assistant",
+            serde_json::json!([{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"x"}}]),
+        );
+        let result = line(
+            "result",
+            4,
+            "user",
+            serde_json::json!([{"type":"tool_result","tool_use_id":"tool-1","content":"contents"}]),
+        );
+        fs::write(&workflow, format!("{first}{second}{tool}")).unwrap();
+        fs::write(&direct, format!("{second}{result}")).unwrap();
+        let copies = [&direct, &workflow]
+            .into_iter()
+            .map(|path| AgentCopy {
+                path: path.clone(),
+                size: fs::metadata(path).unwrap().len(),
+                metadata_sha256: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut records = Vec::new();
+
+        let (parsed, _) =
+            parse_agent_records(&direct, &copies, false, &AtomicU64::new(1), |record| {
+                records.push(record);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[0].text, "first block");
+        assert_eq!(records[1].text, "second block");
+        assert_eq!(records[2].role, "tool_use");
+        assert_eq!(records[3].role, "tool_result");
+        assert_eq!(records[3].tool_name.as_deref(), Some("Read"));
+        assert!(
+            records
+                .iter()
+                .all(|record| record.source_path == direct.to_string_lossy())
+        );
+        assert_eq!(parsed.diagnostics.orphan_tool_results, 0);
+    }
+
+    #[test]
+    fn usage_counts_each_content_block_response_once_without_request_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent-a.jsonl");
+        let line = |output: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{{\"id\":\"msg_1\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":{output}}}}}}}\n"
+            )
+        };
+        // Two content blocks of one response, then a separate response.
+        let other = line(7).replace("msg_1", "msg_2");
+        fs::write(&path, format!("{}{}{other}", line(4), line(5))).unwrap();
+        let mut events = parse_usage_file(&path).unwrap();
+        // The same response in another file is not merged without a request ID.
+        let elsewhere = temp.path().join("other.jsonl");
+        fs::write(&elsewhere, line(5)).unwrap();
+        events.extend(parse_usage_file(&elsewhere).unwrap());
+
+        reconcile_usage(&mut events);
+
+        let mut outputs = events
+            .iter()
+            .map(|event| (event.source_path.to_string(), event.tokens.output))
+            .collect::<Vec<_>>();
+        outputs.sort();
+        let path = path.to_string_lossy().into_owned();
+        let elsewhere = elsewhere.to_string_lossy().into_owned();
+        assert_eq!(outputs, [(path.clone(), 5), (path, 7), (elsewhere, 5)]);
     }
 
     #[test]
