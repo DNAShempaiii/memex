@@ -89,7 +89,7 @@ current revision. Runtime-dependent results below apply to the older lock.
   Providers & Tools live inspection was limited by a native UI-tool pipe
   failure; its component tests passed.
 - The current pin in [runtime-source.json](../apps/macos/runtime-source.json) is
-  `a4f5a18796c8fa661b8369541462a937a1e7338f`. The packaged and installed-app
+  `e610a6f585d9c8c1fbca025a5a8aa47c11e650f2`. The packaged and installed-app
   checks above have not been recorded for that revision. Private runtime CI was
   blocked before execution at the older lock, and no CI result is recorded for
   the current pin. Treat runtime-enabled packaging at the current pin
