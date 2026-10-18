@@ -18,6 +18,8 @@ Usage: prepare-runtime.sh [--source PATH] [--output PATH] [--verify]
                           [--development | --candidate-revision FULL_SHA] [--require-published]
 
 ARCHES="arm64 x86_64" selects output architectures (default: this Mac).
+MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 builds one host architecture without
+  --target so RUSTFLAGS also reach host tools; requires a fresh Cargo target directory.
 The normal build requires the clean revision in runtime-source.json.
 --development explicitly records local uncommitted work; it is not release input.
 --candidate-revision tests a clean immutable candidate in private CI; it is not release input.
@@ -210,6 +212,22 @@ if [[ -n "${RUSTUP_TOOLCHAIN:-}" ]]; then
   RUSTC_COMMAND=("$TOOLCHAIN_RUSTC")
   if [[ "${CARGO[0]}" != mbx ]]; then CARGO=("$TOOLCHAIN_CARGO"); fi
 fi
+NATIVE_HOST_QUALIFICATION=${MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION:-0}
+case "$NATIVE_HOST_QUALIFICATION" in 0|1) ;; *) fail "MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION must be 0 or 1" ;; esac
+if [[ "$NATIVE_HOST_QUALIFICATION" == 1 ]]; then
+  RUST_HOST=$("${RUSTC_COMMAND[@]}" -vV | sed -n 's/^host: //p')
+  case "$RUST_HOST" in
+    aarch64-apple-darwin) host_arch=arm64 ;;
+    x86_64-apple-darwin) host_arch=x86_64 ;;
+    *) fail "Selected Rust compiler did not report a supported Apple host target" ;;
+  esac
+  [[ ${#ARCH_LIST[@]} == 1 && "${ARCH_LIST[0]}" == "$host_arch" ]] ||
+    fail "Native host qualification requires exactly the Rust compiler's host architecture"
+  # A default Cargo build.target can still redirect an implicit native build.
+  # Never accept an older native archive in place of this invocation's output.
+  [[ -z "$(find "$CARGO_TARGET_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+    fail "Native host qualification requires a fresh Cargo target directory"
+fi
 mkdir -p "$OUTPUT/slices"
 LIBRARY_SLICES=()
 HELPER_SLICES=()
@@ -219,6 +237,16 @@ for arch in "${ARCH_LIST[@]}"; do
     arm64) rust_target=aarch64-apple-darwin; bun_target=bun-darwin-arm64 ;;
     x86_64) rust_target=x86_64-apple-darwin; bun_target=bun-darwin-x64 ;;
   esac
+  cargo_args=(build --locked --manifest-path "$RUNTIME_MANIFEST" --lib --release)
+  library_slice="$CARGO_TARGET_DIR/$rust_target/release/libsq_acp_runtime.a"
+  # Explicit --target withholds RUSTFLAGS from build scripts and proc macros,
+  # even for the host triple. Native builds must normalize those source paths
+  # too when qualifying shared-cache outputs with MBX_VERIFY.
+  if [[ "$NATIVE_HOST_QUALIFICATION" == 1 ]]; then
+    library_slice="$CARGO_TARGET_DIR/release/libsq_acp_runtime.a"
+  else
+    cargo_args+=(--target "$rust_target")
+  fi
   if [[ "${CARGO[0]}" == mbx && ( "${MBX_VERIFY:-0}" == 1 || "${MBX_VERIFY:-0}" == true ) ]]; then
     # mbx returns the compiler status even when shadow verification diverges.
     # A unique report prevents an earlier successful run from qualifying this
@@ -226,7 +254,7 @@ for arch in "${ARCH_LIST[@]}"; do
     verification_report=$(mktemp "$OUTPUT/slices/mbx-verification-$arch.XXXXXX")
     printf 'Boxington verification report: %s\n' "$verification_report"
     (cd "$RUNTIME_ROOT" && MBX_STATS_REPORT="$verification_report" \
-      "${CARGO[@]}" build --locked --manifest-path "$RUNTIME_MANIFEST" --lib --release --target "$rust_target")
+      "${CARGO[@]}" "${cargo_args[@]}")
     if [[ -n "${MBX_STATS_REPORT:-}" && -s "$verification_report" ]]; then
       # Preserve the caller's requested report as well. As with sequential mbx
       # invocations, it contains the most recently completed architecture.
@@ -238,9 +266,10 @@ for arch in "${ARCH_LIST[@]}"; do
       jq -e '.divergences == 0' "$verification_report" >/dev/null 2>&1 ||
       fail "Boxington verification failed or its report is missing/invalid: $verification_report. Runtime outputs are not qualified."
   else
-    (cd "$RUNTIME_ROOT" && "${CARGO[@]}" build --locked --manifest-path "$RUNTIME_MANIFEST" --lib --release --target "$rust_target")
+    (cd "$RUNTIME_ROOT" && "${CARGO[@]}" "${cargo_args[@]}")
   fi
-  library_slice="$CARGO_TARGET_DIR/$rust_target/release/libsq_acp_runtime.a"
+  [[ "$NATIVE_HOST_QUALIFICATION" != 1 || -f "$library_slice" ]] ||
+    fail "Native host qualification produced no native archive; remove any Cargo build.target default"
   helper_slice="$OUTPUT/slices/claude-agent-sdk-host-$arch"
   (cd "$HELPER_ROOT" && bun build --compile --minify --target="$bun_target" ./src/index.ts --outfile "$helper_slice")
   LIBRARY_SLICES+=("$library_slice")

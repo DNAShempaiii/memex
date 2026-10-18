@@ -37,9 +37,14 @@ while [[ $# -gt 0 ]]; do
   if [[ "$1" == --target ]]; then target=$2; shift; fi
   shift
 done
-[[ -n "$target" ]]
-mkdir -p "$CARGO_TARGET_DIR/$target/release"
-printf 'compiled library fixture\n' > "$CARGO_TARGET_DIR/$target/release/libsq_acp_runtime.a"
+if [[ "${FIXTURE_EXPECTED_TARGET+x}" == x ]]; then
+  [[ "$target" == "$FIXTURE_EXPECTED_TARGET" ]] || {
+    echo "Expected target '$FIXTURE_EXPECTED_TARGET', got '$target'" >&2; exit 1;
+  }
+fi
+target="${target:-${CARGO_BUILD_TARGET:-${FIXTURE_CONFIG_TARGET:-}}}"
+mkdir -p "$CARGO_TARGET_DIR${target:+/$target}/release"
+printf 'compiled library fixture %s\n' "${target:-native}" > "$CARGO_TARGET_DIR${target:+/$target}/release/libsq_acp_runtime.a"
 STUB
 cat > "$scratch/bin/mbx" <<'STUB'
 #!/usr/bin/env bash
@@ -70,9 +75,25 @@ case "$1" in
   *) exit 1 ;;
 esac
 STUB
-printf '#!/usr/bin/env bash\necho fixture\n' > "$scratch/bin/rustc"
+cat > "$scratch/bin/rustc" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == -vV ]]; then
+  printf 'host: %s\n' "${FIXTURE_RUST_HOST-aarch64-apple-darwin}"
+else
+  echo fixture
+fi
+STUB
 printf '#!/usr/bin/env bash\necho 26.0\n' > "$scratch/bin/xcrun"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$scratch/bin/lipo"
+cat > "$scratch/bin/lipo" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == -create ]]; then
+  shift
+  inputs=()
+  while [[ "$1" != -output ]]; do inputs+=("$1"); shift; done
+  cat "${inputs[@]}" > "$2"
+fi
+STUB
 cat > "$scratch/bin/otool" <<'STUB'
 #!/usr/bin/env bash
 printf 'fixture.o:\n cmd LC_BUILD_VERSION\n minos %s\n' "${FIXTURE_MINIMUM_OS:-14.0}"
@@ -85,6 +106,7 @@ export MEMEX_RUNTIME_OUTPUT="$scratch/output"
 export CARGO_TARGET_DIR="$scratch/cargo"
 unset MEMEX_AGENT_RUNTIME_LIBRARY MEMEX_CLAUDE_HELPER
 unset RUSTUP_TOOLCHAIN
+unset CARGO_BUILD_TARGET MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION
 prepare="$scratch/app/scripts/prepare-runtime.sh"
 
 expect_failure() {
@@ -97,8 +119,46 @@ expect_failure() {
 }
 
 expect_failure 'output is missing' bash "$prepare" --verify
-bash "$prepare"
+env FIXTURE_EXPECTED_TARGET=aarch64-apple-darwin bash "$prepare"
+grep -Fxq 'compiled library fixture aarch64-apple-darwin' "$scratch/output/libsq_acp_runtime.a"
 bash "$prepare" --verify
+env ARCHES=x86_64 FIXTURE_EXPECTED_TARGET=x86_64-apple-darwin bash "$prepare"
+grep -Fxq 'compiled library fixture x86_64-apple-darwin' "$scratch/output/libsq_acp_runtime.a"
+env ARCHES=x86_64 FIXTURE_RUST_HOST=x86_64-apple-darwin FIXTURE_EXPECTED_TARGET=x86_64-apple-darwin bash "$prepare"
+grep -Fxq 'compiled library fixture x86_64-apple-darwin' "$scratch/output/libsq_acp_runtime.a"
+env FIXTURE_RUST_HOST=x86_64-apple-darwin FIXTURE_EXPECTED_TARGET=aarch64-apple-darwin bash "$prepare"
+grep -Fxq 'compiled library fixture aarch64-apple-darwin' "$scratch/output/libsq_acp_runtime.a"
+env ARCHES='arm64 x86_64' MBX_VERIFY=1 bash "$prepare"
+grep -Fxq 'compiled library fixture aarch64-apple-darwin' "$scratch/output/libsq_acp_runtime.a"
+grep -Fxq 'compiled library fixture x86_64-apple-darwin' "$scratch/output/libsq_acp_runtime.a"
+env ARCHES='arm64 x86_64' bash "$prepare" --verify
+# Only native-host qualification opts out of --target, with fresh build state.
+env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 MBX_VERIFY=1 FIXTURE_EXPECTED_TARGET= \
+  CARGO_TARGET_DIR="$scratch/native-arm64" bash "$prepare"
+grep -Fxq 'compiled library fixture native' "$scratch/output/libsq_acp_runtime.a"
+bash "$prepare" --verify
+env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 ARCHES=x86_64 FIXTURE_RUST_HOST=x86_64-apple-darwin \
+  FIXTURE_EXPECTED_TARGET= CARGO_TARGET_DIR="$scratch/native-x86" bash "$prepare"
+grep -Fxq 'compiled library fixture native' "$scratch/output/libsq_acp_runtime.a"
+expect_failure 'fresh Cargo target directory' env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 \
+  CARGO_TARGET_DIR="$scratch/native-arm64" bash "$prepare"
+expect_failure 'exactly the Rust compiler' env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 \
+  ARCHES=x86_64 bash "$prepare"
+expect_failure 'exactly the Rust compiler' env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 \
+  ARCHES='arm64 x86_64' bash "$prepare"
+expect_failure 'supported Apple host target' env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 \
+  FIXTURE_RUST_HOST= bash "$prepare"
+for target_setting in CARGO_BUILD_TARGET FIXTURE_CONFIG_TARGET; do
+  expect_failure 'produced no native archive' env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 \
+    "$target_setting=aarch64-apple-darwin" CARGO_TARGET_DIR="$scratch/default-$target_setting" \
+    MEMEX_RUNTIME_OUTPUT="$scratch/default-output-$target_setting" bash "$prepare"
+  [[ ! -e "$scratch/default-output-$target_setting/runtime-provenance.json" ]]
+done
+expect_failure 'Boxington verification failed' env MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 \
+  MBX_VERIFY=1 FIXTURE_DIVERGENCES=1 CARGO_TARGET_DIR="$scratch/native-divergence" \
+  MEMEX_RUNTIME_OUTPUT="$scratch/native-divergence-output" bash "$prepare"
+[[ ! -e "$scratch/native-divergence-output/runtime-provenance.json" ]]
+bash "$prepare"
 expect_failure 'exceeds the deployment target' env FIXTURE_MINIMUM_OS=27.0 bash "$prepare" --verify
 jq -e --arg revision "$revision" '.mode == "locked" and .source.revision == $revision and .source.dirty == false' \
   "$scratch/output/runtime-provenance.json" >/dev/null
@@ -153,7 +213,9 @@ expect_failure 'applies only to the locked' bash "$prepare" --verify --developme
 # accepted by actual Cargo binaries, only by rustup proxies.
 mkdir -p "$scratch/toolchain/bin"
 cp "$scratch/bin/cargo" "$scratch/toolchain/bin/cargo"
-printf '#!/usr/bin/env bash\necho "rustc selected-toolchain"\n' > "$scratch/toolchain/bin/rustc"
+sed -e 's/echo fixture/echo "rustc selected-toolchain"/' \
+  -e 's/FIXTURE_RUST_HOST-aarch64-apple-darwin/FIXTURE_RUST_HOST-x86_64-apple-darwin/' \
+  "$scratch/bin/rustc" > "$scratch/toolchain/bin/rustc"
 chmod +x "$scratch/toolchain/bin/rustc"
 cat > "$scratch/bin/rustup" <<'STUB'
 #!/usr/bin/env bash
@@ -163,10 +225,17 @@ printf '%s/%s\n' "$FIXTURE_TOOLCHAIN" "$4"
 STUB
 chmod +x "$scratch/bin/rustup"
 env RUSTUP_TOOLCHAIN=stable FIXTURE_TOOLCHAIN="$scratch/toolchain/bin" \
+  FIXTURE_EXPECTED_TARGET=aarch64-apple-darwin \
   EXPECTED_CARGO="$scratch/toolchain/bin/cargo" EXPECTED_RUSTC="$scratch/toolchain/bin/rustc" \
   EXPECTED_WRAPPER="${RUSTC_WRAPPER:-}" bash "$prepare"
 jq -e '.toolchain.rustc == "rustc selected-toolchain"' "$scratch/output/runtime-provenance.json" >/dev/null
 env RUSTUP_TOOLCHAIN=stable FIXTURE_TOOLCHAIN="$scratch/toolchain/bin" \
+  MEMEX_RUNTIME_NATIVE_HOST_QUALIFICATION=1 ARCHES=x86_64 FIXTURE_EXPECTED_TARGET= \
+  CARGO_TARGET_DIR="$scratch/selected-native" \
+  EXPECTED_CARGO="$scratch/toolchain/bin/cargo" EXPECTED_RUSTC="$scratch/toolchain/bin/rustc" \
+  EXPECTED_WRAPPER="${RUSTC_WRAPPER:-}" bash "$prepare"
+env RUSTUP_TOOLCHAIN=stable FIXTURE_TOOLCHAIN="$scratch/toolchain/bin" \
+  FIXTURE_EXPECTED_TARGET=aarch64-apple-darwin \
   EXPECTED_CARGO="$scratch/toolchain/bin/cargo" EXPECTED_RUSTC="$scratch/toolchain/bin/rustc" \
   RUSTC_WRAPPER=fixture-wrapper EXPECTED_WRAPPER=fixture-wrapper bash "$prepare"
 jq -e '.toolchain.cargoDriver == "cargo" and .toolchain.rustc == "rustc selected-toolchain"' \
