@@ -9,7 +9,7 @@ use crate::machine::{
     MAX_HYDRATE_LINE_BYTES, MAX_SESSION_BATCH_SIZE, MAX_SESSION_PAGE_SIZE, SearchMode, SearchSpec,
     SessionListSpec, SessionPageRequest, UsageSpec, federated_memory_search, federated_sessions,
     federated_usage, read_context, read_memory, read_record, read_session_pages,
-    session_page_context,
+    refresh_local_sessions, session_page_context,
 };
 use crate::memory::MemoryStore;
 use crate::memory_search::{
@@ -3684,6 +3684,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             limit,
         } => {
             check_index(&machine)?;
+            if machine == crate::machine::LOCAL_MACHINE_ID {
+                refresh_local_sessions(
+                    paths,
+                    &config,
+                    [(session_id.as_str(), source_path.as_str())],
+                )?;
+            }
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -3715,6 +3722,13 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
             max_chars,
         } => {
             check_index(&machine)?;
+            if machine == crate::machine::LOCAL_MACHINE_ID {
+                refresh_local_sessions(
+                    paths,
+                    &config,
+                    [(session_id.as_str(), source_path.as_str())],
+                )?;
+            }
             let (records, page) = collect_session_page(
                 paths,
                 &config,
@@ -4464,6 +4478,18 @@ fn run_hydrate(
             )
         })
         .collect();
+    // One refresh covers every local request; when a strict refresh fails, only the local
+    // pages report it.
+    let local_refresh = refresh_local_sessions(
+        &paths,
+        &config,
+        requests
+            .iter()
+            .filter(|(machine, _)| machine == crate::machine::LOCAL_MACHINE_ID)
+            .map(|(_, request)| (request.session_id.as_str(), request.source_path.as_str())),
+    )
+    .err()
+    .map(|error| format!("{error:#}"));
     let mut writer = output.writer();
     let mut remaining = budget.remaining();
     let mut position = 0;
@@ -4478,6 +4504,15 @@ fn run_hydrate(
             .iter()
             .map(|(_, request)| request.clone())
             .collect();
+        if machine == crate::machine::LOCAL_MACHINE_ID
+            && let Some(error) = &local_refresh
+        {
+            for request in &batch {
+                writer.write(hydrate_error_value(machine, request, error)?)?;
+            }
+            position = end;
+            continue;
+        }
         match read_session_pages(&paths, &config, machine, &batch, remaining) {
             Ok(pages) => {
                 for page in pages {
@@ -4675,6 +4710,13 @@ fn run_session(args: SessionRunArgs) -> Result<()> {
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let source_path = source_path.unwrap_or_default();
+    if machine == crate::machine::LOCAL_MACHINE_ID {
+        refresh_local_sessions(
+            &paths,
+            &config,
+            [(session_id.as_str(), source_path.as_str())],
+        )?;
+    }
     let (records, page) = collect_session_page(
         &paths,
         &config,

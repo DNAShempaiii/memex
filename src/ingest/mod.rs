@@ -216,19 +216,38 @@ struct VectorMigration {
     model: ModelChoice,
 }
 
-/// Check if scan cache is fresh and vector state is usable; if so, skip indexing entirely.
-/// Returns Ok(None) if skipped due to fresh cache, Ok(Some(report)) if indexing ran.
+/// How far a read may trail the transcripts on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Reads serve the index as it stands.
+    None,
+    /// Reads take in what the journal names as changed. When it cannot name the changes, the
+    /// index is walked only once the last walk is older than `ttl_seconds`.
+    Bounded { ttl_seconds: u64 },
+    /// Reads take in what the journal names as changed, and walk whenever it cannot.
+    Strict,
+}
+
+/// Bring the index up to date for a read, as far as `freshness` asks. Returns Ok(None) when
+/// nothing was refreshed, Ok(Some(report)) when a refresh ran.
 pub fn ingest_if_stale(
     paths: &Paths,
     index: &SearchIndex,
     options: &IngestOptions,
-    ttl_seconds: u64,
+    freshness: Freshness,
     lease: &IngestLease,
     journal: Option<journal::ReplayHandle>,
 ) -> Result<Option<IngestReport>> {
     crate::profiling::span!("ingest.freshness");
     let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
-    if can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)? {
+    let walk = match freshness {
+        Freshness::None => return Ok(None),
+        Freshness::Strict => true,
+        Freshness::Bounded { ttl_seconds } => {
+            !can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)?
+        }
+    };
+    if !walk && journal.is_none() {
         crate::profiling::count!("ingest.fresh_cache_hits", 1);
         // The transcript scan cache cannot detect edits in a Markdown memory
         // file. Refresh these small documents even when transcript discovery is
@@ -242,8 +261,95 @@ pub fn ingest_if_stale(
     }
 
     crate::profiling::count!("ingest.fresh_cache_misses", 1);
-    let report = ingest_selected(paths, index, options, lease, None, Some(header), journal)?.report;
+    let narrowing = match journal {
+        Some(replay) => discovery::Narrowing::Journal { replay, walk },
+        None => discovery::Narrowing::None,
+    };
+    let report = ingest_selected(paths, index, options, lease, narrowing, Some(header))?.report;
     Ok(Some(report))
+}
+
+/// Bring the sources a session read names up to date, as far as `freshness` asks. `targets`
+/// comes from [`session_refresh_targets`]. A target the dirty selection cannot resolve on its
+/// own walks only when `freshness` would walk for any other read; otherwise the read sees the
+/// index as it stands. Returns Ok(None) when nothing was refreshed.
+pub(crate) fn ingest_session_sources(
+    paths: &Paths,
+    index: &SearchIndex,
+    options: &IngestOptions,
+    freshness: Freshness,
+    lease: &IngestLease,
+    targets: &HashSet<PathBuf>,
+) -> Result<Option<IngestReport>> {
+    let walk = match freshness {
+        Freshness::None => return Ok(None),
+        Freshness::Strict => true,
+        Freshness::Bounded { ttl_seconds } => {
+            let header = CheckpointReader::open(&paths.state.join("ingest.json"))?.header()?;
+            !can_skip_fresh_scan(&header, paths, index, options, ttl_seconds)?
+        }
+    };
+    let narrowing = discovery::Narrowing::Dirty {
+        paths: targets,
+        walk,
+    };
+    Ok(Some(
+        ingest_selected(paths, index, options, lease, narrowing, None)?.report,
+    ))
+}
+
+/// The paths a dirty refresh needs to bring `sources` up to date: transcripts whose size,
+/// identity or timestamps moved since the checkpoint last recorded them, or that it never
+/// recorded, and the SQLite store behind every database-backed session, whose writer can
+/// commit to the WAL while the main file's metadata stays put. Returns None when a source
+/// cannot be targeted this way, such as a legacy OpenCode session directory or a transcript
+/// that no longer exists, so the caller refreshes as other reads do.
+pub(crate) fn session_refresh_targets<'a>(
+    paths: &Paths,
+    sources: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<HashSet<PathBuf>>> {
+    let mut targets = HashSet::new();
+    let mut transcripts = Vec::new();
+    for source in sources {
+        let virtual_database = crate::sources::bob::split_virtual_path(Path::new(source))
+            .or_else(|| crate::sources::zcode::split_virtual_path(Path::new(source)))
+            .or_else(|| crate::sources::kilocode::split_virtual_path(Path::new(source)))
+            .map(|(database, _)| database);
+        if let Some(database) = virtual_database {
+            if !database.is_file() {
+                return Ok(None);
+            }
+            targets.insert(database);
+        } else if std::fs::metadata(source).is_ok_and(|metadata| metadata.is_file()) {
+            transcripts.push(source.to_owned());
+        } else {
+            return Ok(None);
+        }
+    }
+    let state_path = paths.state.join("ingest.json");
+    if transcripts.is_empty() || !state_path.exists() {
+        targets.extend(transcripts.into_iter().map(PathBuf::from));
+        return Ok(Some(targets));
+    }
+    let recorded = CheckpointReader::open(&state_path)?.load_files(
+        &transcripts,
+        crate::state::checkpoint::FileLoadScope::Targeted,
+    )?;
+    for source in transcripts {
+        let unchanged = match (recorded.get(&source), std::fs::metadata(&source)) {
+            (Some(Some(previous)), Ok(metadata)) => {
+                discovery::unchanged_file_metadata(previous, &metadata, previous.parser_version)
+                    && previous.identity.sqlite_wal.as_ref().is_none_or(|wal| {
+                        *wal == crate::state::SqliteWalIdentity::read(Path::new(&source))
+                    })
+            }
+            _ => false,
+        };
+        if !unchanged {
+            targets.insert(PathBuf::from(source));
+        }
+    }
+    Ok(Some(targets))
 }
 
 pub fn ingest_all(
@@ -252,7 +358,15 @@ pub fn ingest_all(
     options: &IngestOptions,
     lease: &IngestLease,
 ) -> Result<IngestReport> {
-    ingest_selected(paths, index, options, lease, None, None, None).map(|result| result.report)
+    ingest_selected(
+        paths,
+        index,
+        options,
+        lease,
+        discovery::Narrowing::None,
+        None,
+    )
+    .map(|result| result.report)
 }
 
 pub(crate) fn ingest_dirty(
@@ -262,7 +376,17 @@ pub(crate) fn ingest_dirty(
     lease: &IngestLease,
     dirty: &HashSet<PathBuf>,
 ) -> Result<DirtyIngestReport> {
-    ingest_selected(paths, index, options, lease, Some(dirty), None, None)
+    ingest_selected(
+        paths,
+        index,
+        options,
+        lease,
+        discovery::Narrowing::Dirty {
+            paths: dirty,
+            walk: true,
+        },
+        None,
+    )
 }
 
 fn ingest_selected(
@@ -270,26 +394,21 @@ fn ingest_selected(
     index: &SearchIndex,
     options: &IngestOptions,
     lease: &IngestLease,
-    dirty: Option<&HashSet<PathBuf>>,
+    narrowing: discovery::Narrowing<'_>,
     checkpoint_header: Option<CheckpointHeader>,
-    journal: Option<journal::ReplayHandle>,
 ) -> Result<DirtyIngestReport> {
     crate::profiling::span!("ingest.all");
     let repositories = Arc::new(crate::repository::RepositoryResolver::default());
-    let narrowing = match (dirty, journal) {
-        (Some(dirty), _) => discovery::Narrowing::Dirty(dirty),
-        (None, Some(journal)) => discovery::Narrowing::Journal(journal),
-        (None, None) => discovery::Narrowing::None,
-    };
+    let dirty = matches!(narrowing, discovery::Narrowing::Dirty { .. });
     let pool = parser_thread_pool()?;
     let recovered = publication::recover_checkpoint(paths, index, lease, checkpoint_header)?;
-    if dirty.is_none() {
+    if !dirty {
         refresh_memories(paths, options, &repositories)?;
     }
     let prepared =
         discovery::prepare_refresh(paths, index, options, &pool, recovered, narrowing, None)?;
     let full_scan = prepared.full_scan;
-    if full_scan && dirty.is_some() {
+    if full_scan && dirty {
         refresh_memories(paths, options, &repositories)?;
     }
     let report = execution::execute_refresh(prepared, paths, index, options, repositories, &pool)?;

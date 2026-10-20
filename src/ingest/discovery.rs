@@ -1683,11 +1683,18 @@ pub(super) struct PreparedRefresh {
     pub identities_changed: bool,
 }
 
-/// How a refresh limits discovery: to event hints from a watcher, to a journal replay started
-/// before the checkpoint was opened, or not at all.
+/// How a refresh limits discovery: to event hints from a watcher or a session read, to a
+/// journal replay started before the checkpoint was opened, or not at all. A refresh that may
+/// not `walk` leaves the index as it stands when its hints or replay cannot name what changed.
 pub(super) enum Narrowing<'a> {
-    Dirty(&'a HashSet<PathBuf>),
-    Journal(journal::ReplayHandle),
+    Dirty {
+        paths: &'a HashSet<PathBuf>,
+        walk: bool,
+    },
+    Journal {
+        replay: journal::ReplayHandle,
+        walk: bool,
+    },
     None,
 }
 
@@ -1700,10 +1707,10 @@ pub(super) fn prepare_refresh(
     narrowing: Narrowing<'_>,
     mut scan_cache: Option<ScanCache>,
 ) -> Result<PreparedRefresh> {
-    let (dirty, journal) = match narrowing {
-        Narrowing::Dirty(dirty) => (Some(dirty), None),
-        Narrowing::Journal(journal) => (None, Some(journal)),
-        Narrowing::None => (None, None),
+    let (dirty, journal, walk) = match narrowing {
+        Narrowing::Dirty { paths, walk } => (Some(paths), None, walk),
+        Narrowing::Journal { replay, walk } => (None, Some(replay), walk),
+        Narrowing::None => (None, None, true),
     };
     let publication::RecoveredCheckpoint {
         mut state,
@@ -1719,7 +1726,8 @@ pub(super) fn prepare_refresh(
     {
         match selection::resolve_dirty(options, dirty, &state)? {
             selection::DirtySelection::Paths { files, databases } => Some((files, databases)),
-            selection::DirtySelection::Resync => None,
+            selection::DirtySelection::Resync if walk => None,
+            selection::DirtySelection::Resync => Some((Vec::new(), Vec::new())),
         }
     } else {
         None
@@ -1735,17 +1743,29 @@ pub(super) fn prepare_refresh(
                 && !state.clears_files() =>
         {
             let (cursor, hints) = journal_hints(journal, &state, options)?;
-            journal_cursor = cursor;
-            match hints {
+            let narrowed = match hints {
                 Some(hints) => match selection::resolve_dirty(options, &hints, &state)? {
                     selection::DirtySelection::Paths { files, databases } => {
-                        crate::profiling::count!("journal.narrowed_refreshes", 1);
-                        journal_narrowed = true;
                         Some((files, databases))
                     }
                     selection::DirtySelection::Resync => None,
                 },
                 None => None,
+            };
+            match narrowed {
+                Some(selected) => {
+                    crate::profiling::count!("journal.narrowed_refreshes", 1);
+                    journal_cursor = cursor;
+                    journal_narrowed = true;
+                    Some(selected)
+                }
+                None if walk => {
+                    journal_cursor = cursor;
+                    None
+                }
+                // The interval the replay could not name stays behind the stored cursor, so
+                // the next walk or usable replay still covers it.
+                None => Some((Vec::new(), Vec::new())),
             }
         }
         (selected, Some(journal)) => {

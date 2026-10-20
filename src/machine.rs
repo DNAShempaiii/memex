@@ -4,7 +4,10 @@ use crate::analytics::{
 use crate::config::{MachineConfig, Paths, UserConfig};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
-use crate::ingest::{IngestOptions, IngestReport, ingest_all, ingest_if_stale};
+use crate::ingest::{
+    Freshness, IngestOptions, IngestReport, ingest_all, ingest_if_stale, ingest_session_sources,
+    session_refresh_targets,
+};
 use crate::lease::{INGEST_LEASE_TIMEOUT, IngestLease};
 use crate::memory_search::{
     MemoryReadRequest, MemoryReadValue, MemorySearchHit, MemorySearchOptions,
@@ -1284,10 +1287,7 @@ pub fn read_session_pages(
         return Ok(pages);
     }
     if machine_id == LOCAL_MACHINE_ID {
-        let contexts = requests
-            .iter()
-            .map(|request| session_page_context_local(paths, request))
-            .collect::<Result<Vec<_>>>()?;
+        let contexts = session_pages_local(paths, requests)?;
         return apply_session_pages_budget(contexts, max_chars);
     }
     let machine = machine_by_id(config, machine_id)
@@ -1321,7 +1321,8 @@ pub fn session_page_context(
 ) -> Result<SessionPageContext> {
     validate_session_page_request(request)?;
     if machine_id == LOCAL_MACHINE_ID {
-        return session_page_context_local(paths, request);
+        return session_pages_local(paths, std::slice::from_ref(request))
+            .map(|mut contexts| contexts.remove(0));
     }
     let machine = config
         .machines
@@ -1354,10 +1355,7 @@ pub fn batch_session_contexts(
 ) -> Result<Vec<SessionPageContext>> {
     validate_session_batch(requests)?;
     if machine_id == LOCAL_MACHINE_ID {
-        return requests
-            .iter()
-            .map(|request| session_page_context_local(paths, request))
-            .collect();
+        return session_pages_local(paths, requests);
     }
     let machine = config
         .machines
@@ -1389,6 +1387,18 @@ pub fn batch_session_contexts(
             "session batch returned unexpected response: {other:?}"
         )),
     }
+}
+
+/// Reads local session pages from the index as it stands; entry points refresh it once per
+/// operation with [`refresh_local_sessions`] first.
+fn session_pages_local(
+    paths: &Paths,
+    requests: &[SessionPageRequest],
+) -> Result<Vec<SessionPageContext>> {
+    requests
+        .iter()
+        .map(|request| session_page_context_local(paths, request))
+        .collect()
 }
 
 fn session_page_context_local(
@@ -2325,6 +2335,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             session_id,
             source_path,
         } => {
+            refresh_local_sessions(paths, config, [(session_id.as_str(), source_path.as_str())])?;
             let index = SearchIndex::open_or_create(&paths.index)?;
             let records = records_for_session(&index, &session_id, &source_path)?;
             Ok(RpcPayload::Session {
@@ -2397,30 +2408,27 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
             max_chars,
         } => {
             validate_session_batch(&requests)?;
-            let contexts = requests
-                .iter()
-                .map(|request| session_page_context_local(paths, request))
-                .collect::<Result<Vec<_>>>()?;
+            refresh_local_sessions(paths, config, session_keys(&requests))?;
+            let contexts = session_pages_local(paths, &requests)?;
             Ok(RpcPayload::BoundedSessionPages {
                 pages: apply_session_pages_budget(contexts, Some(max_chars))?,
             })
         }
         RpcOperation::SessionPage { request } => {
             validate_session_page_request(&request)?;
+            refresh_local_sessions(paths, config, session_keys(std::slice::from_ref(&request)))?;
             Ok(RpcPayload::SessionPage {
-                context: session_page_context_local(paths, &request)?,
+                context: session_pages_local(paths, std::slice::from_ref(&request))?.remove(0),
             })
         }
         RpcOperation::SessionBatch { requests } => {
             validate_session_batch(&requests)?;
-            let contexts = requests
-                .iter()
-                .map(|request| session_page_context_local(paths, request))
-                .collect::<Result<Vec<_>>>()?;
+            refresh_local_sessions(paths, config, session_keys(&requests))?;
+            let contexts = session_pages_local(paths, &requests)?;
             Ok(RpcPayload::SessionBatch { contexts })
         }
         RpcOperation::Index => {
-            let report = index_local(paths, config, false)?;
+            let report = index_local(paths, config, false, INGEST_LEASE_TIMEOUT)?;
             Ok(RpcPayload::Index {
                 records_added: report.records_added,
                 records_embedded: report.records_embedded,
@@ -2984,8 +2992,16 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
 }
 
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
-    if config.auto_index_on_search_default() {
-        let report = index_local(paths, config, true)?;
+    ensure_local_index_within(paths, config, INGEST_LEASE_TIMEOUT)
+}
+
+fn ensure_local_index_within(
+    paths: &Paths,
+    config: &UserConfig,
+    lease_timeout: Duration,
+) -> Result<()> {
+    if config.index_freshness()? != Freshness::None {
+        let report = index_local(paths, config, true, lease_timeout)?;
         if report.records_added > 0 || compaction_pending(paths) {
             schedule_compaction_if_fragmented(paths)?;
         }
@@ -3019,6 +3035,107 @@ pub(crate) fn clear_compaction_pending(paths: &Paths) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).context("clear pending index compaction"),
+    }
+}
+
+/// Bring the index up to date for reads of local sessions, given as `(session_id,
+/// source_path)` pairs, so a live session reads back its newest messages. Each entry point
+/// calls this once per operation before reading. The sources a read names, or the ones the
+/// index holds for a session named without one, are stat'ed against their checkpoints and the
+/// ones that moved are ingested whatever the journal or the scan cache say. A read that cannot
+/// be narrowed to its sources refreshes as searches do. Under `bounded` freshness a refresh
+/// that fails, for instance because an ingest holds the lease past [`SESSION_READ_LEASE_WAIT`],
+/// leaves the read on the index as it stands; under `strict` it fails the read.
+pub fn refresh_local_sessions<'a>(
+    paths: &Paths,
+    config: &UserConfig,
+    sessions: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let freshness = config.index_freshness()?;
+    let sessions: Vec<_> = sessions.into_iter().collect();
+    if freshness == Freshness::None || sessions.is_empty() {
+        return Ok(());
+    }
+    match refresh_sessions(paths, config, freshness, &sessions) {
+        Ok(()) => Ok(()),
+        Err(error) if freshness != Freshness::Strict => {
+            eprintln!(
+                "warning: reading the index as it stands; refreshing it for a session read failed: {error:#}"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.context("refresh the index before a session read")),
+    }
+}
+
+/// The `(session_id, source_path)` pairs of session page requests.
+pub fn session_keys(requests: &[SessionPageRequest]) -> impl Iterator<Item = (&str, &str)> {
+    requests
+        .iter()
+        .map(|request| (request.session_id.as_str(), request.source_path.as_str()))
+}
+
+/// How long a `bounded` session read waits for an ingest that holds the lease before it reads
+/// the index as it stands.
+const SESSION_READ_LEASE_WAIT: Duration = Duration::from_secs(1);
+
+fn refresh_sessions(
+    paths: &Paths,
+    config: &UserConfig,
+    freshness: Freshness,
+    sessions: &[(&str, &str)],
+) -> Result<()> {
+    let lease_timeout = if freshness == Freshness::Strict {
+        INGEST_LEASE_TIMEOUT
+    } else {
+        SESSION_READ_LEASE_WAIT
+    };
+    let mut sources = HashSet::new();
+    let mut index = None;
+    for &(session_id, source_path) in sessions {
+        if !source_path.is_empty() {
+            sources.insert(source_path.to_owned());
+            continue;
+        }
+        let index = match &mut index {
+            Some(index) => index,
+            None => index.insert(SearchIndex::open_or_create(&paths.index)?),
+        };
+        let indexed = index.session_source_paths(session_id)?;
+        if indexed.is_empty() {
+            return ensure_local_index_within(paths, config, lease_timeout);
+        }
+        sources.extend(indexed);
+    }
+    drop(index);
+    let Some(targets) = session_refresh_targets(paths, sources.iter().map(String::as_str))? else {
+        return ensure_local_index_within(paths, config, lease_timeout);
+    };
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let options = local_ingest_options(config)?;
+    paths.ensure_dirs()?;
+    let lease = IngestLease::acquire(paths, "session read", lease_timeout)?;
+    let report = ingest_session_sources(
+        paths,
+        &refresh_index(paths)?,
+        &options,
+        freshness,
+        &lease,
+        &targets,
+    )?;
+    drop(lease);
+    if report.is_some_and(|report| report.records_added > 0) || compaction_pending(paths) {
+        schedule_compaction_if_fragmented(paths)?;
+    }
+    Ok(())
+}
+
+fn refresh_index(paths: &Paths) -> Result<SearchIndex> {
+    match SearchIndex::open_or_create(&paths.index) {
+        Ok(index) if !index.is_writable() => Ok(index),
+        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index),
     }
 }
 
@@ -3078,7 +3195,12 @@ pub(crate) fn schedule_compaction_if_fragmented(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<IngestReport> {
+fn index_local(
+    paths: &Paths,
+    config: &UserConfig,
+    stale_only: bool,
+    lease_timeout: Duration,
+) -> Result<IngestReport> {
     crate::profiling::span!("index.local");
     let options = local_ingest_options(config)?;
     // The journal stream must be registered before this process writes anything: a write in
@@ -3089,17 +3211,14 @@ fn index_local(paths: &Paths, config: &UserConfig, stale_only: bool) -> Result<I
         journal
     });
     paths.ensure_dirs()?;
-    let lease = IngestLease::acquire(paths, "RPC index", INGEST_LEASE_TIMEOUT)?;
-    let index = match SearchIndex::open_or_create(&paths.index) {
-        Ok(index) if !index.is_writable() => index,
-        _ => SearchIndex::open_or_create_for_search_refresh(&paths.index)?,
-    };
+    let lease = IngestLease::acquire(paths, "RPC index", lease_timeout)?;
+    let index = refresh_index(paths)?;
     if stale_only {
         Ok(ingest_if_stale(
             paths,
             &index,
             &options,
-            config.scan_cache_ttl(),
+            config.index_freshness()?,
             &lease,
             journal,
         )?
@@ -5147,5 +5266,109 @@ mod tests {
         assert_eq!(merged.unavailable_token_events, 1);
         assert_eq!(merged.total_tokens, 0);
         assert_eq!(merged.by_source[0].credits, Some(0.75));
+    }
+
+    fn append_claude_line(path: &std::path::Path, text: &str) {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            serde_json::json!({
+                "type": "user", "uuid": text,
+                "message": {"role": "user", "content": text},
+            })
+        )
+        .unwrap();
+    }
+
+    fn page_texts(paths: &Paths, config: &UserConfig, request: &SessionPageRequest) -> Vec<String> {
+        let RpcPayload::SessionPage { context } = rpc_handler_round_trip(
+            paths,
+            config,
+            RpcOperation::SessionPage {
+                request: request.clone(),
+            },
+        ) else {
+            panic!("expected a session page");
+        };
+        let mut texts: Vec<_> = context.records.into_iter().map(|r| r.text).collect();
+        texts.sort();
+        texts
+    }
+
+    #[test]
+    fn session_pages_read_what_a_live_transcript_appended_within_the_scan_ttl() {
+        let _guard = crate::test_support::env_lock();
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("home");
+        let claude = temp.path().join("projects");
+        let transcript = claude.join("project").join("session.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let elsewhere = |name: &str| temp.path().join(name).to_string_lossy().into_owned();
+        let (codex, opencode, openclaw, copilot, grok, jcode, muse) = (
+            elsewhere("codex"),
+            elsewhere("opencode"),
+            elsewhere("openclaw"),
+            elsewhere("copilot"),
+            elsewhere("grok"),
+            elsewhere("jcode"),
+            elsewhere("muse"),
+        );
+        let _env = crate::test_support::EnvVarGuard::set(&[
+            ("HOME", Some(home.to_str().unwrap())),
+            ("CLAUDE_CONFIG_DIR", Some(claude.to_str().unwrap())),
+            ("CODEX_HOME", Some(&codex)),
+            ("OPENCODE_DATA_DIR", Some(&opencode)),
+            ("PI_CODING_AGENT_DIR", None),
+            ("PI_CODING_AGENT_SESSION_DIR", None),
+            ("PI_CONFIG_DIR", None),
+            ("OMP_PROFILE", None),
+            ("PI_PROFILE", None),
+            ("OPENCLAW_STATE_DIR", Some(&openclaw)),
+            ("CLAWDBOT_STATE_DIR", None),
+            ("COPILOT_HOME", Some(&copilot)),
+            ("GROK_HOME", Some(&grok)),
+            ("JCODE_HOME", Some(&jcode)),
+            ("MUSE_HOME", Some(&muse)),
+            ("XDG_DATA_HOME", None),
+        ]);
+        append_claude_line(&transcript, "first");
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        let config = UserConfig::default();
+        rpc_handler_round_trip(&paths, &config, RpcOperation::Index);
+        let mut record = None;
+        SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .for_each_record(|indexed| {
+                record = Some(indexed);
+                Ok(())
+            })
+            .unwrap();
+        let record = record.expect("the walk indexed the transcript");
+        let request = SessionPageRequest {
+            session_id: record.session_id,
+            source_path: record.source_path,
+            offset: 0,
+            limit: 10,
+        };
+
+        append_claude_line(&transcript, "second");
+        assert_eq!(page_texts(&paths, &config, &request), ["first", "second"]);
+
+        append_claude_line(&transcript, "third");
+        let unrefreshed = UserConfig {
+            index_freshness: Some("none".to_string()),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            page_texts(&paths, &unrefreshed, &request),
+            ["first", "second"]
+        );
     }
 }
