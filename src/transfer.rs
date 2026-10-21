@@ -1562,6 +1562,9 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Zcode => {
             crate::sources::zcode::session_cwd(Path::new(&first.source_path), &first.session_id)
         }
+        SourceKind::Goose => {
+            crate::sources::goose::session_cwd(Path::new(&first.source_path), &first.session_id)
+        }
     }
     .filter(|path| path.is_dir())
 }

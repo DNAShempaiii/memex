@@ -138,7 +138,7 @@ sets them permanently. Claude Code workflow runs store each agent transcript twi
 session, and token usage reconciles shared responses across both copies.
 Index sources are `claude`, `codex`,
 `cursor`, `opencode`, `pi`, `omp`, `openclaw`, `copilot`, `grok`, `hermes`, `jcode`,
-`muse`, `antigravity`, `bob`, `zcode`, `kilocode`, and `kimi`.
+`muse`, `antigravity`, `bob`, `zcode`, `kilocode`, `kimi`, and `goose`.
 Hermes transcripts and usage are read from `state.db` under `~/.hermes` and its
 named profiles; `HERMES_PROFILE_ROOTS` (comma-separated paths) selects alternate
 stores. Plaintext reasoning is indexed only with `--include-reasoning`.
@@ -159,6 +159,12 @@ the home directory). Each agent journals its own `agents/<agent>/wire.jsonl`; su
 journals are indexed as `<session>:<agent>` sessions with the parent recorded. Reasoning
 parts are indexed only with `--include-reasoning`, and token usage comes from the
 `usage.record` line each model request journals.
+goose sessions are read from `sessions/sessions.db` under the goose data directory:
+`$XDG_DATA_HOME/goose` (`~/.local/share/goose`) or, on macOS and Windows, the platform
+data directory the current goose release uses; `GOOSE_PATH_ROOT` relocates the whole
+tree. Every session lives in that one SQLite store, and `--include-reasoning` adds its
+`thinking` blocks. Messages goose never showed the user — per-turn `<turn-context>`
+scaffolding and `hidden` CLI sessions — are not indexed.
 
 ## Agent memories
 
@@ -364,7 +370,7 @@ envelope. Its identifiers remain searchable through the `event_id` field.
 - `--role <user|assistant|tool_use|tool_result>`
 - `--tool <tool_name>`
 - `--session <session_id>`
-- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode|kimi`
+- `--source claude|codex|cursor|opencode|pi|omp|openclaw|copilot|grok|hermes|jcode|muse|antigravity|bob|zcode|kilocode|kimi|goose`
 - `--since <iso|unix>` / `--until <iso|unix>`
 - `--limit <n>`
 - `--min-score <float>`

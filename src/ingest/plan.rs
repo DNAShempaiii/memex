@@ -70,6 +70,7 @@ pub(super) fn classify_file(
             | SourceKind::Bob
             | SourceKind::Zcode
             | SourceKind::Kilocode
+            | SourceKind::Goose
     ) {
         FileChange::Replaced
     } else {

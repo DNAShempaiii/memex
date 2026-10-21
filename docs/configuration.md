@@ -157,6 +157,7 @@ bob_resume_cmd = "cd {cwd_shell} && bob --resume {session_id}"
 jcode_resume_cmd = "cd {cwd_shell} && jcode --resume {session_id}"
 muse_resume_cmd = "cd {cwd_shell} && muse resume {session_id}"
 kimi_resume_cmd = "cd {cwd_shell} && kimi --session {session_id}"
+goose_resume_cmd = "cd {cwd_shell} && goose session --resume --session-id {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"; an already-open session is focused instead
 
 [mcp]

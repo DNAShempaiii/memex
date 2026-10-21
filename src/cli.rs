@@ -208,6 +208,12 @@ struct IndexArgs {
     /// Skip indexing Kimi Code CLI sessions
     #[arg(long = "no-kimi", default_value_t = false, hide = true)]
     no_kimi: bool,
+    /// Index goose sessions from ~/.local/share/goose/sessions/sessions.db [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    goose: bool,
+    /// Skip indexing goose sessions
+    #[arg(long = "no-goose", default_value_t = false, hide = true)]
+    no_goose: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2719,6 +2725,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_zcode: index.source_enabled(IndexSource::Zcode),
         include_kilocode: index.source_enabled(IndexSource::Kilocode),
         include_kimi: index.source_enabled(IndexSource::Kimi),
+        include_goose: index.source_enabled(IndexSource::Goose),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -6068,6 +6075,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Kiro => "kiro",
         crate::types::SourceKind::Kilocode => "kilocode",
         crate::types::SourceKind::Kimi => "kimi",
+        crate::types::SourceKind::Goose => "goose",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -6083,6 +6091,11 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     if record.source == crate::types::SourceKind::Kilocode {
         return Err(anyhow!(
             "sharing is not supported for KiloCode sessions: {source_path} is a database, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Goose {
+        return Err(anyhow!(
+            "sharing is not supported for goose sessions: {source_path} is a database entry, not a transcript file"
         ));
     }
 
@@ -7427,6 +7440,9 @@ fn build_index_command_args(
     }
     if !index.kimi || index.no_kimi {
         args.push("--no-kimi".to_string());
+    }
+    if !index.goose || index.no_goose {
+        args.push("--no-goose".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -9133,6 +9149,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9205,6 +9223,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9270,6 +9290,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9337,6 +9359,8 @@ mod tests {
             no_kilocode: false,
             kimi: false,
             no_kimi: false,
+            goose: false,
+            no_goose: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,

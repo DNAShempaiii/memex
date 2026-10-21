@@ -422,6 +422,7 @@ enum SourceChoice {
     Kiro,
     Kilocode,
     Kimi,
+    Goose,
 }
 
 impl SourceChoice {
@@ -445,7 +446,8 @@ impl SourceChoice {
             SourceChoice::Zcode => SourceChoice::Kiro,
             SourceChoice::Kiro => SourceChoice::Kilocode,
             SourceChoice::Kilocode => SourceChoice::Kimi,
-            SourceChoice::Kimi => SourceChoice::All,
+            SourceChoice::Kimi => SourceChoice::Goose,
+            SourceChoice::Goose => SourceChoice::All,
         }
     }
 
@@ -470,6 +472,7 @@ impl SourceChoice {
             SourceChoice::Kiro => Some(SourceFilter::Kiro),
             SourceChoice::Kilocode => Some(SourceFilter::Kilocode),
             SourceChoice::Kimi => Some(SourceFilter::Kimi),
+            SourceChoice::Goose => Some(SourceFilter::Goose),
         }
     }
 
@@ -494,6 +497,7 @@ impl SourceChoice {
             SourceChoice::Kiro => "kiro",
             SourceChoice::Kilocode => "kilocode",
             SourceChoice::Kimi => "kimi",
+            SourceChoice::Goose => "goose",
         }
     }
 
@@ -517,6 +521,7 @@ impl SourceChoice {
             SourceKind::Kiro => SourceChoice::Kiro,
             SourceKind::Kilocode => SourceChoice::Kilocode,
             SourceKind::Kimi => SourceChoice::Kimi,
+            SourceKind::Goose => SourceChoice::Goose,
         }
     }
 }
@@ -1200,6 +1205,7 @@ impl App {
                     include_zcode: true,
                     include_kilocode: true,
                     include_kimi: true,
+                    include_goose: true,
                     include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
@@ -2748,6 +2754,7 @@ impl App {
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kiro => "kiro",
             SourceKind::Kimi => "kimi",
+            SourceKind::Goose => "goose",
         };
         let source_path = session.source_path.clone();
 
@@ -4227,6 +4234,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Zcode => label == "zcode",
         SourceChoice::Kilocode => label == "kilocode",
         SourceChoice::Kimi => label == "kimi",
+        SourceChoice::Goose => label == "goose",
         SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
@@ -4251,6 +4259,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Zcode => Color::Rgb(96, 222, 228),
         SourceKind::Kilocode => Color::Rgb(255, 122, 189),
         SourceKind::Kimi => Color::Rgb(86, 170, 255),
+        SourceKind::Goose => Color::Rgb(255, 173, 66),
         SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }

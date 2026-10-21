@@ -125,6 +125,7 @@ pub fn audit_installed_sources(
     push(SourceKind::Bob, super::bob::usage_files());
     push(SourceKind::Zcode, super::zcode::usage_files());
     push(SourceKind::Kilocode, super::kilocode::usage_files());
+    push(SourceKind::Goose, super::goose::usage_files());
 
     push(
         SourceKind::Omp,
@@ -156,10 +157,14 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
     for file in files {
         if matches!(
             source,
-            SourceKind::Hermes | SourceKind::Bob | SourceKind::Zcode | SourceKind::Kilocode
+            SourceKind::Hermes
+                | SourceKind::Bob
+                | SourceKind::Zcode
+                | SourceKind::Kilocode
+                | SourceKind::Goose
         ) {
-            // Hermes usage truth, Bob tasks, Zcode, and KiloCode sessions are
-            // SQLite data.
+            // Hermes usage truth, Bob tasks, Zcode, KiloCode, and goose sessions
+            // are SQLite data.
             // Audit must not reinterpret the database as JSON, and in particular
             // must not read transcript/message columns: count the file, skip
             // content.
@@ -392,6 +397,8 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         SourceKind::Zcode => {}
         // KiloCode sessions are SQLite rows, not per-line JSON documents.
         SourceKind::Kilocode => {}
+        // goose sessions are SQLite rows, not per-line JSON documents.
+        SourceKind::Goose => {}
     }
 }
 

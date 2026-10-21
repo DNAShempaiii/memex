@@ -23,10 +23,11 @@ pub enum SourceKind {
     Kiro,
     Kilocode,
     Kimi,
+    Goose,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 18] = [
+    pub const ALL: [SourceKind; 19] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -45,6 +46,7 @@ impl SourceKind {
         SourceKind::Kiro,
         SourceKind::Kilocode,
         SourceKind::Kimi,
+        SourceKind::Goose,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -68,6 +70,7 @@ impl SourceKind {
             SourceKind::Kiro => 15,
             SourceKind::Kilocode => 16,
             SourceKind::Kimi => 17,
+            SourceKind::Goose => 18,
         }
     }
 
@@ -91,6 +94,7 @@ impl SourceKind {
             15 => Some(SourceKind::Kiro),
             16 => Some(SourceKind::Kilocode),
             17 => Some(SourceKind::Kimi),
+            18 => Some(SourceKind::Goose),
             _ => None,
         }
     }
@@ -115,6 +119,7 @@ impl SourceKind {
             SourceKind::Kiro => "kiro",
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kimi => "kimi",
+            SourceKind::Goose => "goose",
         }
     }
 
@@ -138,6 +143,7 @@ impl SourceKind {
             SourceKind::Kiro => "kiro",
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kimi => "kimi",
+            SourceKind::Goose => "goose",
         }
     }
 
@@ -165,6 +171,7 @@ impl SourceKind {
             "kiro" => Some(SourceKind::Kiro),
             "kilocode" => Some(SourceKind::Kilocode),
             "kimi" => Some(SourceKind::Kimi),
+            "goose" => Some(SourceKind::Goose),
             _ => None,
         }
     }
@@ -193,6 +200,7 @@ pub enum SourceFilter {
     Kiro,
     Kilocode,
     Kimi,
+    Goose,
 }
 
 impl SourceFilter {
@@ -216,6 +224,7 @@ impl SourceFilter {
             SourceFilter::Kiro => source == SourceKind::Kiro,
             SourceFilter::Kilocode => source == SourceKind::Kilocode,
             SourceFilter::Kimi => source == SourceKind::Kimi,
+            SourceFilter::Goose => source == SourceKind::Goose,
         }
     }
 
@@ -239,6 +248,7 @@ impl SourceFilter {
             SourceFilter::Kiro => &["kiro"],
             SourceFilter::Kilocode => &["kilocode"],
             SourceFilter::Kimi => &["kimi"],
+            SourceFilter::Goose => &["goose"],
         }
     }
 
@@ -262,6 +272,7 @@ impl SourceFilter {
             SourceFilter::Kiro => "kiro",
             SourceFilter::Kilocode => "kilocode",
             SourceFilter::Kimi => "kimi",
+            SourceFilter::Goose => "goose",
         }
     }
 }
@@ -499,6 +510,20 @@ mod tests {
         assert!(SourceFilter::Grok.matches(SourceKind::Grok));
         assert_eq!(SourceFilter::Grok.as_str(), "grok");
         assert_eq!(SourceFilter::Grok.storage_labels(), &["grok"]);
+    }
+
+    #[test]
+    fn goose_is_a_stable_first_class_source() {
+        assert_eq!(SourceKind::Goose.label(), "goose");
+        assert_eq!(SourceKind::Goose.storage_label(), "goose");
+        assert_eq!(SourceKind::from_label("goose"), Some(SourceKind::Goose));
+        assert_eq!(
+            SourceKind::from_idx(SourceKind::Goose.idx()),
+            Some(SourceKind::Goose)
+        );
+        assert!(SourceFilter::Goose.matches(SourceKind::Goose));
+        assert_eq!(SourceFilter::Goose.as_str(), "goose");
+        assert_eq!(SourceFilter::Goose.storage_labels(), &["goose"]);
     }
 
     #[test]

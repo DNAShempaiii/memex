@@ -179,6 +179,9 @@ pub(crate) fn watch_roots(options: &IngestOptions) -> Vec<PathBuf> {
     if options.include_kilocode {
         roots.extend(crate::sources::kilocode::db_dirs());
     }
+    if options.include_goose {
+        roots.extend(crate::sources::goose::db_dirs());
+    }
     roots.sort();
     roots.dedup();
     roots
@@ -228,6 +231,7 @@ fn interesting_event_paths(event: &Event, excluder: &PathExcluder) -> (Vec<PathB
                     || crate::sources::bob::is_configured_database(&database)
                     || crate::sources::zcode::db_paths().contains(&database)
                     || crate::sources::kilocode::db_paths().contains(&database)
+                    || crate::sources::goose::db_paths().contains(&database)
                     || crate::sources::hermes::is_configured_database(&database)
                     || (crate::sources::antigravity::is_db_path(&database)
                         && crate::sources::antigravity::matches_path(&database.to_string_lossy()))
@@ -425,12 +429,14 @@ pub(crate) fn sweep_candidates(
             && file.identity.bob_database.is_none()
             && file.identity.zcode_database.is_none()
             && file.identity.kilocode_database.is_none()
+            && file.identity.goose_database.is_none()
             && !databases.contains(key)
             && !crate::sources::bob::matches_path(key)
     });
     databases.extend(reader.bob_database_paths()?);
     databases.extend(reader.zcode_database_paths()?);
     databases.extend(reader.kilocode_database_paths()?);
+    databases.extend(reader.goose_database_paths()?);
     Ok((snapshot, databases))
 }
 
@@ -749,6 +755,7 @@ impl WatchService {
             .into_iter()
             .chain(crate::sources::zcode::db_paths())
             .chain(crate::sources::kilocode::db_paths())
+            .chain(crate::sources::goose::db_paths())
         {
             if database.is_file()
                 && crate::sources::bob::canonical_alias(&database)
@@ -829,6 +836,7 @@ mod tests {
             include_bob: true,
             include_zcode: true,
             include_kilocode: true,
+            include_goose: true,
             include_kimi: true,
             include_kiro: true,
             exclude_patterns: Vec::new(),
@@ -951,6 +959,7 @@ mod tests {
         options.include_bob = false;
         options.include_zcode = false;
         options.include_kilocode = false;
+        options.include_goose = false;
         options.include_kiro = false;
         options.include_kimi = false;
         let roots = watch_roots(&options);
@@ -1467,6 +1476,7 @@ mod tests {
                 bob_database: None,
                 zcode_database: None,
                 kilocode_database: None,
+                goose_database: None,
                 sqlite_wal: None,
                 device: None,
                 inode: None,

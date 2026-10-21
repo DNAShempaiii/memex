@@ -56,7 +56,7 @@ impl Drop for EnvVarGuard {
 /// stores never depend on the machine they run on. Hold `env_lock()` for the
 /// duration of the test alongside the returned guard.
 pub fn pin_source_roots(base: &std::path::Path) -> EnvVarGuard {
-    const ROOT_VARS: [&str; 16] = [
+    const ROOT_VARS: [&str; 17] = [
         "HOME",
         "CLAUDE_CONFIG_DIR",
         "CODEX_HOME",
@@ -73,6 +73,7 @@ pub fn pin_source_roots(base: &std::path::Path) -> EnvVarGuard {
         "ANTIGRAVITY_HOME",
         "MEMEX_BOB_DB",
         "KIMI_CODE_HOME",
+        "GOOSE_PATH_ROOT",
     ];
     let values: Vec<Option<OsString>> = ROOT_VARS
         .iter()

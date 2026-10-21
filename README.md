@@ -76,6 +76,7 @@ tool. **Import into** creates a conversation in another tool using the
 | Kimi Code | Yes | Yes | Yes | No | No |
 | Kiro CLI | Yes | Credits only | No | No | No |
 | Hermes | Yes | Yes | No | No | No |
+| goose | Yes | Yes | Yes | No | No |
 
 - **History coverage depends on the local records a tool saves.** Cursor history
   comes from agent transcripts; its usage data comes from local databases.
@@ -88,6 +89,9 @@ tool. **Import into** creates a conversation in another tool using the
   set `KILO_DATA_DIR` (comma-separated) to index extra stores.
   Kimi Code reads `~/.kimi-code/sessions` (`KIMI_CODE_HOME` relocates it); every
   agent journal, subagents included, is indexed as its own session with the parent recorded.
+  goose keeps every session in one SQLite store under its data directory
+  (`~/.local/share/goose/sessions/sessions.db`), relocatable with `GOOSE_PATH_ROOT`;
+  per-turn context messages and `hidden` CLI sessions are skipped.
 - **Token usage is opt-in and depends on recorded counters.** Cost estimates are
   not subscription charges or quota balances. Hermes history and usage are read from
   its local `state.db`; plaintext reasoning is indexed only with `--include-reasoning`.

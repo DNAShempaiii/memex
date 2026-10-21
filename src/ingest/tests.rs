@@ -56,6 +56,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_zcode: false,
         include_kilocode: false,
         include_kimi: false,
+        include_goose: false,
         include_kiro: false,
         embeddings,
         backfill_embeddings: false,
@@ -2608,6 +2609,7 @@ fn device_renumbering_preserves_append_continuity() {
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2632,6 +2634,7 @@ fn device_renumbering_does_not_hide_file_replacement() {
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2925,6 +2928,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_zcode: false,
         include_kilocode: false,
         include_kimi: false,
+        include_goose: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3704,6 +3708,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_zcode: false,
         include_kilocode: false,
         include_kimi: false,
+        include_goose: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -7335,6 +7340,170 @@ fn kilocode_store_removed_with_its_directory_keeps_indexed_sessions() {
     let report = full();
     assert!(report.diagnostics.unreadable_sources.is_empty());
     assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn goose_sessions_index_conversations_but_not_turn_context() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data").join("sessions").join("sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let run = |options: &IngestOptions| {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, options, &lease).unwrap()
+    };
+    run(&options);
+    let indexed = indexed_texts(&paths);
+    assert!(indexed.contains(&"List the files".to_string()));
+    assert!(indexed.contains(&"One file".to_string()));
+    assert!(indexed.contains(&"Count the entries".to_string()));
+    // Turn scaffolding and internal CLI sessions never reach the index.
+    assert!(!indexed.iter().any(|text| text.contains("<turn-context>")));
+    assert!(
+        !indexed
+            .iter()
+            .any(|text| text.contains("internal plumbing"))
+    );
+    // Reasoning blocks are opt-in, like every other source.
+    assert!(!indexed.iter().any(|text| text == "thinking about it"));
+    let reader =
+        crate::state::checkpoint::CheckpointReader::open(&paths.state.join("ingest.json")).unwrap();
+    assert_eq!(
+        reader.goose_database_paths().unwrap(),
+        HashSet::from([database.to_string_lossy().into_owned()])
+    );
+
+    // An excluded session keeps its records out of a fresh index while its
+    // sibling still indexes.
+    let fresh = Paths::new(Some(temp.path().join("memex-excluded"))).unwrap();
+    fresh.ensure_dirs().unwrap();
+    let fresh_lease = ingest_lease(&fresh);
+    options.exclude_patterns = vec![
+        crate::sources::goose::virtual_path(&database, "sess_main")
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&fresh.index).unwrap();
+    ingest_all(&fresh, &index, &options, &fresh_lease).unwrap();
+    assert_eq!(
+        indexed_texts(&fresh),
+        [
+            "Count the entries",
+            "[image: image/png]",
+            "invalid arguments"
+        ]
+    );
+}
+
+#[test]
+fn goose_refresh_preserves_unchanged_sessions_and_reconciles_deletions() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let database = root.join("data/sessions/sessions.db");
+    fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    crate::sources::goose::tests::fixture_db(&database);
+    let mut options = ingest_options(false, ModelChoice::potion());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let full = || {
+        let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+        ingest_all(&paths, &index, &options, &lease).unwrap()
+    };
+    let session_ids = |session| {
+        let mut ids = SearchIndex::open_or_create(&paths.index)
+            .unwrap()
+            .records_by_session_id(session)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.doc_id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    full();
+    let original = indexed_texts(&paths);
+    let main_ids = session_ids("sess_main");
+    let child_ids = session_ids("sess_child");
+    assert!(!main_ids.is_empty());
+    assert!(!child_ids.is_empty());
+    assert_eq!(full().records_added, 0);
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(session_ids("sess_main"), main_ids);
+    assert_eq!(session_ids("sess_child"), child_ids);
+
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("ALTER TABLE sessions RENAME TO unavailable_sessions")
+        .unwrap();
+    let report = full();
+    assert_eq!(indexed_texts(&paths), original);
+    assert_eq!(
+        report.diagnostics.unreadable_sources,
+        vec![database.to_string_lossy().into_owned()]
+    );
+    writer
+        .execute_batch("ALTER TABLE unavailable_sessions RENAME TO sessions")
+        .unwrap();
+
+    // A narrowed refresh must publish the session deletion, not just drop its checkpoint.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_child';
+             DELETE FROM sessions WHERE id = 'sess_child';",
+        )
+        .unwrap();
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let dirty = ingest_dirty(
+        &paths,
+        &index,
+        &options,
+        &lease,
+        &HashSet::from([database.clone()]),
+    )
+    .unwrap();
+    assert!(!dirty.full_scan);
+    drop(index);
+    assert!(session_ids("sess_child").is_empty());
+    assert_eq!(session_ids("sess_main"), main_ids);
+
+    // Full discovery must publish deletions too, without resurrecting the child.
+    writer
+        .execute_batch(
+            "DELETE FROM messages WHERE session_id = 'sess_main';
+             DELETE FROM sessions WHERE id = 'sess_main';",
+        )
+        .unwrap();
+    full();
+    assert!(indexed_texts(&paths).is_empty());
+}
+
+#[test]
+fn goose_store_that_never_existed_is_not_reported_unreadable() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("goose");
+    let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
+    let mut options = ingest_options(false, ModelChoice::default());
+    options.include_goose = true;
+    let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+    paths.ensure_dirs().unwrap();
+    let lease = ingest_lease(&paths);
+    let index = SearchIndex::open_or_create_for_continuous_ingest(&paths.index).unwrap();
+    let report = ingest_all(&paths, &index, &options, &lease).unwrap();
+    assert!(report.diagnostics.unreadable_sources.is_empty());
+    assert_eq!(report.files_skipped, 0);
 }
 
 #[test]

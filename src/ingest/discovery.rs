@@ -430,6 +430,13 @@ fn journal_hints(
                         .filter(|database| database.is_file()),
                 );
             }
+            if options.include_goose {
+                paths.extend(
+                    crate::sources::goose::db_paths()
+                        .into_iter()
+                        .filter(|database| database.is_file()),
+                );
+            }
             crate::profiling::count!("journal.hints", paths.len());
             Some(paths)
         }
@@ -532,6 +539,7 @@ pub(super) fn file_identity(
         bob_database: None,
         zcode_database: None,
         kilocode_database: None,
+        goose_database: None,
         sqlite_wal: None,
         #[cfg(unix)]
         device: Some(metadata.dev()),
@@ -1243,6 +1251,152 @@ pub(super) fn discover_kilocode(
     Ok(result)
 }
 
+fn has_indexed_goose_sessions(state: &CheckpointSession, database: &Path) -> Result<bool> {
+    // Recovery hides pending paths from the working checkpoint. A first
+    // interrupted publication may leave only the intent as ownership evidence.
+    Ok(state
+        .persisted_file_keys()?
+        .iter()
+        .chain(
+            state
+                .pending
+                .iter()
+                .flat_map(|pending| &pending.source_paths),
+        )
+        .any(|key| goose_database_owns(database, key)))
+}
+
+/// The raw database key is the pre-session-scoped checkpoint; virtual session
+/// paths carry their owning store.
+fn goose_database_owns(database: &Path, key: &str) -> bool {
+    Path::new(key) == database
+        || crate::sources::goose::split_virtual_path(Path::new(key))
+            .is_some_and(|(owner, _)| owner == database)
+}
+
+/// goose sessions own independent checkpoints. Hash conversation rows rather than
+/// the database/WAL so usage-only commits never schedule transcript replay.
+pub(super) fn discover_goose(
+    options: &IngestOptions,
+    excluder: &PathExcluder,
+    state: &mut CheckpointSession,
+    selected: Option<&[crate::sources::SourceFile]>,
+) -> Result<SessionDatabaseDiscovery> {
+    let mut result = SessionDatabaseDiscovery::default();
+    if !options.include_goose {
+        return Ok(result);
+    }
+    let databases = match selected {
+        Some(files) => files.iter().map(|file| file.path.clone()).collect(),
+        None => crate::sources::goose::roots()
+            .into_iter()
+            .map(|root| root.join("sessions.db"))
+            .collect::<Vec<_>>(),
+    };
+    let parser_version =
+        crate::sources::index_state_version_for(SourceKind::Goose, options.include_reasoning);
+    for database in databases {
+        let alias = database.canonicalize().ok();
+        let excluded = excluder.is_excluded(&database)
+            || alias
+                .as_ref()
+                .is_some_and(|path| excluder.is_excluded(path));
+        // A store that never existed is absent, while one that vanished with
+        // its directory (an unmounted volume) stays unreadable so its sessions
+        // are kept.
+        let missing = database
+            .metadata()
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let absent = missing
+            && (database.parent().is_some_and(Path::is_dir)
+                || !has_indexed_goose_sessions(state, &database)?);
+        let sessions = if excluded || absent {
+            Vec::new()
+        } else {
+            match crate::sources::goose::enumerate_sessions(&database) {
+                Ok(sessions) => sessions,
+                Err(_) => {
+                    result
+                        .diagnostics
+                        .unreadable_sources
+                        .push(database.to_string_lossy().into_owned());
+                    result.unreadable_databases.push(database);
+                    result.files_skipped += 1;
+                    continue;
+                }
+            }
+        };
+        let mut current = HashSet::new();
+        let keys = sessions
+            .iter()
+            .map(|session| {
+                crate::sources::goose::virtual_path(&database, &session.id)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        state.preload(&keys, FileLoadScope::Targeted)?;
+        for (session, key) in sessions.into_iter().zip(keys) {
+            let path = PathBuf::from(&key);
+            if excluder.is_excluded(&path)
+                || alias.as_ref().is_some_and(|alias| {
+                    excluder.is_excluded(&crate::sources::goose::virtual_path(alias, &session.id))
+                })
+            {
+                result.files_skipped += 1;
+                continue;
+            }
+            current.insert(key.clone());
+            result.files_scanned += 1;
+            result.total_bytes += session.size;
+            let identity = FileIdentity {
+                goose_database: Some(database.to_string_lossy().into_owned()),
+                prefix_sha256: Some(session.fingerprint),
+                prefix_bytes: 1,
+                ..FileIdentity::default()
+            };
+            let change = plan::classify_file(
+                SourceKind::Goose,
+                session.size,
+                0,
+                &identity,
+                parser_version,
+                state.file(&key),
+            );
+            if change == FileChange::Unchanged {
+                result.files_skipped += 1;
+                result.unchanged_identities.push((key, identity));
+                continue;
+            }
+            result.tasks.push(FileTask {
+                path,
+                source: SourceKind::Goose,
+                offset: 0,
+                turn_id: 0,
+                legacy_turn_id: None,
+                size: session.size,
+                mtime: 0,
+                change,
+                pending_tool_calls: HashMap::new(),
+                identity,
+                parser_version,
+                codex_metadata_offsets: None,
+                claude_background: None,
+                claude_agent_copies: Vec::new(),
+            });
+        }
+        // Reconcile only after a successful inventory (or confirmed removal).
+        // The raw database key is the pre-session-scoped checkpoint; replace it once.
+        for key in state.file_keys()? {
+            if goose_database_owns(&database, &key) && !current.contains(&key) {
+                state.delete_file(&key);
+                result.missing_paths.push(key);
+            }
+        }
+    }
+    Ok(result)
+}
+
 pub(super) fn discover_opencode(
     paths: &Paths,
     index: &SearchIndex,
@@ -1822,11 +1976,13 @@ pub(super) fn prepare_refresh(
                 state.persisted_file_keys()?,
             )
         };
-        // Bob, ZCode, and KiloCode virtual paths sit "under" a database file, never under a walked directory.
+        // Database-backed virtual paths are reconciled by their source adapters,
+        // never by the transcript directory walk.
         let known = known.into_iter().filter(|key| {
             !crate::sources::bob::matches_path(key)
                 && crate::sources::zcode::split_virtual_path(Path::new(key)).is_none()
                 && crate::sources::kilocode::split_virtual_path(Path::new(key)).is_none()
+                && crate::sources::goose::split_virtual_path(Path::new(key)).is_none()
         });
         Some((
             directories::StampedWalk::new(previous, known.map(PathBuf::from)),
@@ -1873,7 +2029,7 @@ pub(super) fn prepare_refresh(
     }
 
     // Route narrowed refreshes to the owning database adapter.
-    let (bob_selected, zcode_selected, kilocode_selected, opencode_selected) =
+    let (bob_selected, zcode_selected, kilocode_selected, goose_selected, opencode_selected) =
         match selected.as_ref() {
             Some((_, databases)) => {
                 let (bob, databases): (Vec<_>, Vec<_>) = databases
@@ -1883,12 +2039,21 @@ pub(super) fn prepare_refresh(
                 let (zcode, databases): (Vec<_>, Vec<_>) = databases
                     .into_iter()
                     .partition(|file| file.source == SourceKind::Zcode);
-                let (kilocode, opencode): (Vec<_>, Vec<_>) = databases
+                let (kilocode, databases): (Vec<_>, Vec<_>) = databases
                     .into_iter()
                     .partition(|file| file.source == SourceKind::Kilocode);
-                (Some(bob), Some(zcode), Some(kilocode), Some(opencode))
+                let (goose, opencode): (Vec<_>, Vec<_>) = databases
+                    .into_iter()
+                    .partition(|file| file.source == SourceKind::Goose);
+                (
+                    Some(bob),
+                    Some(zcode),
+                    Some(kilocode),
+                    Some(goose),
+                    Some(opencode),
+                )
             }
-            None => (None, None, None, None),
+            None => (None, None, None, None, None),
         };
     let discovery::SessionDatabaseDiscovery {
         tasks: mut bob_tasks,
@@ -1991,6 +2156,35 @@ pub(super) fn prepare_refresh(
     files_skipped += kilocode.files_skipped;
     total_bytes += kilocode.total_bytes;
 
+    let mut goose = discover_goose(options, &excluder, &mut state, goose_selected.as_deref())?;
+    if let Some(pending) = &pending_recovery {
+        for path in &pending.source_paths {
+            let database = crate::sources::goose::split_virtual_path(Path::new(path))
+                .map(|(database, _)| database)
+                .unwrap_or_else(|| PathBuf::from(path));
+            if goose.unreadable_databases.contains(&database) {
+                anyhow::bail!(
+                    "goose source {path} has an interrupted replay but its database cannot be read"
+                );
+            }
+        }
+        for task in &mut goose.tasks {
+            let database = crate::sources::goose::split_virtual_path(&task.path)
+                .unwrap()
+                .0;
+            if pending.source_paths.iter().any(|path| {
+                *path == task.path.to_string_lossy() || *path == database.to_string_lossy()
+            }) {
+                task.change = FileChange::Replaced;
+            }
+        }
+    }
+    tasks.extend(goose.tasks);
+    unchanged_identities.extend(goose.unchanged_identities);
+    files_scanned += goose.files_scanned;
+    files_skipped += goose.files_skipped;
+    total_bytes += goose.total_bytes;
+
     let Some(opencode) = discovery::discover_opencode(
         paths,
         index,
@@ -2027,6 +2221,7 @@ pub(super) fn prepare_refresh(
     opencode_diagnostics.merge(bob_diagnostics);
     opencode_diagnostics.merge(zcode.diagnostics);
     opencode_diagnostics.merge(kilocode.diagnostics);
+    opencode_diagnostics.merge(goose.diagnostics);
     let opencode_scope_targets = opencode.scope_targets;
     let opencode_session_cwds = opencode.session_cwds;
     let opencode_database_states = opencode.database_states;
@@ -2048,6 +2243,11 @@ pub(super) fn prepare_refresh(
             .filter(|root| root.is_dir() && std::fs::read_dir(root).is_ok())
             .collect::<Vec<_>>();
         for path in state.file_keys()? {
+            // Goose virtual paths sit beside sessions.db rather than beneath it.
+            // Their absence on disk says nothing about whether the session exists.
+            if crate::sources::goose::split_virtual_path(Path::new(&path)).is_some() {
+                continue;
+            }
             let confirmed_missing = match Path::new(&path).metadata() {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     let path = Path::new(&path);
@@ -2072,6 +2272,7 @@ pub(super) fn prepare_refresh(
     missing_state_paths.extend(bob_missing_paths);
     missing_state_paths.extend(zcode.missing_paths);
     missing_state_paths.extend(kilocode.missing_paths);
+    missing_state_paths.extend(goose.missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).

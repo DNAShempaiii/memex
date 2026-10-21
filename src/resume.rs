@@ -73,6 +73,8 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Kilocode => config.kilocode_resume_cmd.clone(),
         // Kimi Code sessions resume with `kimi --session <id>` in a project directory.
         SourceKind::Kimi => config.kimi_resume_cmd.clone(),
+        // goose sessions resume with `goose session --resume --session-id <id>`.
+        SourceKind::Goose => config.goose_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }
@@ -122,6 +124,9 @@ pub fn default_resume_template(cmd: &str, remote: bool) -> Option<String> {
         }
         "kimi" if remote || find_in_path("kimi").is_some() => {
             Some("cd {cwd_shell} && kimi --session {session_id}".to_string())
+        }
+        "goose" if remote || find_in_path("goose").is_some() => {
+            Some("cd {cwd_shell} && goose session --resume --session-id {session_id}".to_string())
         }
         _ => None,
     }
