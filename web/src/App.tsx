@@ -107,6 +107,29 @@ function SortControl({ value, hasQuery, onChange }: {
 const timeRanges: TimeRange[] = ["24h", "7d", "30d", "all"]
 const defaultTimeRange: TimeRange = "30d"
 
+// Mirrors SourceFilter::as_str in src/types.rs; keep in step with new sources.
+const sourceOptions = [
+  { value: "claude", label: "Claude" },
+  { value: "codex", label: "Codex" },
+  { value: "opencode", label: "OpenCode" },
+  { value: "cursor", label: "Cursor" },
+  { value: "pi", label: "Pi" },
+  { value: "openclaw", label: "OpenClaw" },
+  { value: "copilot", label: "Copilot" },
+  { value: "omp", label: "Oh My Pi" },
+  { value: "grok", label: "Grok" },
+  { value: "hermes", label: "Hermes" },
+  { value: "jcode", label: "Jcode" },
+  { value: "muse", label: "Muse" },
+  { value: "antigravity", label: "Antigravity" },
+  { value: "bob", label: "IBM Bob" },
+  { value: "zcode", label: "ZCode" },
+  { value: "kiro", label: "Kiro" },
+  { value: "kilocode", label: "KiloCode" },
+  { value: "kimi", label: "Kimi Code" },
+  { value: "goose", label: "goose" },
+]
+
 function ResultSnippet({ result }: { result: SearchResult }) {
   if (!result.snippet) return <>No text preview</>
   const characters = Array.from(result.snippet)
@@ -1061,17 +1084,11 @@ function App() {
               <SelectContent>
                 <SelectGroup>
                   <SelectItem value="all">all sources</SelectItem>
-                  <SelectItem value="claude">Claude</SelectItem>
-                  <SelectItem value="codex">Codex</SelectItem>
-                  <SelectItem value="opencode">OpenCode</SelectItem>
-                  <SelectItem value="cursor">Cursor</SelectItem>
-                  <SelectItem value="pi">Pi</SelectItem>
-                  <SelectItem value="openclaw">OpenClaw</SelectItem>
-                  <SelectItem value="copilot">Copilot</SelectItem>
-                  <SelectItem value="kiro">Kiro</SelectItem>
-                  <SelectItem value="kilocode">KiloCode</SelectItem>
-                  <SelectItem value="goose">goose</SelectItem>
-                  <SelectItem value="kimi">Kimi Code</SelectItem>
+                  {sourceOptions.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      {option.label}
+                    </SelectItem>
+                  ))}
                 </SelectGroup>
               </SelectContent>
             </Select>
@@ -1393,17 +1410,11 @@ function App() {
                       <SelectContent>
                         <SelectGroup>
                           <SelectItem value="all">All sources</SelectItem>
-                          <SelectItem value="claude">Claude</SelectItem>
-                          <SelectItem value="codex">Codex</SelectItem>
-                          <SelectItem value="opencode">OpenCode</SelectItem>
-                          <SelectItem value="cursor">Cursor</SelectItem>
-                          <SelectItem value="pi">Pi</SelectItem>
-                          <SelectItem value="openclaw">OpenClaw</SelectItem>
-                          <SelectItem value="copilot">Copilot</SelectItem>
-                          <SelectItem value="kiro">Kiro</SelectItem>
-                          <SelectItem value="kilocode">KiloCode</SelectItem>
-                          <SelectItem value="goose">goose</SelectItem>
-                          <SelectItem value="kimi">Kimi Code</SelectItem>
+                          {sourceOptions.map((option) => (
+                            <SelectItem key={option.value} value={option.value}>
+                              {option.label}
+                            </SelectItem>
+                          ))}
                         </SelectGroup>
                       </SelectContent>
                     </Select>
