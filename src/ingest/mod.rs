@@ -315,6 +315,7 @@ pub(crate) fn session_refresh_targets<'a>(
         let virtual_database = crate::sources::bob::split_virtual_path(Path::new(source))
             .or_else(|| crate::sources::zcode::split_virtual_path(Path::new(source)))
             .or_else(|| crate::sources::kilocode::split_virtual_path(Path::new(source)))
+            .or_else(|| crate::sources::goose::split_virtual_path(Path::new(source)))
             .map(|(database, _)| database);
         if let Some(database) = virtual_database {
             if !database.is_file() {

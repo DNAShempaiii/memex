@@ -1535,7 +1535,8 @@ impl SearchIndex {
         let searcher = reader.searcher();
         let term = Term::from_field_text(self.fields.session_id, session_id);
         let query = TermQuery::new(term, IndexRecordOption::Basic);
-        let limit = searcher.num_docs() as usize;
+        // TopDocs rejects a zero limit, which an empty index would otherwise pass.
+        let limit = (searcher.num_docs() as usize).max(1);
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
         let mut records = Vec::with_capacity(top_docs.len());
         for (_score, addr) in top_docs {
@@ -3058,6 +3059,26 @@ impl Query for UnscoredQuery {
     }
 }
 
+/// Parse free text as query syntax, or as literal words when it is not valid syntax.
+/// Pasted URLs, `TODO:` notes, `std::fs` paths, and stray quotes would otherwise read
+/// as unknown fields or unbalanced phrases and fail the whole search.
+pub(crate) fn parse_text_query(
+    parser: &tantivy::query::QueryParser,
+    text: &str,
+) -> Result<Box<dyn Query>> {
+    if let Ok(query) = parser.parse_query(text) {
+        return Ok(query);
+    }
+    let literals = text
+        .split_whitespace()
+        .map(|word| word.replace(['"', '\\'], ""))
+        .filter(|word| !word.is_empty())
+        .map(|word| format!("\"{word}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(parser.parse_query(&literals)?)
+}
+
 fn build_query(
     fields: &IndexFields,
     options: &QueryOptions,
@@ -3069,7 +3090,7 @@ fn build_query(
         clauses.push((Occur::Must, Box::new(AllQuery)));
     } else {
         let parser = tantivy::query::QueryParser::for_index(index, vec![fields.text]);
-        let text_query = parser.parse_query(&options.query)?;
+        let text_query = parse_text_query(&parser, &options.query)?;
         clauses.push((Occur::Must, text_query));
     }
 
@@ -4638,6 +4659,28 @@ mod tests {
         assert_eq!(search_text_count(&index, "migrated"), 1);
         assert_eq!(search_text_count(&index, "Databases"), 1);
         assert_eq!(search_text_count(&index, "rollback"), 0);
+    }
+
+    #[test]
+    fn text_that_is_not_query_syntax_searches_as_literal_words() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut writer = index.writer().expect("writer");
+        index
+            .add_record(
+                &mut writer,
+                &test_record(
+                    1,
+                    "see https://github.com/foo/bar and TODO: fix std::fs::read",
+                ),
+            )
+            .expect("add record");
+        writer.commit().expect("commit");
+
+        assert_eq!(search_text_count(&index, "https://github.com/foo/bar"), 1);
+        assert_eq!(search_text_count(&index, "TODO: fix"), 1);
+        assert_eq!(search_text_count(&index, "std::fs::read"), 1);
+        assert_eq!(search_text_count(&index, "it's \"unclosed fix"), 1);
     }
 
     #[test]

