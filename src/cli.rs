@@ -7429,6 +7429,9 @@ fn build_index_command_args(
     if !index.muse || index.no_muse {
         args.push("--no-muse".to_string());
     }
+    if !index.antigravity || index.no_antigravity {
+        args.push("--no-antigravity".to_string());
+    }
     if !index.bob || index.no_bob {
         args.push("--no-bob".to_string());
     }
@@ -7632,11 +7635,11 @@ fn build_systemd_service(
     continuous: bool,
     env_vars: &[(String, String)],
 ) -> String {
-    let exec_start = if program_args.is_empty() {
-        exe_path.to_string()
-    } else {
-        format!("{} {}", exe_path, program_args.join(" "))
-    };
+    let exec_start = std::iter::once(exe_path)
+        .chain(program_args.iter().map(String::as_str))
+        .map(systemd_exec_word)
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let mut out = String::new();
     out.push_str("[Unit]\n");
@@ -7664,6 +7667,34 @@ fn build_systemd_service(
     if continuous {
         out.push_str("WantedBy=default.target\n");
     }
+    out
+}
+
+/// One ExecStart argument. systemd splits on whitespace, expands `%` specifiers and
+/// `$` variables, and reads C escapes inside double quotes, so anything that is not a
+/// plain word is quoted rather than split or turned into another unit directive.
+fn systemd_exec_word(input: &str) -> String {
+    let escaped = input.replace('%', "%%").replace('$', "$$");
+    let plain = !escaped.is_empty()
+        && !escaped.chars().any(|ch| {
+            ch.is_whitespace() || ch.is_control() || matches!(ch, '"' | '\'' | '\\' | ';')
+        });
+    if plain {
+        return escaped;
+    }
+    let mut out = String::from("\"");
+    for ch in escaped.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_ascii_control() => out.push_str(&format!("\\x{:02x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
     out
 }
 
@@ -9180,6 +9211,7 @@ mod tests {
         assert!(args.contains(&"--no-grok".to_string()));
         assert!(args.contains(&"--no-jcode".to_string()));
         assert!(args.contains(&"--no-muse".to_string()));
+        assert!(args.contains(&"--no-antigravity".to_string()));
         assert!(args.contains(&"--no-bob".to_string()));
     }
 
@@ -10462,6 +10494,25 @@ arguments = {
             "Environment=\"PI_CODING_AGENT_SESSION_DIR=/tmp/pi \\\"sessions\\\" 100%%\"\n"
         ));
         assert!(service.contains("ExecStart=/usr/bin/memex index --no-pi\n"));
+    }
+
+    #[test]
+    fn systemd_exec_start_keeps_each_argument_one_word() {
+        let service = build_systemd_service(
+            "/opt/my tools/memex",
+            &[
+                "--exclude".to_string(),
+                "~/My Work/**".to_string(),
+                "%h\nExecStartPre=/bin/evil $HOME".to_string(),
+            ],
+            true,
+            &[],
+        );
+        assert!(service.contains(
+            "ExecStart=\"/opt/my tools/memex\" --exclude \"~/My Work/**\" \
+             \"%%h\\nExecStartPre=/bin/evil $$HOME\"\n"
+        ));
+        assert!(!service.contains("\nExecStartPre="));
     }
 
     #[test]

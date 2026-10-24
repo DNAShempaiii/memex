@@ -1870,6 +1870,7 @@ pub(super) fn prepare_refresh(
         mut state,
         pending_recovery,
         empty_index_rebuild,
+        carried_missing_paths,
     } = recovered;
     let recovering_pending_ingest = pending_recovery.is_some();
     let state_path = paths.state.join("ingest.json");
@@ -2195,6 +2196,12 @@ pub(super) fn prepare_refresh(
         &next_doc_id,
     )?
     else {
+        // Database discovery above already dropped vanished sessions from `state`.
+        let mut carried_missing_paths = carried_missing_paths;
+        carried_missing_paths.extend(bob_missing_paths);
+        carried_missing_paths.extend(zcode.missing_paths);
+        carried_missing_paths.extend(kilocode.missing_paths);
+        carried_missing_paths.extend(goose.missing_paths);
         return prepare_refresh(
             paths,
             index,
@@ -2204,6 +2211,7 @@ pub(super) fn prepare_refresh(
                 state,
                 pending_recovery,
                 empty_index_rebuild,
+                carried_missing_paths,
             },
             Narrowing::None,
             scan_cache,
@@ -2273,6 +2281,7 @@ pub(super) fn prepare_refresh(
     missing_state_paths.extend(zcode.missing_paths);
     missing_state_paths.extend(kilocode.missing_paths);
     missing_state_paths.extend(goose.missing_paths);
+    missing_state_paths.extend(carried_missing_paths);
 
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).

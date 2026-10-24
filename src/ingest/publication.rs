@@ -410,6 +410,9 @@ pub(super) struct RecoveredCheckpoint {
     pub state: CheckpointSession,
     pub pending_recovery: Option<PendingIngest>,
     pub empty_index_rebuild: bool,
+    /// Sessions an earlier discovery pass already dropped from `state` before it had
+    /// to restart; the restart cannot rediscover them, so their deletions carry over.
+    pub carried_missing_paths: Vec<String>,
 }
 
 pub(super) fn recover_checkpoint(
@@ -476,5 +479,6 @@ pub(super) fn recover_checkpoint(
         state,
         pending_recovery,
         empty_index_rebuild,
+        carried_missing_paths: Vec::new(),
     })
 }
