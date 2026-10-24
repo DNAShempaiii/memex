@@ -859,3 +859,144 @@ fn bob_usage_matches_through_uncached_and_canonical_fact_scans() {
     assert_report_matches(&scan_usage(&cached_query).unwrap(), &uncached);
     assert_report_matches(&scan_usage(&cached_query).unwrap(), &uncached);
 }
+
+#[test]
+fn facts_refresh_replaces_warnings_from_an_earlier_pass() {
+    use super::cache::write_fact_sync;
+    use super::snapshot::lock_merged;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _env = crate::test_support::pin_source_roots(temp.path());
+    let root = temp.path().join("JCODE_SESSIONS_DIR");
+    fs::create_dir_all(&root).unwrap();
+    let session = root.join("session_one.json");
+    let write_session = |input: u64| {
+        let doc = serde_json::json!({
+            "id": "session_one",
+            "messages": [{"id": "m1", "role": "assistant", "timestamp": 1788338819456u64,
+                "token_usage": {"input_tokens": input, "output_tokens": 5}}],
+        });
+        fs::write(&session, doc.to_string()).unwrap();
+    };
+    write_session(10);
+    let query = UsageQuery {
+        source: Some(SourceFilter::Jcode),
+        cache_path: Some(temp.path().join("cache.sqlite3")),
+        memo_ttl_ms: 60_000,
+        ..UsageQuery::default()
+    };
+    let key = (SourceFilter::Jcode, query.cache_path.clone());
+    assert_eq!(scan_usage(&query).unwrap().total_tokens, 15);
+    // Record warnings an earlier pass could have reported (a transiently
+    // locked file, a failed cache write) against the current facts.
+    let stamp_transient_warnings = || {
+        let fingerprint = lock_partitions()
+            .get(&key)
+            .map(|entry| entry.fingerprint.clone())
+            .expect("snapshot published");
+        let stored = Connection::open(query.cache_path.as_ref().unwrap()).unwrap();
+        write_fact_sync(
+            &stored,
+            SourceFilter::Jcode,
+            &fingerprint,
+            &[
+                format!(
+                    "jcode usage file skipped ({}): database is locked",
+                    session.display()
+                ),
+                "jcode usage cache write failed: database is locked".to_string(),
+            ],
+        )
+        .unwrap();
+        expire(&query);
+    };
+    // Cold queries serve the stored checkpoint's warnings directly.
+    let cold_warnings = || {
+        lock_partitions().clear();
+        lock_merged().clear();
+        scan_usage(&query).unwrap().warnings
+    };
+
+    // The file reparses cleanly, so its warning must not survive the refresh.
+    stamp_transient_warnings();
+    write_session(70);
+    let reparsed = scan_usage(&query).unwrap();
+    assert_eq!(reparsed.total_tokens, 75);
+    assert!(reparsed.warnings.is_empty(), "{:?}", reparsed.warnings);
+    assert!(cold_warnings().is_empty());
+
+    // Nothing changed on disk: the refresh reuses every fact yet still drops
+    // the old warnings, from both the report and the stored checkpoint.
+    stamp_transient_warnings();
+    let unchanged = scan_usage(&query).unwrap();
+    assert_eq!(unchanged.total_tokens, 75);
+    assert!(unchanged.warnings.is_empty(), "{:?}", unchanged.warnings);
+    assert!(cold_warnings().is_empty());
+}
+
+fn kiro_session(root: &std::path::Path, name: &str, execution: &str, at: &str, credits: f64) {
+    let dir = root.join("workspace").join(name);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("session.json"), r#"{"id":"shared"}"#).unwrap();
+    let line = serde_json::json!({"id": name, "timestamp": at,
+        "payload": {"type": "usage_summary", "executionId": execution,
+            "promptTurnSummaries": [{"unit": "credit", "usage": credits}]}});
+    fs::write(dir.join("messages.jsonl"), format!("{line}\n")).unwrap();
+}
+
+#[test]
+fn kiro_refresh_reconciles_an_execution_repeated_in_a_new_file() {
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _pinned = crate::test_support::pin_source_roots(temp.path());
+    let root = temp.path().join("kiro");
+    let _env = EnvVarGuard::set_os(&[("KIRO_SESSIONS_DIR", Some(root.as_os_str()))]);
+    kiro_session(&root, "a", "exec", "2026-09-04T11:11:05.286Z", 1.0);
+    let query = UsageQuery {
+        source: Some(SourceFilter::Kiro),
+        cache_path: Some(temp.path().join("cache.sqlite3")),
+        memo_ttl_ms: 60_000,
+        ..UsageQuery::default()
+    };
+    let initial = scan_usage(&query).unwrap();
+    assert_eq!((initial.events, initial.credits), (1, Some(1.0)));
+
+    // A later copy of the same (session, executionId) summary supersedes the
+    // first even though only the new file reparses.
+    kiro_session(&root, "b", "exec", "2026-09-04T12:00:00.000Z", 2.0);
+    expire(&query);
+    let refreshed = scan_usage(&query).unwrap();
+    assert_eq!((refreshed.events, refreshed.credits), (1, Some(2.0)));
+    let fresh = scan_usage(&UsageQuery {
+        cache_path: Some(temp.path().join("fresh.sqlite3")),
+        memo_ttl_ms: 0,
+        ..query.clone()
+    })
+    .unwrap();
+    assert_report_matches(&refreshed, &fresh);
+}
+
+#[test]
+fn kiro_credit_warning_needs_kiro_usage() {
+    use super::snapshot::lock_merged;
+
+    let _guard = env_lock();
+    let temp = tempfile::tempdir().unwrap();
+    let _pinned = crate::test_support::pin_source_roots(temp.path());
+    let root = temp.path().join("kiro");
+    let _env = EnvVarGuard::set_os(&[("KIRO_SESSIONS_DIR", Some(root.as_os_str()))]);
+    let kiro_warning = |report: &UsageReport| {
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.starts_with("Kiro reports credits"))
+    };
+    lock_partitions().clear();
+    lock_merged().clear();
+    assert!(!kiro_warning(&scan_usage(&UsageQuery::default()).unwrap()));
+    kiro_session(&root, "a", "exec", "2026-09-04T11:11:05.286Z", 1.0);
+    lock_partitions().clear();
+    lock_merged().clear();
+    assert!(kiro_warning(&scan_usage(&UsageQuery::default()).unwrap()));
+}

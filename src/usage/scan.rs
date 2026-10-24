@@ -978,7 +978,10 @@ fn scan_kiro(
         out,
         crate::sources::kiro::parse_usage_file,
     );
-    warnings.push("Kiro reports credits; token usage and dollar costs are unavailable.".into());
+    // Only a report that actually holds Kiro credits is missing token data.
+    if !out.is_empty() {
+        warnings.push("Kiro reports credits; token usage and dollar costs are unavailable.".into());
+    }
     Ok(())
 }
 
