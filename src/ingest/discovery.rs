@@ -639,12 +639,12 @@ pub(super) fn prepare_file_task(
         _ => (0, 0, HashMap::new()),
     };
     let claude = resolve_claude_background(&path, source, size, previous, change);
-    // A Kimi undo retracts lines earlier passes indexed; only a full parse drops them.
-    // If the tail cannot be inspected, fail safe by reparsing.
-    let kimi_undo = source == SourceKind::Kimi
+    // A Kimi undo or step retry retracts lines earlier passes indexed; only a full parse
+    // drops them. If the tail cannot be inspected, fail safe by reparsing.
+    let kimi_retraction = source == SourceKind::Kimi
         && change == FileChange::Append
-        && crate::sources::kimi::has_undo_since(&path, offset, size).unwrap_or(true);
-    if claude.reparse || kimi_undo {
+        && crate::sources::kimi::has_retraction_since(&path, offset, size).unwrap_or(true);
+    if claude.reparse || kimi_retraction {
         change = FileChange::Replaced;
         offset = 0;
         turn_id = 0;

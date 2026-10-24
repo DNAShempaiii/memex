@@ -280,9 +280,16 @@ fn is_undo(value: &Value) -> bool {
     value["type"] == "context.undo"
 }
 
-/// Whether bytes `[from, to)` of a journal hold an undo. An undo retracts lines an
-/// earlier pass indexed, so an append carrying one needs a full reparse.
-pub(crate) fn has_undo_since(path: &Path, from: u64, to: u64) -> Result<bool> {
+const RETRY_NEEDLE: &[u8] = br#""type":"turn.step.retrying""#;
+
+fn is_retry(value: &Value) -> bool {
+    value["type"] == "turn.step.retrying"
+}
+
+/// Whether bytes `[from, to)` of a journal hold an undo or a step retry. Either can
+/// retract lines an earlier pass indexed (a retry drops the failed attempt's partial
+/// reply), so an append carrying one needs a full reparse.
+pub(crate) fn has_retraction_since(path: &Path, from: u64, to: u64) -> Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = File::open(path)?;
     let end = to.min(file.metadata()?.len());
@@ -290,7 +297,8 @@ pub(crate) fn has_undo_since(path: &Path, from: u64, to: u64) -> Result<bool> {
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::with_capacity((end - start) as usize);
     file.take(end - start).read_to_end(&mut bytes)?;
-    Ok(last_line_end(&bytes, UNDO_NEEDLE, is_undo) > 0)
+    Ok(last_line_end(&bytes, UNDO_NEEDLE, is_undo) > 0
+        || last_line_end(&bytes, RETRY_NEEDLE, is_retry) > 0)
 }
 
 fn origin_kind(origin: &Value) -> Option<&str> {
@@ -378,16 +386,14 @@ fn undone_lines(bytes: &[u8]) -> Vec<Range<u64>> {
 /// Steps the agent loop retried. A failed attempt journals whatever it had streamed
 /// before the retry repeats the reply, all in one burst.
 fn retried_steps(bytes: &[u8]) -> HashSet<String> {
-    let finder = memchr::memmem::Finder::new(br#""type":"turn.step.retrying""#);
+    let finder = memchr::memmem::Finder::new(RETRY_NEEDLE);
     finder
         .find_iter(bytes)
         .filter_map(|hit| {
             let line_start = memchr::memrchr(b'\n', &bytes[..hit]).map_or(0, |i| i + 1);
             let line_end = hit + memchr(b'\n', &bytes[hit..])?;
             let value = serde_json::from_slice::<Value>(&bytes[line_start..line_end]).ok()?;
-            (value["type"] == "turn.step.retrying")
-                .then(|| string(&value, "stepId"))
-                .flatten()
+            is_retry(&value).then(|| string(&value, "stepId")).flatten()
         })
         .collect()
 }
@@ -701,9 +707,9 @@ pub(crate) fn parse_index_records(
             diagnostics.non_object_json_lines += 1;
             continue;
         }
-        // An undo retracts lines earlier passes indexed. Leave it for the next refresh,
-        // which sees it in the appended bytes and reparses the whole journal.
-        if incremental && is_undo(&value) {
+        // An undo or retry retracts lines earlier passes indexed. Leave it for the next
+        // refresh, which sees it in the appended bytes and reparses the whole journal.
+        if incremental && (is_undo(&value) || is_retry(&value)) {
             start = line_start;
             break;
         }
@@ -1646,7 +1652,7 @@ mod tests {
         fs::write(&path, &kept).unwrap();
         let (records, first) = parse(&path, IndexParseState::default(), false);
         assert_eq!(records.len(), 4);
-        assert!(!has_undo_since(&path, 0, kept.len() as u64).unwrap());
+        assert!(!has_retraction_since(&path, 0, kept.len() as u64).unwrap());
 
         // An incremental pass stops at the undo instead of indexing past it ...
         fs::OpenOptions::new()
@@ -1659,7 +1665,9 @@ mod tests {
         assert!(appended.is_empty());
         assert!(second.offset < (kept.len() + undo.len()) as u64);
         // ... so the refresh that follows sees it in the tail and reparses everything.
-        assert!(has_undo_since(&path, second.offset, (kept.len() + undo.len()) as u64).unwrap());
+        assert!(
+            has_retraction_since(&path, second.offset, (kept.len() + undo.len()) as u64).unwrap()
+        );
         let (full, _) = parse(&path, IndexParseState::default(), false);
         assert_eq!(
             full.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
@@ -1712,6 +1720,65 @@ mod tests {
         assert_eq!(
             records.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
             ["explain", "Full explanation", "Interrupted partial"]
+        );
+    }
+
+    #[test]
+    fn appended_retry_of_an_indexed_partial_waits_for_a_full_parse() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = session(temp.path(), "session_ri");
+        let path = dir.join("agents/main/wire.jsonl");
+        let part = |time: u64, step: &str, text: &str| {
+            loop_event(
+                "main",
+                time,
+                json!({"type": "content.part", "uuid": format!("p{time}"), "stepUuid": step, "part": {"type": "text", "text": text}}),
+            )
+        };
+        let streamed = prompt("main", 1, json!({"kind": "user"}), "explain")
+            + &loop_event(
+                "main",
+                2,
+                json!({"type": "step.begin", "uuid": "S1", "step": 1}),
+            )
+            + &part(3, "S1", "Partial expl");
+        let retry = loop_event(
+            "main",
+            4,
+            json!({"type": "step.end", "uuid": "S1", "step": 1, "finishReason": "error"}),
+        ) + &line(
+            json!({"type": "turn.step.retrying", "agentId": "main", "turnId": 0, "step": 1, "stepId": "S1",
+                "failedAttempt": 1, "nextAttempt": 2, "time": 5}),
+        ) + &loop_event(
+            "main",
+            6,
+            json!({"type": "step.begin", "uuid": "S2", "step": 1}),
+        ) + &part(7, "S2", "Full explanation");
+        fs::write(&path, &streamed).unwrap();
+        // A refresh indexes the partial reply while the step is still streaming.
+        let (indexed, first) = parse(&path, IndexParseState::default(), false);
+        assert_eq!(
+            indexed.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["explain", "Partial expl"]
+        );
+        assert!(!has_retraction_since(&path, first.offset, streamed.len() as u64).unwrap());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(retry.as_bytes())
+            .unwrap();
+        let size = (streamed.len() + retry.len()) as u64;
+        // The incremental pass stops at the retry, and the next refresh reparses fully.
+        let (appended, second) = parse(&path, resume(&first), false);
+        assert!(appended.is_empty());
+        assert!(has_retraction_since(&path, second.offset, size).unwrap());
+        assert!(has_retraction_since(&path, first.offset, size).unwrap());
+        let (full, _) = parse(&path, IndexParseState::default(), false);
+        assert_eq!(
+            full.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["explain", "Full explanation"]
         );
     }
 
