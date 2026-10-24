@@ -480,6 +480,7 @@ fn reconciles_cross_file(filter: SourceFilter) -> bool {
             | SourceFilter::Cursor
             | SourceFilter::Copilot
             | SourceFilter::Opencode
+            | SourceFilter::Kiro
     )
 }
 
@@ -634,23 +635,19 @@ pub(crate) fn refresh_partition_from_facts(
             changed.push(event.clone());
         }
     }
-    // Stored warnings describe unchanged files; new warnings describe this
-    // refresh's parses. Union them deduplicated (see write_fact_sync).
-    let mut stored = stored_warnings;
-    for warning in warnings.iter() {
-        if !stored.contains(warning) {
-            stored.push(warning.clone());
-        }
-    }
+    // This refresh's warnings replace the stored ones (see write_fact_sync):
+    // a file that failed to stat or parse never becomes a hit, so every
+    // per-file warning is recomputed above, and transient cache failures from
+    // an earlier build no longer apply.
     let upsert_start = Instant::now();
-    if !removed.is_empty() {
+    if !removed.is_empty() || *warnings != stored_warnings {
         cache
             .upsert_file_facts(
                 filter,
                 &removed.into_iter().collect::<Vec<_>>(),
                 &changed,
                 &fingerprint,
-                &stored,
+                warnings,
             )
             .map_err(|_| anyhow::anyhow!("{name} facts write failed"))?;
     }
@@ -661,7 +658,6 @@ pub(crate) fn refresh_partition_from_facts(
             changed.len()
         )
     });
-    *warnings = stored;
     Ok((events, fingerprint))
 }
 
