@@ -7,7 +7,7 @@ use super::execution::{
     parse_codex_session, parse_copilot_session, parse_pi_file, record_channel,
 };
 use super::publication::{
-    open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
+    EmbedBudget, open_vector_index_for_ingest, prepare_pending_ingest_recovery, recover_checkpoint,
 };
 use crate::analytics::backfill_from_index;
 
@@ -64,6 +64,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        embedding_budget: None,
     }
 }
 
@@ -962,6 +963,7 @@ fn cancelled_writer_does_not_publish_staged_records() {
         index_root: PathBuf::new(),
         input_bytes: None,
         defer_merges: false,
+        embedding_budget: None,
         embeddings: false,
         do_backfill_embeddings: false,
         reset_vector_store: false,
@@ -1038,6 +1040,7 @@ fn checkpoint_only_writer_skips_embedding_initialization() {
         WriterContext {
             index_root: paths.index.clone(),
             defer_merges: false,
+            embedding_budget: None,
             input_bytes: Some(0),
             embeddings: true,
             do_backfill_embeddings: false,
@@ -1177,6 +1180,7 @@ fn parser_cancellation_preserves_active_vectors() {
         index_root: PathBuf::new(),
         input_bytes: None,
         defer_merges: false,
+        embedding_budget: None,
         embeddings: true,
         do_backfill_embeddings: false,
         reset_vector_store: true,
@@ -2935,6 +2939,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        embedding_budget: None,
     };
 
     let lease = ingest_lease(&paths);
@@ -3715,6 +3720,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         embed_runtime: EmbedRuntimeConfig::default(),
         tool_content_limits: IndexedToolContentLimits::default(),
         defer_merges: false,
+        embedding_budget: None,
     };
 
     let lease = ingest_lease(&paths);
@@ -4502,6 +4508,7 @@ fn writer_loop_accepts_copilot_source_progress() {
         index_root: PathBuf::new(),
         input_bytes: None,
         defer_merges: false,
+        embedding_budget: None,
         embeddings: false,
         do_backfill_embeddings: false,
         reset_vector_store: false,
@@ -7969,4 +7976,153 @@ fn bounded_reads_keep_the_stored_cursor_and_scan_cache_when_the_journal_cannot_a
     .unwrap();
     assert_eq!(stored(), before);
     assert_eq!(indexed_texts(&paths), ["indexed"]);
+}
+
+/// Answers OpenAI-style embedding requests with 3-dimensional vectors until dropped.
+fn serve_test_embeddings() -> (String, std::thread::JoinHandle<usize>) {
+    let server = tiny_http::Server::http("127.0.0.1:0").expect("bind embedding server");
+    let addr = server.server_addr().to_ip().expect("server address");
+    let handle = std::thread::spawn(move || {
+        let mut requests = 0;
+        while let Ok(Some(mut request)) = server.recv_timeout(Duration::from_millis(500)) {
+            let mut raw = String::new();
+            let _ = request.as_reader().read_to_string(&mut raw);
+            let body: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            let count = body["input"].as_array().map_or(1, Vec::len);
+            let data: Vec<_> = (0..count)
+                .map(|index| serde_json::json!({"index": index, "embedding": [1.0, 0.5, 0.25]}))
+                .collect();
+            let response = tiny_http::Response::from_string(
+                serde_json::json!({"object": "list", "data": data}).to_string(),
+            )
+            .with_header(
+                tiny_http::Header::from_bytes("Content-Type", "application/json").unwrap(),
+            );
+            let _ = request.respond(response);
+            requests += 1;
+        }
+        requests
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+fn budgeted_embedding_writer(
+    paths: &Paths,
+    index: &SearchIndex,
+    base_url: &str,
+    records: Vec<Record>,
+    embedding_budget: Option<Duration>,
+) -> WriterOutcome {
+    let (tx_record, rx_record) = unbounded();
+    for record in records {
+        tx_record.send(record).expect("send record");
+    }
+    drop(tx_record);
+    let (decision_tx, decision_rx) = bounded(1);
+    decision_tx
+        .send(WriterDecision::Commit {
+            session_cwds: Vec::new(),
+        })
+        .expect("commit");
+    let ctx = WriterContext {
+        index_root: paths.index.clone(),
+        input_bytes: None,
+        defer_merges: false,
+        embedding_budget,
+        embeddings: true,
+        do_backfill_embeddings: false,
+        reset_vector_store: false,
+        vector_dir: paths.vectors.clone(),
+        analytics_path: analytics_path(&paths.state),
+        progress: Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true)),
+        model: ModelChoice::Remote("test-model".to_string()),
+        embed_runtime: EmbedRuntimeConfig {
+            remote: Some(crate::embed::RemoteEmbedConfig {
+                endpoint: crate::remote_embed::RemoteEndpoint {
+                    base_url: base_url.to_string(),
+                    api_key: None,
+                    timeout: Duration::from_secs(5),
+                    max_retries: 0,
+                },
+                dimensions: None,
+            }),
+            ..EmbedRuntimeConfig::default()
+        },
+        tool_content_limits: IndexedToolContentLimits::default(),
+        reconcile_vector_ids: false,
+        scope_targets: Vec::new(),
+        opencode_session_cwds: HashMap::new(),
+        repositories: Arc::new(crate::repository::RepositoryResolver::default()),
+        codex_metadata_checkpoints: HashMap::new(),
+        vector_delete_paths: HashSet::new(),
+    };
+    let writer = index.writer().expect("writer");
+    run_writer_fixture(
+        index.clone(),
+        writer,
+        rx_record,
+        decision_rx,
+        Vec::new(),
+        ctx,
+    )
+    .expect("run writer")
+}
+
+#[test]
+fn spent_embedding_budget_publishes_records_and_a_later_refresh_backfills_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+    paths.ensure_dirs().expect("ensure dirs");
+    let index = save_search_records(&paths, &[record(1, "user", "existing")]);
+    backfill_from_index(analytics_path(&paths.state), &index).expect("seed analytics");
+    let (base_url, server) = serve_test_embeddings();
+
+    let outcome = budgeted_embedding_writer(
+        &paths,
+        &index,
+        &base_url,
+        vec![record(2, "user", "second"), record(3, "user", "third")],
+        Some(Duration::ZERO),
+    );
+    assert_eq!(
+        outcome,
+        WriterOutcome::Published {
+            records_added: 2,
+            records_embedded: 0,
+        }
+    );
+    let index = open_search_index(&paths);
+    assert_eq!(index.doc_count().expect("document count"), 3);
+    let vectors = VectorIndex::open(&paths.vectors).expect("vector index");
+    assert_eq!(vectors.len(), 0);
+
+    let outcome = budgeted_embedding_writer(&paths, &index, &base_url, Vec::new(), None);
+    assert_eq!(
+        outcome,
+        WriterOutcome::Published {
+            records_added: 0,
+            records_embedded: 3,
+        }
+    );
+    let vectors = VectorIndex::open(&paths.vectors).expect("vector index");
+    assert!((1..=3).all(|doc_id| vectors.contains(doc_id)));
+    drop(index);
+    server.join().expect("embedding server");
+}
+
+#[test]
+fn embed_budget_drops_buffered_work_once_spent() {
+    let progress = Arc::new(Progress::new([0; SOURCE_COUNT], [0; SOURCE_COUNT], true));
+    assert!(!EmbedBudget::new(None).spent());
+    assert!(!EmbedBudget::new(Some(Duration::from_secs(3600))).spent());
+
+    let mut budget = EmbedBudget::new(Some(Duration::ZERO));
+    assert!(budget.spent());
+    let mut buffer = vec![
+        (1, "one".to_string(), SourceKind::Claude),
+        (2, "two".to_string(), SourceKind::Claude),
+    ];
+    budget.skip(&mut buffer, &progress);
+    assert!(buffer.is_empty());
+    assert_eq!(budget.skipped, 2);
 }
