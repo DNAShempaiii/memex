@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod daemon_runtime;
 pub mod embed;
+mod embed_cpu;
 pub mod herdr;
 pub mod index;
 pub mod ingest;

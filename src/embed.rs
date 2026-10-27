@@ -1,3 +1,4 @@
+use crate::embed_cpu::CpuTextEmbedding;
 use crate::remote_embed::{RemoteEmbedder, RemoteEndpoint};
 use anyhow::{Context, Result, anyhow};
 use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
@@ -655,7 +656,7 @@ fn init_options_for_model(
 
     match effective_provider {
         ExecutionProviderChoice::Auto => unreachable!("auto should resolve to a concrete provider"),
-        ExecutionProviderChoice::Cpu => Ok(opts),
+        ExecutionProviderChoice::Cpu => unreachable!("cpu sessions are built by CpuTextEmbedding"),
         ExecutionProviderChoice::CoreML => init_options_with_coreml(opts, runtime),
         ExecutionProviderChoice::Cuda => init_options_with_cuda(opts, runtime),
     }
@@ -729,6 +730,7 @@ fn init_options_with_cuda(
 
 enum EmbedBackend {
     Fastembed(TextEmbedding),
+    CpuFastembed(CpuTextEmbedding),
     Model2Vec(StaticModel),
     Remote(RemoteEmbedder),
 }
@@ -771,6 +773,13 @@ impl EmbedderHandle {
                 let dims = TextEmbedding::get_model_info(model_type)?.dim;
                 let requested_provider = runtime.execution_provider;
                 let effective_provider = requested_provider.effective();
+                if effective_provider == ExecutionProviderChoice::Cpu {
+                    return Ok(Self {
+                        backend: EmbedBackend::CpuFastembed(CpuTextEmbedding::try_new(model_type)?),
+                        dims,
+                        batch_size,
+                    });
+                }
                 let opts = init_options_for_model(model_type.clone(), runtime)?;
                 let model = TextEmbedding::try_new(opts).map_err(|err| match effective_provider {
                     ExecutionProviderChoice::Cuda => anyhow!(
@@ -854,6 +863,7 @@ impl EmbedderHandle {
         }
         match &mut self.backend {
             EmbedBackend::Fastembed(model) => Ok(model.embed(texts, Some(self.batch_size))?),
+            EmbedBackend::CpuFastembed(model) => model.embed(texts, self.batch_size),
             EmbedBackend::Model2Vec(model) => {
                 let input: Vec<String> = texts.iter().map(|t| t.to_string()).collect();
                 Ok(model.encode_with_args(&input, Some(512), self.batch_size))
