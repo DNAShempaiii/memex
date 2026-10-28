@@ -63,7 +63,7 @@ static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[command(
     name = "memex",
     version,
-    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
+    help_template = "{about-with-newline}\nUsage: {usage}\n\nFind and read:\n  search       Search history and memories\n  sessions     List sessions\n  projects     List project counts and activity\n  activity     Chart conversation and token activity\n  machines     List configured machines\n  session      Read a session or batch of pages\n  show         Read a record or memory\n  context      Read surrounding records\n\nBrowse and reuse:\n  tui          Browse interactively (also the default)\n  web          Serve or open the browser\n  share        Share a session\n  transfer     Transfer a session to another agent\n\nIndex and operate:\n  index        Index history and memories; rebuild, gc, embed, stats\n  daemon       Run indexing, web, and MCP together\n  usage        Report token usage and cost\n\nIntegrate and maintain:\n  mcp          Run the MCP server\n  skill        Manage the bundled search skill\n  rex          Install the Rex module\n  update       Update Memex and installed skills\n  debug        Retrieval evaluation\n  help         Show command help\n\nOptions:\n{options}\n{after-help}",
     about = "Search, browse, and reuse local agent history and memory",
     after_help = "\
 QUICK START:
@@ -742,6 +742,15 @@ EXAMPLES:
         #[command(subcommand)]
         action: HerdrCommand,
     },
+    /// Rex integration: install the memex module for Rex's init.lua
+    #[command(after_help = "\
+EXAMPLES:
+    memex rex install                     # write memex.lua beside Rex's init.lua
+    memex rex install --dir ~/dotfiles/rex")]
+    Rex {
+        #[command(subcommand)]
+        action: RexCommand,
+    },
     /// Show index statistics, vector state, and indexing config
     #[command(hide = true)]
     Stats {
@@ -979,6 +988,59 @@ enum HerdrCommand {
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RexCommand {
+    /// Write memex.lua beside Rex's init.lua (rerun after upgrading memex)
+    Install {
+        /// Directory to write memex.lua to [default: the directory of Rex's init.lua]
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Replace a memex.lua that `memex rex install` did not write
+        #[arg(long)]
+        force: bool,
+    },
+    /// Resume the most recent resumable session, opening a new Rex tab
+    #[command(hide = true)]
+    ResumeLast {
+        /// Prefer sessions from this directory (falls back to the global latest unless strict)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Refuse when no resumable session exists in --cwd instead of using another project
+        #[arg(long)]
+        strict_cwd: bool,
+        /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Rex session to open the tab in [default: $REX_SESSION]
+        #[arg(long)]
+        rex_session: Option<String>,
+        /// Rex block a split opens beside [default: $REX_BLOCK]
+        #[arg(long)]
+        rex_block: Option<String>,
+    },
+    /// Resume a specific session by id, opening a new Rex tab
+    #[command(hide = true)]
+    Resume {
+        /// Session ID (from `memex sessions` or search results)
+        session_id: String,
+        /// Filter by source when a session id appears in multiple backends
+        #[arg(long)]
+        source: Option<SourceFilter>,
+        /// Path to memex data directory [default: ~/.memex]
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Rex session to open the tab in [default: $REX_SESSION]
+        #[arg(long)]
+        rex_session: Option<String>,
+        /// Rex block a split opens beside [default: $REX_BLOCK]
+        #[arg(long)]
+        rex_block: Option<String>,
     },
 }
 
@@ -1979,6 +2041,36 @@ pub fn run() -> Result<()> {
                 root,
             } => {
                 run_herdr_resume(Some(session_id), None, false, source, root)?;
+            }
+        },
+        Commands::Rex { action } => match action {
+            RexCommand::Install { dir, force } => run_rex_install(dir, force)?,
+            RexCommand::ResumeLast {
+                cwd,
+                strict_cwd,
+                source,
+                root,
+                rex_session,
+                rex_block,
+            } => {
+                let target = RexTarget {
+                    session: rex_session,
+                    block: rex_block,
+                };
+                run_rex_resume(None, cwd, strict_cwd, source, root, target)?;
+            }
+            RexCommand::Resume {
+                session_id,
+                source,
+                root,
+                rex_session,
+                rex_block,
+            } => {
+                let target = RexTarget {
+                    session: rex_session,
+                    block: rex_block,
+                };
+                run_rex_resume(Some(session_id), None, false, source, root, target)?;
             }
         },
         Commands::Stats { json, root, output } => {
@@ -5710,17 +5802,24 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
     }))
 }
 
-fn run_herdr_resume(
+/// What `memex herdr|rex resume[-last]` resumes: the session, its resume
+/// command, and the directory to run it in.
+struct ResumeTarget {
+    row: crate::analytics::SessionDetailRow,
+    command: String,
+    cwd: String,
+}
+
+fn resume_target(
+    paths: &Paths,
+    config: &UserConfig,
     session_id: Option<String>,
     cwd: Option<PathBuf>,
     strict_cwd: bool,
     source: Option<SourceFilter>,
-    root: Option<PathBuf>,
-) -> Result<()> {
-    let paths = Paths::new(root)?;
-    let config = UserConfig::load(&paths)?;
+) -> Result<ResumeTarget> {
     let claude_sources = config.claude_sources();
-    let store = open_analytics_read_only(&paths)?;
+    let store = open_analytics_read_only(paths)?;
     let cwd_filter = canonical_cwd_filter(cwd);
 
     let mut rows =
@@ -5743,18 +5842,54 @@ fn run_herdr_resume(
         // selection falls through to the global fallback or reports none.
         rows.retain(&interactive);
         if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
-            // The public CLI keeps its historical global fallback unless the Herdr plugin
-            // explicitly requires the focused directory to match.
+            // The public CLI keeps its historical global fallback unless the herdr or Rex
+            // plugin explicitly requires the focused directory to match.
             rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
             rows.retain(&interactive);
         }
     }
 
-    let Some((row, command, cwd)) = rows.iter().find_map(|row| {
-        session_resume_command(&config, row, &claude_sources).map(|(cmd, cwd)| (row, cmd, cwd))
-    }) else {
-        return Err(anyhow!("no resumable session found"));
-    };
+    rows.into_iter()
+        .find_map(|row| {
+            let (command, cwd) = session_resume_command(config, &row, &claude_sources)?;
+            Some(ResumeTarget { row, command, cwd })
+        })
+        .ok_or_else(|| anyhow!("no resumable session found"))
+}
+
+/// Outside a terminal multiplexer, run the resume command directly.
+fn run_resume_inline(target: &ResumeTarget) -> Result<()> {
+    let status = std::process::Command::new("sh")
+        .args(["-lc", &target.command])
+        .status()?;
+    if !status.success() {
+        return Err(anyhow!("resume command exited with {status}"));
+    }
+    println!(
+        "resumed {} ({})",
+        target.row.session_id,
+        target.row.source.label()
+    );
+    Ok(())
+}
+
+fn resume_label(row: &crate::analytics::SessionDetailRow) -> String {
+    row.repo_project
+        .clone()
+        .unwrap_or_else(|| row.project.clone())
+}
+
+fn run_herdr_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    strict_cwd: bool,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let target = resume_target(&paths, &config, session_id, cwd, strict_cwd, source)?;
+    let ResumeTarget { row, command, cwd } = &target;
 
     if crate::herdr::inside_herdr() {
         let placement = crate::herdr::resume_placement(&config);
@@ -5771,12 +5906,12 @@ fn run_herdr_resume(
             );
             return Ok(());
         }
-        let label = row
-            .repo_project
-            .clone()
-            .unwrap_or_else(|| row.project.clone());
-        let pane_id =
-            crate::herdr::open_resume_pane(placement, Some(cwd.as_str()), &label, &command)?;
+        let pane_id = crate::herdr::open_resume_pane(
+            placement,
+            Some(cwd.as_str()),
+            &resume_label(row),
+            command,
+        )?;
         println!(
             "resumed {} ({}) in herdr pane {pane_id}",
             row.session_id,
@@ -5785,14 +5920,122 @@ fn run_herdr_resume(
         return Ok(());
     }
 
-    // Outside herdr, run the resume command directly.
-    let status = std::process::Command::new("sh")
-        .args(["-lc", &command])
-        .status()?;
-    if !status.success() {
-        return Err(anyhow!("resume command exited with {status}"));
+    run_resume_inline(&target)
+}
+
+/// Where `memex rex resume[-last]` opens the session. The Rex module passes
+/// both from its action context; from a shell they default to the terminal's
+/// own `REX_SESSION` and `REX_BLOCK`.
+struct RexTarget {
+    session: Option<String>,
+    block: Option<String>,
+}
+
+fn run_rex_resume(
+    session_id: Option<String>,
+    cwd: Option<PathBuf>,
+    strict_cwd: bool,
+    source: Option<SourceFilter>,
+    root: Option<PathBuf>,
+    rex: RexTarget,
+) -> Result<()> {
+    let paths = Paths::new(root)?;
+    let config = UserConfig::load(&paths)?;
+    let target = resume_target(&paths, &config, session_id, cwd, strict_cwd, source)?;
+    let ResumeTarget { row, command, cwd } = &target;
+
+    // A block id only means something in the session it came from.
+    let (rex_session, rex_block) = match rex.session {
+        Some(session) => (Some(session), rex.block),
+        None => (
+            crate::rex::current_session(),
+            rex.block.or_else(crate::rex::current_block),
+        ),
+    };
+    let Some(rex_session) = rex_session else {
+        return run_resume_inline(&target);
+    };
+    let placement = crate::rex::resume_placement(&config);
+    if placement == crate::rex::ResumePlacement::Off {
+        return Err(anyhow!("Rex resume is disabled (rex_resume = \"off\")"));
     }
-    println!("resumed {} ({})", row.session_id, row.source.label());
+    if let Some(block_id) = crate::rex::block_running_session(&rex_session, &row.session_id)
+        && crate::rex::focus_block(&rex_session, &block_id).is_ok()
+    {
+        println!(
+            "{} ({}) is already open; focused Rex block {block_id}",
+            row.session_id,
+            row.source.label()
+        );
+        return Ok(());
+    }
+    let block_id = crate::rex::open_resume_block(
+        placement,
+        &rex_session,
+        rex_block.as_deref(),
+        Some(cwd.as_str()),
+        &resume_label(row),
+        command,
+    )?;
+    println!(
+        "resumed {} ({}) in Rex block {block_id}",
+        row.session_id,
+        row.source.label()
+    );
+    Ok(())
+}
+
+fn run_rex_install(dir: Option<PathBuf>, force: bool) -> Result<()> {
+    let dir = match dir {
+        Some(dir) => dir,
+        None => crate::rex::config_dir()
+            .ok_or_else(|| anyhow!("cannot locate Rex's config directory; pass --dir"))?,
+    };
+    let path = dir.join("memex.lua");
+    let contents = crate::rex::module_contents();
+    let status = match std::fs::read_to_string(&path) {
+        Ok(existing) if existing == contents => "unchanged",
+        Ok(existing) if !force && !existing.starts_with(crate::rex::MODULE_MARKER) => {
+            return Err(anyhow!(
+                "{} was not written by memex; pass --force to replace it",
+                path.display()
+            ));
+        }
+        Ok(_) => "updated",
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => "created",
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    if status != "unchanged" {
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        std::fs::write(&path, &contents)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    println!("{status} {}", path.display());
+
+    let init = dir.join("init.lua");
+    let loaded = std::fs::read_to_string(&init).is_ok_and(|text| {
+        [
+            "require(\"memex\")",
+            "require('memex')",
+            "require \"memex\"",
+        ]
+        .iter()
+        .any(|call| text.contains(call))
+    });
+    if loaded {
+        println!(
+            "\n{} already loads it; run `rex config reload` to apply.",
+            init.display()
+        );
+    } else {
+        println!(
+            "\nAdd to {}:\n\n  require(\"memex\").setup{{}}\n  rex.bind(\"cmd+shift+m\", \"memex_palette\")\n\nthen run `rex config reload`.",
+            init.display()
+        );
+    }
     Ok(())
 }
 
@@ -8094,6 +8337,9 @@ fn command_reports_updates(command: &Commands) -> bool {
             | Commands::Rpc { .. }
             | Commands::Mcp { .. }
             | Commands::Herdr { .. }
+            | Commands::Rex {
+                action: RexCommand::ResumeLast { .. } | RexCommand::Resume { .. }
+            }
             | Commands::IndexService {
                 action: IndexServiceCommand::Run { .. }
             }

@@ -383,6 +383,8 @@ pub struct UserConfig {
     pub goose_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
     pub herdr_resume: Option<String>,
+    /// How resume behaves inside a Rex terminal: "tab" (default), "split", or "off".
+    pub rex_resume: Option<String>,
     /// Glob patterns matched against transcript source paths; matched files are
     /// never indexed. Applied during source discovery, not at query time.
     pub exclude_paths: Option<Vec<String>>,

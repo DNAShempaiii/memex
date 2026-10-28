@@ -2719,6 +2719,48 @@ impl App {
                     }
                 }
             }
+        } else if let Some(rex_session) = crate::rex::current_session() {
+            // Inside a Rex terminal, the same: a new Rex tab/split, or the block
+            // already running the session.
+            let placement = crate::rex::resume_placement(&self.config);
+            if placement != crate::rex::ResumePlacement::Off {
+                if !remote
+                    && let Some(block_id) =
+                        crate::rex::block_running_session(&rex_session, &session.session_id)
+                    && crate::rex::focus_block(&rex_session, &block_id).is_ok()
+                {
+                    self.set_status(format!(
+                        "{} is already open; focused Rex block {block_id}",
+                        session.session_id
+                    ));
+                    return Ok(());
+                }
+                let rex_cwd = (!remote).then_some(cwd.as_str());
+                match crate::rex::open_resume_block(
+                    placement,
+                    &rex_session,
+                    crate::rex::current_block().as_deref(),
+                    rex_cwd,
+                    &session.project,
+                    &command,
+                ) {
+                    Ok(_) => {
+                        self.set_status(format!(
+                            "resumed {} in a new Rex {}",
+                            session.session_id,
+                            if placement == crate::rex::ResumePlacement::Split {
+                                "split"
+                            } else {
+                                "tab"
+                            }
+                        ));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        self.set_status(format!("Rex resume failed ({err}); running inline"));
+                    }
+                }
+            }
         }
         run_external_command(self, terminal, &command)?;
         self.set_status(format!("ran: {command}"));
