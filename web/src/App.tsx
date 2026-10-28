@@ -61,6 +61,7 @@ type SearchResult = {
   record_id?: string
   source_path?: string
   project: string
+  tags?: string[]
   source: string
   role: string
   ts: number
@@ -588,10 +589,16 @@ function ResultContinuation({
   )
 }
 
+function formatTags(tags?: string[]) {
+  return tags?.length ? ` · ${tags.map((tag) => `#${tag}`).join(" ")}` : ""
+}
+
 function App() {
   const [query, setQuery] = useState(paramsAtLoad.get("q") || "")
   const [source, setSource] = useState(paramsAtLoad.get("source") || "all")
   const [project, setProject] = useState(paramsAtLoad.get("project") || "")
+  const [tag, setTag] = useState(paramsAtLoad.get("tag") || "")
+  const [knownTags, setKnownTags] = useState<string[]>([])
   const [origin, setOrigin] = useState(
     paramsAtLoad.get("origin") || "interactive",
   )
@@ -641,7 +648,7 @@ function App() {
   const resultOffset = useRef(0)
   const resultIntent = useRef("")
   const loadingMore = useRef(false)
-  const intent = JSON.stringify([query, source, project, origin, timeRange, sort])
+  const intent = JSON.stringify([query, source, project, tag, origin, timeRange, sort])
   const currentIntent = useRef(intent)
   currentIntent.current = intent
 
@@ -664,6 +671,7 @@ function App() {
       if (query.trim()) next.set("q", query.trim())
       if (source !== "all") next.set("source", source)
       if (project.trim()) next.set("project", project.trim())
+      if (tag.trim()) next.set("tag", tag.trim())
       if (origin !== "interactive") next.set("origin", origin)
       if (nextTimeRange !== defaultTimeRange) next.set("range", nextTimeRange)
       if (nextSort) next.set("sort", nextSort)
@@ -678,7 +686,7 @@ function App() {
       const url = next.size ? `?${next}` : location.pathname
       return url
     },
-    [mode, origin, project, query, source, timeRange, selectedSort],
+    [mode, origin, project, query, source, tag, timeRange, selectedSort],
   )
 
   const updateLocation = useCallback(
@@ -720,6 +728,7 @@ function App() {
       setQuery(params.get("q") || "")
       setSource(params.get("source") || "all")
       setProject(params.get("project") || "")
+      setTag(params.get("tag") || "")
       setOrigin(params.get("origin") || "interactive")
       setTimeRange(parseTimeRange(params.get("range")))
       setSelectedSort(parseSearchSort(params.get("sort")))
@@ -749,13 +758,25 @@ function App() {
       if (query.trim()) searchParams.set("q", query.trim())
       if (source !== "all") searchParams.set("source", source)
       if (project.trim()) searchParams.set("project", project.trim())
+      if (tag.trim()) searchParams.set("tag", tag.trim())
       if (origin !== "interactive") searchParams.set("origin", origin)
       searchParams.set("range", timeRange)
       searchParams.set("sort", sort)
       return searchParams
     },
-    [origin, project, query, source, timeRange, sort],
+    [origin, project, query, source, tag, timeRange, sort],
   )
+
+  useEffect(() => {
+    const controller = new AbortController()
+    api<{ tags: Array<{ tag: string; session_count: number }> }>(
+      "/api/tags",
+      controller.signal,
+    )
+      .then((data) => setKnownTags(data.tags.map((entry) => entry.tag)))
+      .catch(() => {})
+    return () => controller.abort()
+  }, [searchRevision])
 
   const searchStatus = useCallback(
     (count: number) =>
@@ -885,7 +906,7 @@ function App() {
 
   useEffect(() => {
     setHomeSelectedIndex(0)
-  }, [origin, project, query, source, timeRange, sort])
+  }, [origin, project, query, source, tag, timeRange, sort])
 
   useEffect(() => {
     const discovered = results
@@ -1025,6 +1046,7 @@ function App() {
   const filterCount =
     Number(source !== "all") +
     Number(Boolean(project.trim())) +
+    Number(Boolean(tag.trim())) +
     Number(origin !== "interactive")
   const homeSurface = (
     <main className="home-surface">
@@ -1135,6 +1157,33 @@ function App() {
                 </SelectGroup>
               </SelectContent>
             </Select>
+            {(knownTags.length > 0 || tag) && (
+              <Select
+                onValueChange={(value) => setTag(value === "all" ? "" : value)}
+                value={tag || "all"}
+              >
+                <SelectTrigger
+                  aria-label="Tag"
+                  className="home-filter-select home-project-select"
+                  size="sm"
+                  variant="ghost"
+                >
+                  <SelectValue placeholder="All tags" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="all">All tags</SelectItem>
+                    {Array.from(new Set([...knownTags, ...(tag ? [tag] : [])])).map(
+                      (option) => (
+                        <SelectItem key={option} value={option}>
+                          #{option}
+                        </SelectItem>
+                      ),
+                    )}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            )}
           </div>
         </div>
 
@@ -1194,6 +1243,7 @@ function App() {
                 </span>
                 <span className="home-result-meta">
                   {result.source} · {result.role}
+                  {formatTags(result.tags)}
                 </span>
                 <time>{formatDate(result.ts)}</time>
                 <span
@@ -1309,6 +1359,7 @@ function App() {
                           </div>
                           <div className="session-meta">
                             {result.source} · {result.role}
+                            {formatTags(result.tags)}
                             {result.score == null
                               ? ""
                               : ` · ${result.score.toFixed(2)}`}
@@ -1449,6 +1500,22 @@ function App() {
                       placeholder="Any project"
                       value={project}
                     />
+                  </div>
+                  <div className="filter-field">
+                    <label htmlFor="tag-filter">Tag</label>
+                    <Input
+                      className="shadow-none"
+                      id="tag-filter"
+                      list="tag-filter-options"
+                      onChange={(event) => setTag(event.target.value)}
+                      placeholder="Any tag"
+                      value={tag}
+                    />
+                    <datalist id="tag-filter-options">
+                      {knownTags.map((option) => (
+                        <option key={option} value={option} />
+                      ))}
+                    </datalist>
                   </div>
                 </PopoverContent>
               </Popover>

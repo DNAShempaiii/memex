@@ -78,6 +78,9 @@ pub struct SearchSpec {
     /// starts at the first query term when that lies beyond the cap.
     #[serde(default)]
     pub text_limit: Option<usize>,
+    /// Only records from sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 impl SearchSpec {
@@ -356,6 +359,9 @@ pub struct SessionListSpec {
     pub cwd: Option<String>,
     pub since_ms: Option<u64>,
     pub limit: usize,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -398,6 +404,8 @@ enum RpcOperation {
     Ping,
     Projects {
         source: Option<SourceFilter>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
     },
     Sessions {
         #[serde(flatten)]
@@ -469,6 +477,9 @@ enum RpcOperation {
     HomeActivity {
         request: crate::web::ActivityRequest,
         now: u64,
+    },
+    SessionAssignment {
+        request: crate::session_meta::AssignmentRequest,
     },
 }
 
@@ -546,6 +557,9 @@ enum RpcPayload {
     },
     HomeActivity {
         activity: crate::web::RawActivityPayload,
+    },
+    SessionAssignment {
+        report: Box<crate::session_meta::AssignmentReport>,
     },
     Error {
         message: String,
@@ -2059,8 +2073,14 @@ pub(crate) fn remote_project_summaries(
     config: &UserConfig,
     id: &str,
     source: Option<SourceFilter>,
+    tags: Vec<String>,
 ) -> Result<Vec<serde_json::Value>> {
-    match metadata_rpc(config, id, RpcOperation::Projects { source }, "projects")? {
+    match metadata_rpc(
+        config,
+        id,
+        RpcOperation::Projects { source, tags },
+        "projects",
+    )? {
         RpcPayload::Projects { projects } => Ok(projects),
         _ => bail!("machine '{id}' returned an unexpected projects metadata response"),
     }
@@ -2081,6 +2101,34 @@ pub(crate) fn remote_sessions(
     )? {
         RpcPayload::Sessions { sessions } => Ok(sessions),
         _ => bail!("machine '{id}' returned an unexpected sessions metadata response"),
+    }
+}
+
+/// Change or inspect a session's user assignments on the machine that indexes it, so
+/// that machine's own project and tag filters see them.
+pub fn session_assignment(
+    paths: &Paths,
+    config: &UserConfig,
+    machine: &str,
+    request: &crate::session_meta::AssignmentRequest,
+) -> Result<crate::session_meta::AssignmentReport> {
+    if machine == LOCAL_MACHINE_ID {
+        return crate::session_meta::apply_local(paths, request);
+    }
+    match metadata_rpc(
+        config,
+        machine,
+        RpcOperation::SessionAssignment {
+            request: request.clone(),
+        },
+        "session assignment",
+    )? {
+        RpcPayload::SessionAssignment { report } => {
+            let mut report = *report;
+            report.machine = machine.to_string();
+            Ok(report)
+        }
+        _ => bail!("machine '{machine}' returned an unexpected session assignment response"),
     }
 }
 
@@ -2285,8 +2333,8 @@ pub fn run_rpc_stdio(root: Option<std::path::PathBuf>) -> Result<()> {
 
 fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Result<RpcPayload> {
     match request {
-        RpcOperation::Projects { source } => Ok(RpcPayload::Projects {
-            projects: crate::cli::collect_projects(paths, source)?,
+        RpcOperation::Projects { source, tags } => Ok(RpcPayload::Projects {
+            projects: crate::cli::collect_projects(paths, source, tags)?,
         }),
         RpcOperation::Sessions {
             input: SessionsInput::Request { request },
@@ -2296,6 +2344,7 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
                 request.source_path,
                 request.cwd.map(std::path::PathBuf::from),
                 request.project,
+                request.tags,
                 crate::cli::parse_source_filter(request.source)?,
                 request.profile,
                 request.since,
@@ -2306,6 +2355,9 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         }),
         RpcOperation::SessionCount { request, query } => Ok(RpcPayload::SessionCount {
             count: crate::cli::collect_session_count(paths, request, query)?,
+        }),
+        RpcOperation::SessionAssignment { request } => Ok(RpcPayload::SessionAssignment {
+            report: Box::new(crate::session_meta::apply_local(paths, &request)?),
         }),
         RpcOperation::Ping => Ok(RpcPayload::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2461,7 +2513,8 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
 }
 
 fn sessions_local(paths: &Paths, spec: &SessionListSpec) -> Result<Vec<SessionListing>> {
-    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let store =
+        AnalyticsStore::open_read_only(analytics_path(&paths.state))?.with_tags(spec.tags.clone());
     let config = UserConfig::load(paths)?;
     let claude_sources = config.claude_sources();
     let cwd = crate::cli::canonical_cwd_filter(spec.cwd.as_ref().map(std::path::PathBuf::from));
@@ -2742,23 +2795,33 @@ fn search_local(
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
-    let repository_project = spec
-        .project
-        .as_deref()
-        .filter(|_| spec.project_grouping == Some(ProjectGrouping::Repository));
-    if repository_project.is_some() || spec.cwd.is_some() {
-        let db = analytics_path(&paths.state);
-        if db.exists() {
-            let store = AnalyticsStore::open_read_only(db)?;
-            let mut scope = store.query_search_scopes(repository_project, spec.cwd.as_deref())?;
+    let db = analytics_path(&paths.state);
+    let store = if db.exists() {
+        Some(AnalyticsStore::open_read_only(db)?.with_tags(spec.tags.clone()))
+    } else {
+        None
+    };
+    let grouping = spec.project_grouping.unwrap_or(ProjectGrouping::Flat);
+    // Project filters resolve through the analytics catalog whenever user assignments
+    // can move a session between projects; otherwise flat names filter the index.
+    let catalog_project = spec.project.as_deref().filter(|_| {
+        grouping == ProjectGrouping::Repository
+            || store
+                .as_ref()
+                .is_some_and(|store| store.has_project_assignments().unwrap_or(false))
+    });
+    if catalog_project.is_some() || spec.cwd.is_some() || !spec.tags.is_empty() {
+        if let Some(store) = &store {
+            let mut scope =
+                store.query_search_scopes(catalog_project, grouping, spec.cwd.as_deref())?;
             if let Some(existing) = &options.session_scope {
                 scope.retain(|key| existing.contains(key));
             }
             options.session_scope = Some(scope);
-            if repository_project.is_some() {
+            if catalog_project.is_some() {
                 options.project = None;
             }
-        } else if spec.cwd.is_some() {
+        } else if spec.cwd.is_some() || !spec.tags.is_empty() {
             options.session_scope = Some(Vec::new());
         }
     }
@@ -2913,12 +2976,16 @@ fn apply_project_grouping(
     records: &mut [(f32, Record)],
     grouping: Option<ProjectGrouping>,
 ) {
-    let Some(grouping) = grouping.filter(|grouping| *grouping != ProjectGrouping::Flat) else {
+    let Some(grouping) = grouping else {
         return;
     };
     let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
         return;
     };
+    // Flat names come from the index unless a user assignment moves the session.
+    if grouping == ProjectGrouping::Flat && !store.has_project_assignments().unwrap_or(false) {
+        return;
+    }
     let keys: Vec<_> = records
         .iter()
         .map(|(_, record)| {
@@ -3348,6 +3415,7 @@ fn rpc_sessions(
     machine: &MachineConfig,
     spec: SessionListSpec,
 ) -> Result<Vec<SessionListing>> {
+    let tags = spec.tags.clone();
     match metadata_rpc(
         config,
         &machine.id,
@@ -3356,11 +3424,15 @@ fn rpc_sessions(
         },
         "sessions",
     )? {
-        RpcPayload::Sessions { sessions } => sessions
-            .into_iter()
-            .map(serde_json::from_value)
-            .collect::<std::result::Result<_, _>>()
-            .map_err(Into::into),
+        RpcPayload::Sessions { sessions } => {
+            let mut listings = sessions
+                .into_iter()
+                .map(serde_json::from_value)
+                .collect::<std::result::Result<Vec<SessionListing>, _>>()?;
+            // A peer too old to filter by tag reports none; never show its unfiltered rows.
+            listings.retain(|listing| tags.iter().all(|tag| listing.session.tags.contains(tag)));
+            Ok(listings)
+        }
         RpcPayload::Error { message } => Err(anyhow!("sessions failed: {message}")),
         other => Err(anyhow!("sessions returned unexpected response: {other:?}")),
     }
@@ -4044,6 +4116,7 @@ mod tests {
             min_score: None,
             project_grouping: None,
             text_limit: None,
+            tags: Vec::new(),
         }
     }
 
@@ -5091,6 +5164,9 @@ mod tests {
                 last_at,
                 message_count: 1,
                 profile: None,
+                parent_session_id: None,
+                assigned_project: None,
+                tags: Vec::new(),
             },
         };
         let result = merge_sessions(
@@ -5128,6 +5204,9 @@ mod tests {
                 last_at,
                 message_count: 1,
                 profile: reported.then(|| profile.to_string()),
+                parent_session_id: None,
+                assigned_project: None,
+                tags: Vec::new(),
             },
         };
         // An older peer ignores the filter and reports no profile; its newer rows must not

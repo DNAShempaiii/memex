@@ -89,6 +89,76 @@ pub(super) enum SessionCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
+    /// Assign a session to a project, overriding its derived repository grouping
+    #[command(
+        after_help = "Continuation and sub-agent sessions inherit their parent's project unless\nthey have their own. Derived repository facts are kept; `clear-project` restores them."
+    )]
+    SetProject {
+        session_id: String,
+        project: String,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// Remove a session's project assignment, restoring its derived grouping
+    ClearProject {
+        session_id: String,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// Add, remove, or list user tags
+    Tag {
+        #[command(subcommand)]
+        action: TagCommand,
+    },
+    /// Show a session's assigned and derived project and its tags
+    Inspect {
+        session_id: String,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+}
+
+#[derive(Subcommand)]
+pub(super) enum TagCommand {
+    /// Add tags to a session
+    Add {
+        session_id: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// Remove tags from a session
+    #[command(alias = "remove")]
+    Rm {
+        session_id: String,
+        #[arg(required = true)]
+        tags: Vec<String>,
+        #[command(flatten)]
+        target: AssignmentTarget,
+    },
+    /// List tags with their session counts
+    #[command(alias = "list")]
+    Ls {
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        output: OutputArgs,
+    },
+}
+
+#[derive(Debug, Clone, Args)]
+pub(super) struct AssignmentTarget {
+    /// Provider, when several share the session ID
+    #[arg(long)]
+    pub(super) source: Option<crate::types::SourceFilter>,
+    /// Machine that indexes the session
+    #[arg(long, default_value = crate::machine::LOCAL_MACHINE_ID)]
+    pub(super) machine: String,
+    #[arg(long)]
+    pub(super) root: Option<PathBuf>,
+    #[command(flatten)]
+    pub(super) output: OutputArgs,
 }
 
 #[derive(Subcommand)]

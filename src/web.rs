@@ -207,6 +207,10 @@ fn handle_request(
             Ok(payload) => respond_json(request, StatusCode(200), &payload),
             Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
         },
+        "/api/tags" => match tags_payload(paths) {
+            Ok(payload) => respond_json(request, StatusCode(200), &payload),
+            Err(err) => respond_json_error(request, StatusCode(503), &err.to_string()),
+        },
         "/api/search" => match SearchRequest::from_url(&parsed) {
             Ok(params) => match search_payload(paths, &params) {
                 Ok(payload) => respond_json(request, StatusCode(200), &payload),
@@ -1313,6 +1317,7 @@ struct SearchRequest {
     query: String,
     source: Option<SourceFilter>,
     project: Option<String>,
+    tags: Vec<String>,
     offset: usize,
     limit: usize,
     origin: SessionKindFilter,
@@ -1332,6 +1337,7 @@ impl SearchRequest {
         let mut query = String::new();
         let mut source = None;
         let mut project = None;
+        let mut tags = Vec::new();
         let mut offset = 0;
         let mut limit = 50;
         let mut origin = SessionKindFilter::Primary;
@@ -1346,6 +1352,12 @@ impl SearchRequest {
                 }
                 "project" if !value.trim().is_empty() => {
                     project = Some(value.trim().to_string());
+                }
+                "tag" if !value.trim().is_empty() => {
+                    let tag = crate::session_meta::normalize_tag(value)?;
+                    if !tags.contains(&tag) {
+                        tags.push(tag);
+                    }
                 }
                 "origin" => origin = parse_origin(value)?,
                 "range" => range = TimeRange::parse(value)?,
@@ -1390,6 +1402,7 @@ impl SearchRequest {
             query,
             source,
             project,
+            tags,
             offset,
             limit,
             origin,
@@ -1451,6 +1464,30 @@ fn stats_payload(paths: &Paths) -> Result<StatsPayload> {
 }
 
 #[derive(Serialize)]
+struct TagsPayload {
+    tags: Vec<TagSummary>,
+}
+
+#[derive(Serialize)]
+struct TagSummary {
+    tag: String,
+    session_count: u64,
+}
+
+fn tags_payload(paths: &Paths) -> Result<TagsPayload> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Ok(TagsPayload { tags: Vec::new() });
+    }
+    let tags = AnalyticsStore::open_read_only(db)?
+        .query_tags()?
+        .into_iter()
+        .map(|(tag, session_count)| TagSummary { tag, session_count })
+        .collect();
+    Ok(TagsPayload { tags })
+}
+
+#[derive(Serialize)]
 struct SearchPayload {
     query: String,
     offset: usize,
@@ -1464,6 +1501,8 @@ struct SessionSummary {
     record_id: String,
     source_path: String,
     project: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
     source: String,
     role: String,
     ts: u64,
@@ -1493,6 +1532,7 @@ pub(crate) fn evaluate_search(
             query: query.to_string(),
             source,
             project: project.map(str::to_string),
+            tags: Vec::new(),
             offset: 0,
             limit,
             origin,
@@ -1546,15 +1586,16 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 recency_weight: crate::search::DEFAULT_RECENCY_WEIGHT,
                 recency_half_life_days: 30.0,
                 min_score: None,
-                project_grouping: None,
+                project_grouping: Some(ProjectGrouping::Flat),
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+                tags: params.tags.clone(),
             },
             &crate::search::Selection::conversations(target, params.origin),
             false,
         )?;
         let has_more = found.items.len() > params.offset.saturating_add(params.limit);
         let matchers = crate::cli::build_matchers(&params.query)?;
-        let results = found
+        let mut results: Vec<SessionSummary> = found
             .items
             .into_iter()
             .skip(params.offset)
@@ -1571,6 +1612,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                     session_id: record.session_id,
                     source_path: record.source_path,
                     project: record.project,
+                    tags: Vec::new(),
                     source: record.source.label().to_string(),
                     role: record.role,
                     ts: record.ts,
@@ -1580,6 +1622,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 }
             })
             .collect();
+        attach_assignments(paths, &mut results, false);
         return Ok(SearchPayload {
             query: params.query.clone(),
             offset: params.offset,
@@ -1588,6 +1631,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         });
     }
     let index = open_index(paths)?;
+    let catalog_scope = catalog_session_scope(paths, params)?;
     let matchers = crate::cli::build_matchers(&params.query)?;
     let since = params
         .range
@@ -1597,11 +1641,11 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let mut candidate_limit = target.saturating_mul(4).max(100).min(document_count);
     let query_options = |limit| QueryOptions {
         query: params.query.clone(),
-        project: params.project.clone(),
+        project: params.project.clone().filter(|_| catalog_scope.is_none()),
         role: None,
         tool: None,
         session_id: None,
-        session_scope: None,
+        session_scope: catalog_scope.clone(),
         source: params.source,
         since,
         until: None,
@@ -1611,7 +1655,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let summaries = loop {
         let records: Vec<(Option<f32>, crate::types::Record)> = match params.sort {
             SearchSort::Relevance => unreachable!("relevance returns through shared search"),
-            SearchSort::Newest if params.query.is_empty() => index
+            SearchSort::Newest if params.query.is_empty() && catalog_scope.is_none() => index
                 .recent_records_filtered_since(
                     candidate_limit,
                     params.source,
@@ -1728,6 +1772,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
                 session_id: record.session_id,
                 source_path: record.source_path,
                 project: record.project,
+                tags: Vec::new(),
                 source: record.source.label().to_string(),
                 role: record.role,
                 ts: record.ts,
@@ -1748,11 +1793,12 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     };
 
     let has_more = summaries.len() > params.offset.saturating_add(params.limit);
-    let results = summaries
+    let mut results: Vec<SessionSummary> = summaries
         .into_iter()
         .skip(params.offset)
         .take(params.limit)
         .collect();
+    attach_assignments(paths, &mut results, catalog_scope.is_some());
 
     Ok(SearchPayload {
         query: params.query.clone(),
@@ -1760,6 +1806,69 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
         has_more,
         results,
     })
+}
+
+/// Sessions a project or tag filter selects when the index alone cannot answer it:
+/// tags live only in the assignment store, and an assigned project overrides the
+/// indexed one. `None` leaves filtering to the index.
+fn catalog_session_scope(
+    paths: &Paths,
+    params: &SearchRequest,
+) -> Result<Option<Vec<SessionScopeKey>>> {
+    let db = analytics_path(&paths.state);
+    if !db.exists() {
+        return Ok((!params.tags.is_empty()).then(Vec::new));
+    }
+    let store = AnalyticsStore::open_read_only(&db)?.with_tags(params.tags.clone());
+    let project = params
+        .project
+        .as_deref()
+        .filter(|_| store.has_project_assignments().unwrap_or(false));
+    if params.tags.is_empty() && project.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(store.query_search_scopes(
+        project,
+        ProjectGrouping::Flat,
+        None,
+    )?))
+}
+
+/// Show assigned projects and tags on result rows. Relevance results already carry
+/// assigned projects from the shared search path.
+fn attach_assignments(paths: &Paths, results: &mut [SessionSummary], projects: bool) {
+    let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
+        return;
+    };
+    let keys = results
+        .iter()
+        .filter_map(|summary| {
+            crate::types::SourceKind::from_label(&summary.source).map(|source| {
+                (
+                    source,
+                    summary.session_id.clone(),
+                    summary.source_path.clone(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let tags = store.query_session_tags(&keys).unwrap_or_default();
+    let assigned = (projects || store.has_project_assignments().unwrap_or(false))
+        .then(|| {
+            store
+                .query_session_projects(&keys, ProjectGrouping::Flat)
+                .ok()
+        })
+        .flatten()
+        .unwrap_or_default();
+    for (summary, key) in results.iter_mut().zip(keys) {
+        if let Some(tags) = tags.get(&key) {
+            summary.tags.clone_from(tags);
+        }
+        if let Some(project) = assigned.get(&key) {
+            summary.project.clone_from(project);
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -3232,6 +3341,7 @@ mod tests {
                 query: "needle".to_string(),
                 source: Some(SourceFilter::Claude),
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 0,
                 limit: 20,
                 origin: SessionKindFilter::All,
@@ -3310,6 +3420,7 @@ mod tests {
                 query: "alpha".to_string(),
                 source: None,
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3328,6 +3439,7 @@ mod tests {
                 query: "alpha".to_string(),
                 source: None,
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 0,
                 limit: 1,
                 origin: SessionKindFilter::Primary,
@@ -3345,6 +3457,7 @@ mod tests {
                 query: "alpha".to_string(),
                 source: None,
                 project: Some("memex".to_string()),
+                tags: Vec::new(),
                 offset: 1,
                 limit: 1,
                 origin: SessionKindFilter::Primary,
@@ -3386,6 +3499,7 @@ mod tests {
                 query: String::new(),
                 source: Some(SourceFilter::Codex),
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3524,6 +3638,7 @@ mod tests {
                 query: "text:needle".to_string(),
                 source: None,
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3554,6 +3669,7 @@ mod tests {
                 query: String::new(),
                 source: None,
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 30,
                 origin: SessionKindFilter::Primary,
@@ -3688,6 +3804,7 @@ mod tests {
                 query: "collision".to_string(),
                 source: None,
                 project: None,
+                tags: Vec::new(),
                 offset: 0,
                 limit: 10,
                 origin: SessionKindFilter::Primary,
@@ -3920,6 +4037,7 @@ mod tests {
                     query: "flaky".to_string(),
                     source: None,
                     project: None,
+                    tags: Vec::new(),
                     offset: 0,
                     limit: 30,
                     origin,

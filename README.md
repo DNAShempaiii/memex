@@ -169,6 +169,16 @@ Search results identify the session, source, and machine so you can retrieve the
 original records. Transcript reads are bounded by default and return continuation
 information for longer content.
 
+Assign sessions to projects or tag them; both survive reindexing and rebuilds:
+
+```bash
+memex session set-project SESSION_ID ProjectA
+memex session tag add SESSION_ID tooling
+memex sessions --tag tooling
+```
+
+See [projects and tags](docs/projects.md).
+
 For semantic or hybrid search, first generate local embeddings:
 
 ```bash
@@ -284,6 +294,7 @@ destination can reproduce the original session's behavior.
 | [Installation and updates](docs/installation.md) | Package managers, source builds, Nix, skill updates, daemon upgrade migration |
 | [Indexing, search, and reading](docs/search.md) | Sources, memories, filters, formats, record budgets, pagination |
 | [Configuration and embeddings](docs/configuration.md) | Config file, models, execution providers, exclusions, resume templates |
+| [Projects and tags](docs/projects.md) | Project assignments, tags, inheritance, storage |
 | [Background indexing and Web UI](docs/daemon.md) | Services, browser authentication, index cleanup |
 | [Multiple machines](docs/machines.md) | SSH setup, remote reads, batch retrieval |
 | [MCP server](docs/mcp.md) | Transports, authentication, client setup, retrieval tools |
