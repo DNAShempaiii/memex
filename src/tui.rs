@@ -1477,7 +1477,7 @@ impl App {
         let machines = self.selected_machines();
         let source = self.source.as_filter();
         let session_kind = self.session_kind;
-        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
         let range = self.home_activity_range;
@@ -1568,7 +1568,7 @@ impl App {
         let config = self.config.clone();
         let machines = self.selected_machines();
         let source = self.source.as_filter();
-        let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
+        let project = split_project_filter(&self.project).0;
         let project_grouping = self.project_display.grouping();
         let session_keys = home_token_session_keys(&self.query, &self.results);
         let local_session_keys = session_keys.as_ref().map(|keys| {
@@ -1580,7 +1580,10 @@ impl App {
         let session_kind = self.session_kind;
         let mut query = home_token_usage_query(
             self.source,
-            &self.project,
+            split_project_filter(&self.project)
+                .0
+                .as_deref()
+                .unwrap_or(""),
             self.project_display.grouping(),
             local_session_keys,
             self.home_activity_range,
@@ -1721,7 +1724,9 @@ impl App {
                 }
                 let mut projects: Vec<(String, u64)> = latest.into_iter().collect();
                 projects.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                Ok((sources, projects.into_iter().map(|(p, _)| p).collect()))
+                let mut projects: Vec<String> = projects.into_iter().map(|(p, _)| p).collect();
+                projects.extend(tag_filter_options(&store));
+                Ok((sources, projects))
             })()
             .unwrap_or_default();
             let _ = tx.send(SearchUpdate::HomeFilters {
@@ -5388,6 +5393,31 @@ fn session_activity(sessions: &[SessionSummary]) -> Vec<HomeChartPoint> {
         .collect()
 }
 
+/// The project filter doubles as the tag filter: `#tag` selects sessions carrying that
+/// user tag instead of a project.
+fn split_project_filter(value: &str) -> (Option<String>, Vec<String>) {
+    let value = value.trim();
+    if let Some(tag) = value.strip_prefix('#') {
+        return (
+            None,
+            crate::session_meta::normalize_tag(tag)
+                .into_iter()
+                .collect(),
+        );
+    }
+    ((!value.is_empty()).then(|| value.to_string()), Vec::new())
+}
+
+/// Tag entries for the project dropdowns, most used first.
+fn tag_filter_options(store: &AnalyticsStore) -> Vec<String> {
+    store
+        .query_tags()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(tag, _)| format!("#{tag}"))
+        .collect()
+}
+
 fn sessions_from_recent(
     index: &SearchIndex,
     source: Option<SourceFilter>,
@@ -5576,10 +5606,11 @@ fn collect_projects_from_analytics(
     grouping: ProjectGrouping,
 ) -> Result<Vec<String>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    let projects = store.query_projects(source, grouping)?;
+    let mut projects = store.query_projects(source, grouping)?;
     if projects.is_empty() {
         anyhow::bail!("no analytics projects");
     }
+    projects.extend(tag_filter_options(&store));
     Ok(projects)
 }
 
@@ -5855,7 +5886,9 @@ fn run_search_request(
     index: &SearchIndex,
     request: SearchRequest,
 ) -> SearchRequestResult {
-    if !request.query.is_empty() {
+    let (project, tags) = split_project_filter(&request.project);
+    // Tags live only in the assignment store; the shared search path scopes them.
+    if !request.query.is_empty() || !tags.is_empty() {
         let result = crate::search::collect(
             paths,
             config,
@@ -5863,7 +5896,7 @@ fn run_search_request(
             std::slice::from_ref(&request.query),
             &SearchSpec {
                 query: request.query.clone(),
-                project: (!request.project.is_empty()).then(|| request.project.clone()),
+                project,
                 role: None,
                 tool: None,
                 session_id: None,
@@ -5879,6 +5912,7 @@ fn run_search_request(
                 min_score: None,
                 project_grouping: Some(request.grouping),
                 text_limit: Some(crate::machine::SEARCH_TEXT_BUDGET),
+                tags,
             },
             &crate::search::Selection::conversations(RESULT_LIMIT, request.kind),
             false,
@@ -5895,7 +5929,7 @@ fn run_search_request(
             .collect();
         return Ok((sessions, result.failures));
     }
-    let project = (!request.project.is_empty()).then_some(request.project.as_str());
+    let project = project.as_deref();
     if !config.machines.is_empty() {
         let federated = federated_recent(
             paths,

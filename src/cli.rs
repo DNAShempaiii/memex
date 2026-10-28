@@ -54,7 +54,7 @@ mod stats;
 mod surface;
 use surface::{
     CliSearchMode, DaemonMcpArgs, DebugCommand, EvaluationArgs, IndexCommand, IndexSource,
-    OutputArgs, OutputFormat, OutputOptions, SessionCommand, WebCommand,
+    OutputArgs, OutputFormat, OutputOptions, SessionCommand, TagCommand, WebCommand,
 };
 
 static TRACE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -258,9 +258,12 @@ struct SessionsArgs {
     /// Only sessions whose cwd is this path, lives under it, or whose git root is it
     #[arg(long)]
     cwd: Option<PathBuf>,
-    /// Filter by project (repository grouping)
+    /// Filter by project (repository grouping, after user assignments)
     #[arg(long)]
     project: Option<String>,
+    /// Only sessions with this user tag (repeatable; all must match)
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
     /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, muse, kiro, or kimi
     #[arg(long)]
     source: Option<SourceFilter>,
@@ -401,6 +404,9 @@ OUTPUT FIELDS (--fields):
         /// Filter by project name
         #[arg(long, help_heading = "Filters")]
         project: Option<String>,
+        /// Only sessions with this user tag (repeatable; all must match)
+        #[arg(long = "tag", value_name = "TAG", help_heading = "Filters")]
+        tags: Vec<String>,
         /// Filter by role (user, assistant, tool_use, tool_result)
         #[arg(long, help_heading = "Filters")]
         role: Option<String>,
@@ -710,6 +716,9 @@ The input contains at most 32 requests; each page is limited to 500 records."
         /// Filter by source
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Count only sessions with this user tag (repeatable; all must match)
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
         /// Read one machine (defaults to local; ignores configured search defaults)
         #[arg(long)]
         machine: Option<String>,
@@ -1108,6 +1117,9 @@ pub(crate) struct SearchRequest {
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to search.
     pub(crate) project: Option<String>,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tags: Vec<String>,
     /// Record role such as user, assistant, tool_use, or tool_result.
     pub(crate) role: Option<String>,
     /// Tool name such as Read, Edit, or Bash.
@@ -1164,6 +1176,9 @@ pub(crate) struct SessionsRequest {
     pub(crate) cwd: Option<String>,
     /// Repository/project grouping to list.
     pub(crate) project: Option<String>,
+    /// Only sessions carrying every one of these user tags.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) tags: Vec<String>,
     /// Agent source such as claude, codex, cursor, opencode, pi, or omp.
     pub(crate) source: Option<String>,
     /// Claude config directory name, such as `work` for `~/.claude-profiles/work`.
@@ -1439,6 +1454,7 @@ pub fn run() -> Result<()> {
             additional_queries,
             cwd,
             project,
+            tags,
             role,
             tool,
             session,
@@ -1472,6 +1488,7 @@ pub fn run() -> Result<()> {
                 additional_queries,
                 cwd,
                 project,
+                tags,
                 role,
                 tool,
                 session,
@@ -1644,7 +1661,11 @@ pub fn run() -> Result<()> {
             }
         },
         Commands::Session {
-            action: _,
+            action: Some(action),
+            ..
+        } => run_session_assignment(action)?,
+        Commands::Session {
+            action: None,
             session_id,
             machine,
             source_path,
@@ -1839,19 +1860,21 @@ pub fn run() -> Result<()> {
         }
         Commands::Projects {
             source,
+            tags,
             machine,
             root,
             output,
         } => {
             let paths = Paths::new(root)?;
+            let tags = normalize_tags(&tags)?;
             let mut items = if let Some(id) = machine
                 .as_deref()
                 .filter(|id| *id != crate::machine::LOCAL_MACHINE_ID)
             {
                 let config = UserConfig::load(&paths)?;
-                crate::machine::remote_project_summaries(&config, id, source)?
+                crate::machine::remote_project_summaries(&config, id, source, tags)?
             } else {
-                collect_projects(&paths, source)?
+                collect_projects(&paths, source, tags)?
             };
             if let Some(machine) = machine {
                 for item in &mut items {
@@ -1870,6 +1893,7 @@ pub fn run() -> Result<()> {
             source_path,
             cwd,
             project,
+            tags,
             source,
             profile,
             since,
@@ -1892,6 +1916,7 @@ pub fn run() -> Result<()> {
                     source_path,
                     cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                     project,
+                    tags,
                     source: source.map(|value| value.as_str().to_string()),
                     profile,
                     since,
@@ -1924,6 +1949,7 @@ pub fn run() -> Result<()> {
                 source_path,
                 cwd,
                 project,
+                tags,
                 source,
                 profile,
                 since,
@@ -3014,6 +3040,7 @@ fn run_search(
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3064,6 +3091,7 @@ fn run_search(
             additional_queries,
             cwd,
             project,
+            tags,
             role,
             tool,
             session,
@@ -3093,6 +3121,7 @@ fn run_search(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3156,6 +3185,7 @@ struct MemorySurfaceSearchArgs {
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3233,6 +3263,7 @@ fn collect_search_with_memories(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3262,10 +3293,11 @@ fn collect_search_with_memories(
     let conversation_only_filters = role.is_some()
         || tool.is_some()
         || session.is_some()
+        || !tags.is_empty()
         || !matches!(origin, SessionOrigin::Regular | SessionOrigin::All);
     if content == SearchContent::Memories && conversation_only_filters {
         return Err(anyhow!(
-            "--role, --tool, --session, and --origin filter conversations; use --content conversations or all"
+            "--role, --tool, --session, --tag, and --origin filter conversations; use --content conversations or all"
         ));
     }
     if trace {
@@ -3287,6 +3319,7 @@ fn collect_search_with_memories(
             additional_queries: additional_queries.clone(),
             cwd: cwd.clone(),
             project: project.clone(),
+            tags,
             role,
             tool,
             session,
@@ -3489,6 +3522,7 @@ struct SearchCollectRequest {
     additional_queries: Vec<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     role: Option<String>,
     tool: Option<String>,
     session: Option<String>,
@@ -3581,9 +3615,9 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
         Operation::Projects { machine } => {
             check_analytics(&machine)?;
             let items = if machine == crate::machine::LOCAL_MACHINE_ID {
-                collect_projects(paths, None)?
+                collect_projects(paths, None, Vec::new())?
             } else {
-                crate::machine::remote_project_summaries(&config, &machine, None)?
+                crate::machine::remote_project_summaries(&config, &machine, None, Vec::new())?
             };
             Ok(tag(items, machine))
         }
@@ -3599,6 +3633,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     filters.source_path,
                     filters.cwd.map(PathBuf::from),
                     filters.project,
+                    filters.tags,
                     parse_source_filter(filters.source)?,
                     filters.profile,
                     filters.since,
@@ -3647,6 +3682,7 @@ pub(crate) fn native_request(paths: &Paths, operation: crate::native::Operation)
                     query,
                     additional_queries: Vec::new(),
                     cwd: None,
+                    tags: Vec::new(),
                     project,
                     role: None,
                     tool: None,
@@ -3776,6 +3812,7 @@ fn collect_search_with_auto_index(
         additional_queries,
         cwd,
         project,
+        tags,
         role,
         tool,
         session,
@@ -3870,6 +3907,7 @@ fn collect_search_with_auto_index(
             min_score,
             project_grouping: None,
             text_limit,
+            tags: normalize_tags(&tags)?,
         },
         &crate::search::Selection {
             sort: if sort == SortBy::Score {
@@ -4138,6 +4176,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
                 query: request.query,
                 additional_queries: request.additional_queries,
                 cwd: request.cwd.map(PathBuf::from),
+                tags: request.tags,
                 project: request.project,
                 role: request.role,
                 tool: request.tool,
@@ -4172,6 +4211,7 @@ pub(crate) fn mcp_search(root: Option<PathBuf>, request: SearchRequest) -> Resul
         query: request.query,
         additional_queries: request.additional_queries,
         cwd: request.cwd.map(PathBuf::from),
+        tags: request.tags,
         project: request.project,
         role: request.role,
         tool: request.tool,
@@ -5294,6 +5334,12 @@ fn format_usd(value: f64) -> String {
     }
 }
 
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
+    tags.iter()
+        .map(|tag| crate::session_meta::normalize_tag(tag))
+        .collect()
+}
+
 fn open_analytics_read_only(paths: &Paths) -> Result<AnalyticsStore> {
     let db = analytics_path(&paths.state);
     if !db.exists() {
@@ -5417,6 +5463,7 @@ fn run_sessions(
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     source: Option<SourceFilter>,
     profile: Option<String>,
     since: Option<String>,
@@ -5435,6 +5482,7 @@ fn run_sessions(
         &SessionListSpec {
             source,
             project,
+            tags: normalize_tags(&tags)?,
             cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
             since_ms: parse_ts_millis(since)?,
             limit,
@@ -5466,8 +5514,12 @@ fn run_sessions(
     output.print_values(items)
 }
 
-pub(crate) fn collect_projects(paths: &Paths, source: Option<SourceFilter>) -> Result<Vec<Value>> {
-    let store = open_analytics_read_only(paths)?;
+pub(crate) fn collect_projects(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    tags: Vec<String>,
+) -> Result<Vec<Value>> {
+    let store = open_analytics_read_only(paths)?.with_tags(tags);
     Ok(store.query_project_summaries(source)?.into_iter().map(|row| {
         let last_at = row.last_at.and_then(|timestamp| {
             let formatted = format_ts(timestamp);
@@ -5483,6 +5535,7 @@ pub(crate) fn collect_sessions(
     source_path: Option<String>,
     cwd: Option<PathBuf>,
     project: Option<String>,
+    tags: Vec<String>,
     source: Option<SourceFilter>,
     profile: Option<String>,
     since: Option<String>,
@@ -5493,7 +5546,7 @@ pub(crate) fn collect_sessions(
     let paths = Paths::new(root)?;
     let config = UserConfig::load(&paths)?;
     let claude_sources = config.claude_sources();
-    let store = open_analytics_read_only(&paths)?;
+    let store = open_analytics_read_only(&paths)?.with_tags(normalize_tags(&tags)?);
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
     let kind_filter = match origin {
@@ -5553,6 +5606,9 @@ pub(crate) fn collect_session_count(
         if request.cwd.is_some() {
             return Err(anyhow!("--query count does not support --cwd"));
         }
+        if !request.tags.is_empty() {
+            return Err(anyhow!("--query count does not support --tag"));
+        }
         if !SearchIndex::exists(&paths.index) {
             return Ok(SessionCount {
                 total: None,
@@ -5609,7 +5665,7 @@ pub(crate) fn collect_session_count(
                 .then(|| "canonical session metadata incomplete".into()),
         })
     } else {
-        let store = open_analytics_read_only(paths)?;
+        let store = open_analytics_read_only(paths)?.with_tags(normalize_tags(&request.tags)?);
         let cwd = canonical_cwd_filter(request.cwd.map(PathBuf::from));
         let total = store.count_sessions_selected(
             source,
@@ -5636,6 +5692,7 @@ pub(crate) fn mcp_sessions(root: Option<PathBuf>, request: SessionsRequest) -> R
         request.source_path,
         request.cwd.map(PathBuf::from),
         request.project,
+        request.tags,
         source,
         request.profile,
         request.since,
@@ -5737,6 +5794,64 @@ fn run_herdr_resume(
     }
     println!("resumed {} ({})", row.session_id, row.source.label());
     Ok(())
+}
+
+fn run_session_assignment(command: SessionCommand) -> Result<()> {
+    use crate::session_meta::{AssignmentAction, AssignmentRequest};
+    let (session_id, action, target) = match command {
+        SessionCommand::Batch { .. } => unreachable!("batch normalizes to hydrate"),
+        SessionCommand::SetProject {
+            session_id,
+            project,
+            target,
+        } => (session_id, AssignmentAction::SetProject { project }, target),
+        SessionCommand::ClearProject { session_id, target } => {
+            (session_id, AssignmentAction::ClearProject, target)
+        }
+        SessionCommand::Inspect { session_id, target } => {
+            (session_id, AssignmentAction::Inspect, target)
+        }
+        SessionCommand::Tag { action } => match action {
+            TagCommand::Add {
+                session_id,
+                tags,
+                target,
+            } => (session_id, AssignmentAction::AddTags { tags }, target),
+            TagCommand::Rm {
+                session_id,
+                tags,
+                target,
+            } => (session_id, AssignmentAction::RemoveTags { tags }, target),
+            TagCommand::Ls { root, output } => {
+                let paths = Paths::new(root)?;
+                let store = open_analytics_read_only(&paths)?;
+                let output = output.resolve(OutputFormat::Jsonl, None, false)?;
+                return output.print_values(
+                    store
+                        .query_tags()?
+                        .into_iter()
+                        .map(|(tag, sessions)| serde_json::json!({"tag": tag, "session_count": sessions}))
+                        .collect(),
+                );
+            }
+        },
+    };
+    let paths = Paths::new(target.root)?;
+    let config = UserConfig::load(&paths)?;
+    let report = crate::machine::session_assignment(
+        &paths,
+        &config,
+        &target.machine,
+        &AssignmentRequest {
+            session_id,
+            source: target.source.map(|source| source.as_str().to_string()),
+            action,
+        },
+    )?;
+    target
+        .output
+        .resolve(OutputFormat::Json, None, false)?
+        .print_value(&serde_json::to_value(report)?)
 }
 
 fn run_analytics_backfill(root: Option<PathBuf>) -> Result<()> {
