@@ -2734,6 +2734,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         embed_runtime,
         tool_content_limits,
         defer_merges: false,
+        embedding_budget: None,
     })
 }
 

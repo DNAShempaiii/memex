@@ -88,7 +88,17 @@ pub struct IngestOptions {
     /// Search-triggered refreshes append without foreground merges; compaction is scheduled
     /// separately once segments accumulate.
     pub defer_merges: bool,
+    /// Wall-clock time this refresh may spend embedding; `None` is unbounded. Once it is
+    /// spent the remaining records publish without vectors, and a later refresh or
+    /// `memex index embed` backfills them. Read-triggered refreshes set it so a slow
+    /// embedder cannot hold the ingest lease for the whole backlog.
+    pub embedding_budget: Option<std::time::Duration>,
 }
+
+/// How long a read-triggered refresh (search, session read, TUI auto-index) may spend
+/// embedding before it publishes the rest without vectors. See
+/// [`IngestOptions::embedding_budget`].
+pub const READ_REFRESH_EMBEDDING_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct IngestReport {
@@ -193,6 +203,7 @@ struct WriterContext {
     codex_metadata_checkpoints: HashMap<String, (u64, Vec<u64>)>,
     vector_delete_paths: HashSet<String>,
     defer_merges: bool,
+    embedding_budget: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

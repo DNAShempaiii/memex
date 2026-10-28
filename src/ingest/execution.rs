@@ -1599,6 +1599,7 @@ pub(super) fn execute_refresh(
         index_root: paths.index.clone(),
         input_bytes,
         defer_merges: options.defer_merges,
+        embedding_budget: options.embedding_budget,
         embeddings,
         do_backfill_embeddings: options.backfill_embeddings
             || vector_migration.rebuild

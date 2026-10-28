@@ -2991,8 +2991,23 @@ fn abbreviate_field(field: &mut String, limit: usize, terms: &[String]) {
     *field = abbreviated;
 }
 
+/// Refresh the index before a search. Under `strict` freshness the search waits up to
+/// [`INGEST_LEASE_TIMEOUT`] for the lease and fails if the refresh does. Under `bounded` it
+/// waits [`SESSION_READ_LEASE_WAIT`], and a refresh that fails or finds the lease held
+/// leaves the search on the index as it stands with a warning, as session reads do.
 fn ensure_local_index(paths: &Paths, config: &UserConfig) -> Result<()> {
-    ensure_local_index_within(paths, config, INGEST_LEASE_TIMEOUT)
+    match config.index_freshness()? {
+        Freshness::None => Ok(()),
+        Freshness::Strict => ensure_local_index_within(paths, config, INGEST_LEASE_TIMEOUT),
+        Freshness::Bounded { .. } => {
+            if let Err(error) = ensure_local_index_within(paths, config, SESSION_READ_LEASE_WAIT) {
+                eprintln!(
+                    "warning: searching the index as it stands; refreshing it first failed: {error:#}"
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn ensure_local_index_within(
@@ -3114,7 +3129,8 @@ fn refresh_sessions(
     if targets.is_empty() {
         return Ok(());
     }
-    let options = local_ingest_options(config)?;
+    let mut options = local_ingest_options(config)?;
+    options.embedding_budget = Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET);
     paths.ensure_dirs()?;
     let lease = IngestLease::acquire(paths, "session read", lease_timeout)?;
     let report = ingest_session_sources(
@@ -3202,7 +3218,10 @@ fn index_local(
     lease_timeout: Duration,
 ) -> Result<IngestReport> {
     crate::profiling::span!("index.local");
-    let options = local_ingest_options(config)?;
+    let mut options = local_ingest_options(config)?;
+    if stale_only {
+        options.embedding_budget = Some(crate::ingest::READ_REFRESH_EMBEDDING_BUDGET);
+    }
     // The journal stream must be registered before this process writes anything: a write in
     // the milliseconds before registration makes fseventsd hold the replay for ~160 ms.
     let journal = stale_only.then(|| {
@@ -3269,6 +3288,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         embed_runtime: config.resolve_embed_runtime()?,
         tool_content_limits: config.indexed_tool_content_limits()?,
         defer_merges: true,
+        embedding_budget: None,
     })
 }
 
@@ -5371,5 +5391,23 @@ mod tests {
             page_texts(&paths, &unrefreshed, &request),
             ["first", "second"]
         );
+    }
+
+    #[test]
+    fn bounded_search_reads_the_index_as_it_stands_while_an_ingest_holds_the_lease() {
+        let _lock = crate::test_support::env_lock();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let _held = IngestLease::acquire(&paths, "slow refresh", Duration::ZERO).unwrap();
+        let bounded = UserConfig {
+            index_freshness: Some("bounded".to_string()),
+            ..UserConfig::default()
+        };
+
+        assert!(ensure_local_index_within(&paths, &bounded, Duration::ZERO).is_err());
+        let started = std::time::Instant::now();
+        ensure_local_index(&paths, &bounded).expect("bounded search proceeds without a refresh");
+        assert!(started.elapsed() < INGEST_LEASE_TIMEOUT / 2);
     }
 }
