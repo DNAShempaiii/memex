@@ -159,6 +159,7 @@ muse_resume_cmd = "cd {cwd_shell} && muse resume {session_id}"
 kimi_resume_cmd = "cd {cwd_shell} && kimi --session {session_id}"
 goose_resume_cmd = "cd {cwd_shell} && goose session --resume --session-id {session_id}"
 herdr_resume = "tab"  # inside a herdr pane: "tab" (default), "split", or "off"; an already-open session is focused instead
+rex_resume = "tab"    # inside a Rex terminal: "tab" (default), "split", or "off"; an already-open session is focused instead
 
 [mcp]
 listen = "127.0.0.1:5363"

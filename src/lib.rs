@@ -23,6 +23,7 @@ mod repository;
 pub mod resume;
 pub mod retrieval;
 pub mod retrieval_eval;
+pub mod rex;
 mod search;
 pub mod session_meta;
 pub mod sources;

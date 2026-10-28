@@ -120,6 +120,7 @@ See [source discovery and memory retrieval](docs/search.md) and
 | [MCP server](docs/mcp.md) | Give agents structured search and transcript retrieval tools |
 | [Search skill](#agent-integration) | Teach agents to use the Memex CLI for source-backed recall |
 | [herdr plugin](docs/herdr.md) | Browse and resume sessions from a herdr pane |
+| [Rex module](docs/rex.md) | Browse and resume sessions from a Rex pane |
 
 The interfaces share Memex's data, but expose different workflows. The native app
 READMEs describe their capabilities and platform requirements.
@@ -300,4 +301,5 @@ destination can reproduce the original session's behavior.
 | [MCP server](docs/mcp.md) | Transports, authentication, client setup, retrieval tools |
 | [Token usage](docs/usage.md) | Counters, pricing, cache estimates, Hermes coverage |
 | [herdr integration](docs/herdr.md) | Installation, actions, key bindings |
+| [Rex integration](docs/rex.md) | Installation, actions, key bindings |
 | [Developer profiling](docs/profiling.md) | Index/search traces and flamegraphs |
