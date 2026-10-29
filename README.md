@@ -77,6 +77,7 @@ tool. **Import into** creates a conversation in another tool using the
 | Kiro CLI | Yes | Credits only | No | No | No |
 | Hermes | Yes | Yes | No | No | No |
 | goose | Yes | Yes | Yes | No | No |
+| mastracode | Yes | Yes | Yes | No | No |
 
 - **History coverage depends on the local records a tool saves.** Cursor history
   comes from agent transcripts; its usage data comes from local databases.
