@@ -126,6 +126,7 @@ pub fn audit_installed_sources(
     push(SourceKind::Zcode, super::zcode::usage_files());
     push(SourceKind::Kilocode, super::kilocode::usage_files());
     push(SourceKind::Goose, super::goose::usage_files());
+    push(SourceKind::Mastracode, super::mastracode::usage_files());
 
     push(
         SourceKind::Omp,
@@ -162,6 +163,7 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
                 | SourceKind::Zcode
                 | SourceKind::Kilocode
                 | SourceKind::Goose
+                | SourceKind::Mastracode
         ) {
             // Hermes usage truth, Bob tasks, Zcode, KiloCode, and goose sessions
             // are SQLite data.
@@ -399,6 +401,8 @@ fn record_semantics(source: SourceKind, value: &Value, top_level: &str, audit: &
         SourceKind::Kilocode => {}
         // goose sessions are SQLite rows, not per-line JSON documents.
         SourceKind::Goose => {}
+        // Mastra Code threads are SQLite rows, not per-line JSON documents.
+        SourceKind::Mastracode => {}
     }
 }
 

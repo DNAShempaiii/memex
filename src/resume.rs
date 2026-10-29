@@ -75,6 +75,7 @@ pub fn resume_template(config: &UserConfig, source: SourceKind, remote: bool) ->
         SourceKind::Kimi => config.kimi_resume_cmd.clone(),
         // goose sessions resume with `goose session --resume --session-id <id>`.
         SourceKind::Goose => config.goose_resume_cmd.clone(),
+        SourceKind::Mastracode => config.mastracode_resume_cmd.clone(),
     };
     configured.or_else(|| default_resume_template(source.label(), remote))
 }

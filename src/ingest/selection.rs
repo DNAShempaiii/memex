@@ -39,6 +39,7 @@ enum Shape {
     Kilocode,
     Kimi,
     Goose,
+    Mastracode,
 }
 
 struct Root {
@@ -173,6 +174,13 @@ fn roots(options: &IngestOptions) -> Vec<Root> {
                 .map(|root| Root::new(root, Shape::Goose)),
         );
     }
+    if options.include_mastracode {
+        roots.extend(
+            sources::mastracode::db_dirs()
+                .into_iter()
+                .map(|root| Root::new(root, Shape::Mastracode)),
+        );
+    }
     roots
 }
 
@@ -303,6 +311,15 @@ fn classify(root: &Root, path: &Path) -> Match {
             // One store per goose data root; `resolve` routes WAL and
             // shared-memory sidecar hints to the database before classification.
             return if parts.len() == 1 && name == "sessions.db" {
+                Match::Database(path.to_path_buf())
+            } else {
+                Match::Ignore
+            };
+        }
+        Shape::Mastracode => {
+            // One store per mastracode data root; `resolve` routes WAL and
+            // shared-memory sidecar hints to the database before classification.
+            return if parts.len() == 1 && name == "mastra.db" {
                 Match::Database(path.to_path_buf())
             } else {
                 Match::Ignore
@@ -451,6 +468,16 @@ fn resolve(
                     .filter(|name| *name == "sessions.db")
                     .map(|name| path.with_file_name(name))
                     .unwrap_or(path),
+                Shape::Mastracode => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        name.strip_suffix("-wal")
+                            .or_else(|| name.strip_suffix("-shm"))
+                    })
+                    .filter(|name| *name == "mastra.db")
+                    .map(|name| path.with_file_name(name))
+                    .unwrap_or(path),
                 _ => path,
             };
             if excluder.is_excluded(&path) {
@@ -514,6 +541,8 @@ fn resolve(
                         SourceKind::Kilocode
                     } else if matches!(root.shape, Shape::Goose) {
                         SourceKind::Goose
+                    } else if matches!(root.shape, Shape::Mastracode) {
+                        SourceKind::Mastracode
                     } else {
                         SourceKind::Opencode
                     };
@@ -634,6 +663,7 @@ mod tests {
             include_kilocode: false,
             include_kimi: false,
             include_goose: false,
+            include_mastracode: false,
             include_kiro: false,
             exclude_patterns: Vec::new(),
             embeddings: false,

@@ -381,6 +381,8 @@ pub struct UserConfig {
     pub kimi_resume_cmd: Option<String>,
     /// Resume command template for goose sessions.
     pub goose_resume_cmd: Option<String>,
+    /// Resume command template for mastracode sessions.
+    pub mastracode_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
     pub herdr_resume: Option<String>,
     /// How resume behaves inside a Rex terminal: "tab" (default), "split", or "off".

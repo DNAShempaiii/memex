@@ -3347,6 +3347,7 @@ fn local_ingest_options(config: &UserConfig) -> Result<IngestOptions> {
         include_kilocode: true,
         include_kimi: true,
         include_goose: true,
+        include_mastracode: true,
         include_kiro: true,
         exclude_patterns: config.exclude_path_patterns(),
         embeddings: config.embeddings_default(),

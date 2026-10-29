@@ -57,6 +57,7 @@ fn ingest_options(embeddings: bool, model: ModelChoice) -> IngestOptions {
         include_kilocode: false,
         include_kimi: false,
         include_goose: false,
+        include_mastracode: false,
         include_kiro: false,
         embeddings,
         backfill_embeddings: false,
@@ -2614,6 +2615,7 @@ fn device_renumbering_preserves_append_continuity() {
         zcode_database: None,
         kilocode_database: None,
         goose_database: None,
+        mastracode_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2639,6 +2641,7 @@ fn device_renumbering_does_not_hide_file_replacement() {
         zcode_database: None,
         kilocode_database: None,
         goose_database: None,
+        mastracode_database: None,
         sqlite_wal: None,
         device: Some(1),
         inode: Some(2),
@@ -2933,6 +2936,7 @@ fn ingest_claude_records_preserve_sidechain_and_tool_links() {
         include_kilocode: false,
         include_kimi: false,
         include_goose: false,
+        include_mastracode: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -3714,6 +3718,7 @@ fn ingest_pi_session_records_supported_message_shapes() {
         include_kilocode: false,
         include_kimi: false,
         include_goose: false,
+        include_mastracode: false,
         embeddings: false,
         backfill_embeddings: false,
         model: ModelChoice::default(),
@@ -7360,6 +7365,7 @@ fn goose_sessions_index_conversations_but_not_turn_context() {
     crate::sources::goose::tests::fixture_db(&database);
     let mut options = ingest_options(false, ModelChoice::potion());
     options.include_goose = true;
+    options.include_mastracode = false;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
@@ -7421,6 +7427,7 @@ fn goose_refresh_preserves_unchanged_sessions_and_reconciles_deletions() {
     crate::sources::goose::tests::fixture_db(&database);
     let mut options = ingest_options(false, ModelChoice::potion());
     options.include_goose = true;
+    options.include_mastracode = false;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);
@@ -7504,6 +7511,7 @@ fn goose_store_that_never_existed_is_not_reported_unreadable() {
     let _env = EnvVarGuard::set_os(&[("GOOSE_PATH_ROOT", Some(root.as_os_str()))]);
     let mut options = ingest_options(false, ModelChoice::default());
     options.include_goose = true;
+    options.include_mastracode = false;
     let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
     paths.ensure_dirs().unwrap();
     let lease = ingest_lease(&paths);

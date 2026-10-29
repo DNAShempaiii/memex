@@ -79,6 +79,7 @@ pub struct IngestOptions {
     pub include_kiro: bool,
     pub include_kimi: bool,
     pub include_goose: bool,
+    pub include_mastracode: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -327,6 +328,7 @@ pub(crate) fn session_refresh_targets<'a>(
             .or_else(|| crate::sources::zcode::split_virtual_path(Path::new(source)))
             .or_else(|| crate::sources::kilocode::split_virtual_path(Path::new(source)))
             .or_else(|| crate::sources::goose::split_virtual_path(Path::new(source)))
+            .or_else(|| crate::sources::mastracode::split_virtual_path(Path::new(source)))
             .map(|(database, _)| database);
         if let Some(database) = virtual_database {
             if !database.is_file() {

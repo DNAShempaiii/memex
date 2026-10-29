@@ -423,6 +423,7 @@ enum SourceChoice {
     Kilocode,
     Kimi,
     Goose,
+    Mastracode,
 }
 
 impl SourceChoice {
@@ -447,7 +448,8 @@ impl SourceChoice {
             SourceChoice::Kiro => SourceChoice::Kilocode,
             SourceChoice::Kilocode => SourceChoice::Kimi,
             SourceChoice::Kimi => SourceChoice::Goose,
-            SourceChoice::Goose => SourceChoice::All,
+            SourceChoice::Goose => SourceChoice::Mastracode,
+            SourceChoice::Mastracode => SourceChoice::All,
         }
     }
 
@@ -473,6 +475,7 @@ impl SourceChoice {
             SourceChoice::Kilocode => Some(SourceFilter::Kilocode),
             SourceChoice::Kimi => Some(SourceFilter::Kimi),
             SourceChoice::Goose => Some(SourceFilter::Goose),
+            SourceChoice::Mastracode => Some(SourceFilter::Mastracode),
         }
     }
 
@@ -498,6 +501,7 @@ impl SourceChoice {
             SourceChoice::Kilocode => "kilocode",
             SourceChoice::Kimi => "kimi",
             SourceChoice::Goose => "goose",
+            SourceChoice::Mastracode => "mastracode",
         }
     }
 
@@ -522,6 +526,7 @@ impl SourceChoice {
             SourceKind::Kilocode => SourceChoice::Kilocode,
             SourceKind::Kimi => SourceChoice::Kimi,
             SourceKind::Goose => SourceChoice::Goose,
+            SourceKind::Mastracode => SourceChoice::Mastracode,
         }
     }
 }
@@ -1206,6 +1211,7 @@ impl App {
                     include_kilocode: true,
                     include_kimi: true,
                     include_goose: true,
+                    include_mastracode: true,
                     include_kiro: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
@@ -2803,6 +2809,7 @@ impl App {
             SourceKind::Kiro => "kiro",
             SourceKind::Kimi => "kimi",
             SourceKind::Goose => "goose",
+            SourceKind::Mastracode => "mastracode",
         };
         let source_path = session.source_path.clone();
 
@@ -4283,6 +4290,7 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Kilocode => label == "kilocode",
         SourceChoice::Kimi => label == "kimi",
         SourceChoice::Goose => label == "goose",
+        SourceChoice::Mastracode => label == "mastracode",
         SourceChoice::Kiro => label == "kiro",
         SourceChoice::All => false,
     }
@@ -4308,6 +4316,7 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Kilocode => Color::Rgb(255, 122, 189),
         SourceKind::Kimi => Color::Rgb(86, 170, 255),
         SourceKind::Goose => Color::Rgb(255, 173, 66),
+        SourceKind::Mastracode => Color::Rgb(120, 200, 140),
         SourceKind::Kiro => Color::Rgb(180, 130, 240),
     }
 }

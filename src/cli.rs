@@ -214,6 +214,12 @@ struct IndexArgs {
     /// Skip indexing goose sessions
     #[arg(long = "no-goose", default_value_t = false, hide = true)]
     no_goose: bool,
+    /// Index Mastra Code threads from the mastracode data directory (mastra.db) [default: true]
+    #[arg(long, default_value_t = true, hide = true)]
+    mastracode: bool,
+    /// Skip indexing Mastra Code threads
+    #[arg(long = "no-mastracode", default_value_t = false, hide = true)]
+    no_mastracode: bool,
     /// Generate embeddings for semantic search during indexing
     #[arg(long, help_heading = "Embeddings")]
     embeddings: bool,
@@ -2844,6 +2850,7 @@ fn build_ingest_options(index: &IndexArgs, config: &UserConfig) -> Result<Ingest
         include_kilocode: index.source_enabled(IndexSource::Kilocode),
         include_kimi: index.source_enabled(IndexSource::Kimi),
         include_goose: index.source_enabled(IndexSource::Goose),
+        include_mastracode: index.source_enabled(IndexSource::Mastracode),
         include_kiro: index.source_enabled(IndexSource::Kiro),
         exclude_patterns: excludes,
         embeddings,
@@ -6435,6 +6442,7 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
         crate::types::SourceKind::Kilocode => "kilocode",
         crate::types::SourceKind::Kimi => "kimi",
         crate::types::SourceKind::Goose => "goose",
+        crate::types::SourceKind::Mastracode => "mastracode",
     };
     let source_path = &record.source_path;
     if record.source == crate::types::SourceKind::Bob {
@@ -6455,6 +6463,11 @@ fn run_share(session_id: String, title: Option<String>, root: Option<PathBuf>) -
     if record.source == crate::types::SourceKind::Goose {
         return Err(anyhow!(
             "sharing is not supported for goose sessions: {source_path} is a database entry, not a transcript file"
+        ));
+    }
+    if record.source == crate::types::SourceKind::Mastracode {
+        return Err(anyhow!(
+            "sharing is not supported for mastracode sessions: {source_path} is a database entry, not a transcript file"
         ));
     }
 
@@ -7805,6 +7818,9 @@ fn build_index_command_args(
     }
     if !index.goose || index.no_goose {
         args.push("--no-goose".to_string());
+    }
+    if !index.mastracode || index.no_mastracode {
+        args.push("--no-mastracode".to_string());
     }
     if let Some(listen) = mcp_listen {
         args.push("--mcp".to_string());
@@ -9544,6 +9560,8 @@ mod tests {
             no_kimi: false,
             goose: false,
             no_goose: false,
+            mastracode: false,
+            no_mastracode: false,
             kiro: false,
             no_kiro: false,
             embeddings: false,
@@ -9619,6 +9637,8 @@ mod tests {
             no_kimi: false,
             goose: false,
             no_goose: false,
+            mastracode: false,
+            no_mastracode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9686,6 +9706,8 @@ mod tests {
             no_kimi: false,
             goose: false,
             no_goose: false,
+            mastracode: false,
+            no_mastracode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,
@@ -9755,6 +9777,8 @@ mod tests {
             no_kimi: false,
             goose: false,
             no_goose: false,
+            mastracode: false,
+            no_mastracode: false,
             kiro: true,
             no_kiro: false,
             embeddings: false,

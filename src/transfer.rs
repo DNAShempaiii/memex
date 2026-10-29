@@ -1565,6 +1565,10 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
         SourceKind::Goose => {
             crate::sources::goose::session_cwd(Path::new(&first.source_path), &first.session_id)
         }
+        SourceKind::Mastracode => crate::sources::mastracode::session_cwd(
+            Path::new(&first.source_path),
+            &first.session_id,
+        ),
     }
     .filter(|path| path.is_dir())
 }

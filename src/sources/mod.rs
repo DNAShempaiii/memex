@@ -20,6 +20,7 @@ mod jsonl;
 pub mod kilocode;
 pub mod kimi;
 pub mod kiro;
+pub mod mastracode;
 pub mod muse;
 pub mod omp;
 pub mod openclaw;
@@ -301,6 +302,7 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Kilocode => kilocode::VERSIONS,
         SourceKind::Kimi => kimi::VERSIONS,
         SourceKind::Goose => goose::VERSIONS,
+        SourceKind::Mastracode => mastracode::VERSIONS,
     }
 }
 
@@ -324,6 +326,9 @@ pub fn session_cwd(source: SourceKind, path: &Path, session_id: &str) -> Option<
         SourceKind::Hermes => hermes::session_cwd(path, session_id),
         SourceKind::Goose => {
             goose::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
+        }
+        SourceKind::Mastracode => {
+            mastracode::session_cwd(path, session_id).map(|cwd| cwd.to_string_lossy().into_owned())
         }
         _ => jsonl::scan_session_cwd(path, session_id),
     }
@@ -370,6 +375,7 @@ fn state_store_roots(claude_sources: &[PathBuf]) -> Vec<PathBuf> {
     roots.extend(kilocode::roots());
     roots.push(kimi::home());
     roots.extend(goose::roots());
+    roots.extend(mastracode::roots());
     roots
 }
 
@@ -398,6 +404,7 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Kilocode
                 | SourceKind::Kimi
                 | SourceKind::Goose
+                | SourceKind::Mastracode
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
         .saturating_mul(2)
@@ -443,6 +450,8 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::Hermes
     } else if goose::matches_path(path) {
         SourceKind::Goose
+    } else if mastracode::matches_path(path) {
+        SourceKind::Mastracode
     } else {
         SourceKind::Claude
     }

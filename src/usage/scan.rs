@@ -152,6 +152,10 @@ pub(crate) fn source_spec(filter: SourceFilter) -> SourceSpec {
             parser_version: crate::sources::goose::VERSIONS.usage,
             volatile_reuse_ms: no_volatile_reuse,
         },
+        SourceFilter::Mastracode => SourceSpec {
+            parser_version: crate::sources::mastracode::VERSIONS.usage,
+            volatile_reuse_ms: no_volatile_reuse,
+        },
     }
 }
 
@@ -199,6 +203,7 @@ pub(crate) fn source_files(filter: SourceFilter, claude_sources: &[PathBuf]) -> 
         SourceFilter::Kilocode => crate::sources::kilocode::usage_files(),
         SourceFilter::Kimi => crate::sources::kimi::usage_files(),
         SourceFilter::Goose => crate::sources::goose::usage_files(),
+        SourceFilter::Mastracode => crate::sources::mastracode::usage_files(),
     }
 }
 
@@ -519,6 +524,7 @@ pub(crate) fn parse_source_file(
         SourceFilter::Zcode => crate::sources::zcode::parse_usage_file(path),
         SourceFilter::Kilocode => crate::sources::kilocode::parse_usage_file(path),
         SourceFilter::Goose => crate::sources::goose::parse_usage_file(path),
+        SourceFilter::Mastracode => Ok(FileParse::cacheable(Vec::new())),
         SourceFilter::Kimi => {
             crate::sources::kimi::parse_usage_file(path).map(FileParse::cacheable)
         }

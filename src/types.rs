@@ -24,10 +24,11 @@ pub enum SourceKind {
     Kilocode,
     Kimi,
     Goose,
+    Mastracode,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 19] = [
+    pub const ALL: [SourceKind; 20] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -47,6 +48,7 @@ impl SourceKind {
         SourceKind::Kilocode,
         SourceKind::Kimi,
         SourceKind::Goose,
+        SourceKind::Mastracode,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -71,6 +73,7 @@ impl SourceKind {
             SourceKind::Kilocode => 16,
             SourceKind::Kimi => 17,
             SourceKind::Goose => 18,
+            SourceKind::Mastracode => 19,
         }
     }
 
@@ -95,6 +98,7 @@ impl SourceKind {
             16 => Some(SourceKind::Kilocode),
             17 => Some(SourceKind::Kimi),
             18 => Some(SourceKind::Goose),
+            19 => Some(SourceKind::Mastracode),
             _ => None,
         }
     }
@@ -120,6 +124,7 @@ impl SourceKind {
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kimi => "kimi",
             SourceKind::Goose => "goose",
+            SourceKind::Mastracode => "mastracode",
         }
     }
 
@@ -144,6 +149,7 @@ impl SourceKind {
             SourceKind::Kilocode => "kilocode",
             SourceKind::Kimi => "kimi",
             SourceKind::Goose => "goose",
+            SourceKind::Mastracode => "mastracode",
         }
     }
 
@@ -172,6 +178,7 @@ impl SourceKind {
             "kilocode" => Some(SourceKind::Kilocode),
             "kimi" => Some(SourceKind::Kimi),
             "goose" => Some(SourceKind::Goose),
+            "mastracode" => Some(SourceKind::Mastracode),
             _ => None,
         }
     }
@@ -201,6 +208,7 @@ pub enum SourceFilter {
     Kilocode,
     Kimi,
     Goose,
+    Mastracode,
 }
 
 impl SourceFilter {
@@ -225,6 +233,7 @@ impl SourceFilter {
             SourceFilter::Kilocode => source == SourceKind::Kilocode,
             SourceFilter::Kimi => source == SourceKind::Kimi,
             SourceFilter::Goose => source == SourceKind::Goose,
+            SourceFilter::Mastracode => source == SourceKind::Mastracode,
         }
     }
 
@@ -249,6 +258,7 @@ impl SourceFilter {
             SourceFilter::Kilocode => &["kilocode"],
             SourceFilter::Kimi => &["kimi"],
             SourceFilter::Goose => &["goose"],
+            SourceFilter::Mastracode => &["mastracode"],
         }
     }
 
@@ -273,6 +283,7 @@ impl SourceFilter {
             SourceFilter::Kilocode => "kilocode",
             SourceFilter::Kimi => "kimi",
             SourceFilter::Goose => "goose",
+            SourceFilter::Mastracode => "mastracode",
         }
     }
 }

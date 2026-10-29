@@ -24,6 +24,9 @@ pub struct FileIdentity {
     /// Owning store of a virtual goose session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goose_database: Option<String>,
+    /// Owning store of a virtual Mastra Code thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mastracode_database: Option<String>,
     /// SQLite commits can change only the WAL while the main file stays unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sqlite_wal: Option<SqliteWalIdentity>,
